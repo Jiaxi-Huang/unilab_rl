@@ -21,6 +21,10 @@ import torch.nn.functional as F
 import torch.optim as optim
 
 from uni_rl.algos.common.compile import get_torch_compile_for_cuda
+from uni_rl.algos.common.learner_boilerplate import (
+    LearnerBoilerplateMixin,
+    polyak_update_target,
+)
 from uni_rl.algos.common.normalization import EmpiricalNormalization
 
 
@@ -71,7 +75,6 @@ class SACActor(nn.Module):
         self.log_std_max = log_std_max
         self.log_std_min = log_std_min
         self.use_tanh = use_tanh
-        self.device_ = device  # avoid name collision with nn.Module.device
 
         self.net = nn.Sequential(
             nn.Linear(obs_dim, hidden_dim, device=device),
@@ -379,7 +382,7 @@ class SACCritic(nn.Module):
 # ---------------------------------------------------------------------------
 
 
-class FastSACLearner:
+class FastSACLearner(LearnerBoilerplateMixin):
     """FastSAC learner with holosoma-aligned hyperparameters.
 
     Key hyperparameters (aligned with holosoma FastSACConfig):
@@ -585,52 +588,6 @@ class FastSACLearner:
         self._cuda_graph_actor_gradient_sync_calls = 0
         if self.use_compile:
             self._compile_training_methods()
-
-    @staticmethod
-    def _resolve_amp_dtype(amp_dtype: str, device_type: str) -> torch.dtype:
-        normalized = amp_dtype.lower()
-        if normalized == "auto":
-            return torch.bfloat16
-        if normalized == "fp16":
-            return torch.float16
-        if normalized == "bf16":
-            return torch.bfloat16
-        raise ValueError("FastSAC amp_dtype must be one of: auto, fp16, bf16")
-
-    @staticmethod
-    def _should_use_grad_scaler(
-        use_amp: bool,
-        device_type: str,
-        amp_dtype: torch.dtype,
-    ) -> bool:
-        return bool(use_amp) and device_type == "cuda" and amp_dtype == torch.float16
-
-    def _compile_training_methods(self) -> None:
-        compile_fn = get_torch_compile_for_cuda(self.device, warn=True)
-        if compile_fn is None:
-            return
-
-        compile_kwargs = {"options": {"triton.cudagraphs": False}}
-        if not self.use_cuda_graph_critic:
-            self._critic_loss_tensors = compile_fn(  # type: ignore[method-assign]
-                self._critic_loss_tensors, **compile_kwargs
-            )
-        if not self.use_cuda_graph_actor:
-            self._actor_loss_tensors = compile_fn(  # type: ignore[method-assign]
-                self._actor_loss_tensors, **compile_kwargs
-            )
-
-    def _autocast(self):
-        return torch.amp.autocast(  # pyright: ignore[reportPrivateImportUsage]
-            self._device_type, dtype=self._amp_dtype, enabled=self.use_amp
-        )
-
-    @torch.no_grad()
-    def _update_obs_normalizer(self, obs: torch.Tensor) -> None:
-        if isinstance(self.obs_normalizer, nn.Identity):
-            return
-        normalizer = cast(EmpiricalNormalization, self.obs_normalizer)
-        normalizer.update(obs)
 
     def normalize_obs(self, obs: torch.Tensor, update: bool = False) -> torch.Tensor:
         """Normalize actor observations using running statistics."""
@@ -1470,53 +1427,8 @@ class FastSACLearner:
 
     def soft_update_target(self) -> None:
         """Polyak-average update of the target Q-network."""
-        with torch.no_grad():
-            with _cuda_nvtx_range("target/soft_update_loop", self.nvtx_profile_ranges):
-                target_params = cast(list[torch.Tensor], list(self.qnet_target.parameters()))
-                source_params = cast(list[torch.Tensor], list(self.qnet.parameters()))
-                try:
-                    torch._foreach_mul_(target_params, 1.0 - self.tau)
-                    torch._foreach_add_(target_params, source_params, alpha=self.tau)
-                except RuntimeError:
-                    for tgt, src in zip(target_params, source_params):
-                        tgt.mul_(1.0 - self.tau).add_(src, alpha=self.tau)
-
-    def set_gradient_sync(
-        self,
-        sync: Callable[[Iterable[torch.Tensor]], None] | None,
-        *,
-        graph_replay_recorder: Callable[[int], None] | None = None,
-    ) -> None:
-        """Attach the per-optimizer gradient collective used by multi-GPU DP."""
-        if sync is None and graph_replay_recorder is not None:
-            raise ValueError("graph_replay_recorder requires a gradient sync callback")
-        if sync != self._gradient_sync:
-            self._reset_critic_cuda_graph()
-            self._reset_actor_cuda_graph()
-        self._gradient_sync = sync
-        self._gradient_sync_graph_replay_recorder = graph_replay_recorder
-        self.dp_cuda_graph_gradient_sync = bool(
-            sync is not None
-            and (
-                (self.use_cuda_graph_critic and self.scaler is None)
-                or (self.use_cuda_graph_actor and self.scaler is None)
-            )
-        )
-
-    def _sync_gradients(self, parameters: Iterable[torch.Tensor]) -> None:
-        if self._gradient_sync is not None:
-            self._gradient_sync(parameters)
-            if self._active_cuda_graph_gradient_sync_calls is not None:
-                self._active_cuda_graph_gradient_sync_calls[0] += 1
-
-    def _record_cuda_graph_gradient_replay(self, collective_calls: int) -> None:
-        if self._gradient_sync_graph_replay_recorder is not None and collective_calls > 0:
-            self._gradient_sync_graph_replay_recorder(collective_calls)
-
-    def release_cuda_graphs(self) -> None:
-        """Release captured NCCL nodes before the process group is destroyed."""
-        self._reset_critic_cuda_graph()
-        self._reset_actor_cuda_graph()
+        with _cuda_nvtx_range("target/soft_update_loop", self.nvtx_profile_ranges):
+            polyak_update_target(self.qnet_target, self.qnet, self.tau)
 
     def dp_initial_sync_tensors(self) -> Dict[str, torch.Tensor]:
         """Model state broadcast once from rank 0 before collection starts.

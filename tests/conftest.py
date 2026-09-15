@@ -12,11 +12,6 @@ import torch
 
 
 @pytest.fixture
-def mp_ctx():
-    return torch.multiprocessing.get_context("spawn")
-
-
-@pytest.fixture
 def tiny_weight_shapes():
     """Small MLP param shapes dict — linear(8,16) + bias, linear(16,3) + bias."""
     return {

@@ -12,6 +12,10 @@ import torch.nn as nn
 import torch.optim as optim
 
 from uni_rl.algos.common.compile import get_torch_compile_for_cuda
+from uni_rl.algos.common.learner_boilerplate import (
+    LearnerBoilerplateMixin,
+    polyak_update_target,
+)
 from uni_rl.algos.common.normalization import EmpiricalNormalization
 from uni_rl.algos.flash_sac.network import (
     FlashSACActor,
@@ -20,6 +24,7 @@ from uni_rl.algos.flash_sac.network import (
 )
 from uni_rl.algos.flash_sac.update import (
     build_lr_lambda,
+    compute_categorical_td_target,
     resolve_target_entropy,
     select_min_q_log_probs,
 )
@@ -134,7 +139,7 @@ class RewardNormalizer:
         self.g_r_max = state_dict["g_r_max"]
 
 
-class FlashSACLearner:
+class FlashSACLearner(LearnerBoilerplateMixin):
     supports_cuda_graph_packed_staging = True
 
     def __init__(
@@ -300,33 +305,7 @@ class FlashSACLearner:
         self.actor.get_mean_and_std = compile_fn(  # type: ignore[method-assign]
             self.actor.get_mean_and_std, **compile_kwargs
         )
-        if not self.use_cuda_graph_critic:
-            self._critic_loss_tensors = compile_fn(  # type: ignore[method-assign]
-                self._critic_loss_tensors, **compile_kwargs
-            )
-        if not self.use_cuda_graph_actor:
-            self._actor_loss_tensors = compile_fn(  # type: ignore[method-assign]
-                self._actor_loss_tensors, **compile_kwargs
-            )
-
-    @staticmethod
-    def _resolve_amp_dtype(amp_dtype: str, device_type: str) -> torch.dtype:
-        normalized = amp_dtype.lower()
-        if normalized == "auto":
-            return torch.bfloat16
-        if normalized == "fp16":
-            return torch.float16
-        if normalized == "bf16":
-            return torch.bfloat16
-        raise ValueError("FlashSAC amp_dtype must be one of: auto, fp16, bf16")
-
-    @staticmethod
-    def _should_use_grad_scaler(
-        use_amp: bool,
-        device_type: str,
-        amp_dtype: torch.dtype,
-    ) -> bool:
-        return bool(use_amp) and device_type == "cuda" and amp_dtype == torch.float16
+        super()._compile_training_methods()
 
     def _maybe_normalize_obs(self, obs: torch.Tensor, *, update: bool) -> torch.Tensor:
         if isinstance(self.obs_normalizer, nn.Identity):
@@ -336,18 +315,6 @@ class FlashSACLearner:
             self._update_obs_normalizer(obs)
             return cast(torch.Tensor, normalizer(obs, update=False))
         return cast(torch.Tensor, normalizer(obs, update=False))
-
-    def _autocast(self):
-        return torch.autocast(
-            device_type=self.device.type, dtype=self._amp_dtype, enabled=self.use_amp
-        )
-
-    @torch.no_grad()
-    def _update_obs_normalizer(self, obs: torch.Tensor) -> None:
-        if isinstance(self.obs_normalizer, nn.Identity):
-            return
-        normalizer = cast(EmpiricalNormalization, self.obs_normalizer)
-        normalizer.update(obs)
 
     def update_reward_stats(
         self,
@@ -376,29 +343,15 @@ class FlashSACLearner:
         gamma: float,
     ) -> torch.Tensor:
         next_q_log_probs = select_min_q_log_probs(next_q_values, next_q_log_probs_full)
-        batch_size, num_bins = next_q_log_probs.shape
-        support_view = support.view(1, -1)
-        rewards = rewards.view(-1, 1)
-        dones = dones.view(-1, 1)
-        truncated = truncated.view(-1, 1)
-        actor_entropy = actor_entropy.view(-1, 1)
-
-        bootstrap = torch.clamp(1.0 - dones + truncated, 0.0, 1.0)
-        support_min = support_view.min()
-        support_max = support_view.max()
-        target_bin_values = rewards + bootstrap * gamma * (support_view - actor_entropy)
-        target_bin_values = torch.clamp(target_bin_values, support_min, support_max)
-
-        bin_width = torch.clamp(support_view[0, 1] - support_view[0, 0], min=1e-8)
-        offsets = (target_bin_values - support_min) / bin_width
-        lower = torch.floor(offsets).long().clamp(0, num_bins - 1)
-        upper = torch.ceil(offsets).long().clamp(0, num_bins - 1)
-        frac = offsets - lower.float()
-
-        probs = next_q_log_probs.exp()
-        target_probs = torch.zeros(batch_size, num_bins, dtype=probs.dtype, device=probs.device)
-        target_probs.scatter_add_(1, lower, probs * (1.0 - frac))
-        target_probs.scatter_add_(1, upper, probs * frac)
+        target_probs = compute_categorical_td_target(
+            support=support,
+            target_log_probs=next_q_log_probs,
+            reward=rewards,
+            dones=dones,
+            truncated=truncated,
+            actor_entropy=actor_entropy,
+            gamma=gamma,
+        )
         return cast(torch.Tensor, -(target_probs.unsqueeze(0) * pred_log_probs).sum(dim=-1).mean())
 
     def _actor_loss_tensors(
@@ -1083,47 +1036,15 @@ class FlashSACLearner:
         }
 
     def soft_update_target(self) -> None:
-        with torch.no_grad():
-            for target_param, param in zip(
-                self.target_critic.parameters(), self.critic.parameters()
-            ):
-                target_param.data.mul_(1.0 - self.tau).add_(param.data, alpha=self.tau)
+        polyak_update_target(self.target_critic, self.critic, self.tau)
 
-    def set_gradient_sync(
-        self,
-        sync: Callable[[Iterable[torch.Tensor]], None] | None,
-        *,
-        graph_replay_recorder: Callable[[int], None] | None = None,
-    ) -> None:
-        """Attach the per-optimizer gradient collective used by multi-GPU DP."""
-        if sync is None and graph_replay_recorder is not None:
-            raise ValueError("graph_replay_recorder requires a gradient sync callback")
-        if sync != self._gradient_sync:
-            self._reset_critic_cuda_graph()
-            self._reset_actor_cuda_graph()
-        self._gradient_sync = sync
-        self._gradient_sync_graph_replay_recorder = graph_replay_recorder
-        self.dp_cuda_graph_gradient_sync = bool(
-            sync is not None
+    def _dp_cuda_graph_gradient_sync_enabled(self) -> bool:
+        return bool(
+            self._gradient_sync is not None
             and self.scaler is None
             and isinstance(self.obs_normalizer, nn.Identity)
             and (self.use_cuda_graph_critic or self.use_cuda_graph_actor)
         )
-
-    def _sync_gradients(self, parameters: Iterable[torch.Tensor]) -> None:
-        if self._gradient_sync is not None:
-            self._gradient_sync(parameters)
-            if self._active_cuda_graph_gradient_sync_calls is not None:
-                self._active_cuda_graph_gradient_sync_calls[0] += 1
-
-    def _record_cuda_graph_gradient_replay(self, collective_calls: int) -> None:
-        if self._gradient_sync_graph_replay_recorder is not None and collective_calls > 0:
-            self._gradient_sync_graph_replay_recorder(collective_calls)
-
-    def release_cuda_graphs(self) -> None:
-        """Release captured NCCL nodes before the process group is destroyed."""
-        self._reset_critic_cuda_graph()
-        self._reset_actor_cuda_graph()
 
     def dp_initial_sync_tensors(self) -> dict[str, torch.Tensor]:
         """Model state broadcast once from rank 0 before collection starts.

@@ -84,6 +84,43 @@ env contract 是一个最小化的、基于 numpy 的自动 reset 向量化环�
 docstring；如何不 fork 本仓库、通过 `runtime_resolver` 接入自定义算法，
 见 [`AGENTS.md`](AGENTS.md) 的「新算法扩展方式」一节。
 
+### PPO curriculum checkpoint 状态
+
+`RslRlPPORuntime.runner_cls` 是可选的：训练入口可藉此在 wrapper 之外选择
+自定义 runner。取 `None` 时保持入口既有的标准 runner；旧的仅提供 wrapper
+的 resolver 继续可用。
+
+对于必须恢复 curriculum 进度的训练，请选择
+`uni_rl.algos.rsl_rl_training_state.TrainingStateOnPolicyRunner`。其 wrapper
+必须显式实现 `uni_rl.training_state.TrainingStateProvider` 协议，否则调用方
+必须向 runner 传入 `training_state_provider=`:
+
+```python
+def export_training_state(self) -> Mapping[str, object]:
+    return {"schema": "my-task-v1", "steps": self.steps, "difficulty": self.difficulty}
+
+
+def import_training_state(self, state: Mapping[str, object]) -> None:
+    # Validate the complete owner schema before changing any state.
+    ...
+```
+
+runner 会在 `checkpoint["infos"]["uni_rl_training_state"]` 中存放一个
+version-1 envelope;payload 为纯 JSON 数据，schema/version 归 provider
+所有。数组必须显式转换为 list。runner 不会探测嵌套的 env，也不会序列化
+owner 对象。算法、optimizer、iteration 与 logger 的既有行为仍由父 runner
+负责。
+
+`load()` 默认要求存在有效的 training state。只有显式的 actor-only
+`load_cfg={"actor": True}` 才允许对 legacy checkpoint 使用
+`restore_training_state=False`。envelope 错误会在算法加载之前被拒绝；
+provider 的 import 错误会直接传播，且必须中止 resume。算法与 provider 的
+加载不是事务性回滚。本 contract 覆盖训练进度，不包含物理或 RNG 快照。
+
+该 runner 独立于任何具体任务或仿真器。下游 provider 必须把自身的计数器与
+自适应 curriculum 状态一起恢复；如果下一步会重新计算某个派生计数器，只
+恢复它本身是不够的。
+
 ## 设计契约
 
 `uni_rl` **不**依赖任何仿真器或环境库。算法行为归属 `uni_rl.algos.*`

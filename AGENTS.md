@@ -14,12 +14,13 @@ uni_rl（distribution 名 `unilab-rl`）是从 UniLab 拆出的 **RL 算法与�
 
 ## Layout
 
-- `src/uni_rl/algos/` — `appo`（异步 PPO）、`fast_sac` / `fast_td3` / `flash_sac`（off-policy learner + double-buffer builder）、`rsl_rl.py` / `rsl_rl_ppo.py` / `rsl_rl_runtime.py`（rsl_rl 封装）、`common`（共享网络 / normalization / compile 辅助）
+- `src/uni_rl/algos/` — `appo`（异步 PPO）、`fast_sac` / `fast_td3` / `flash_sac`（off-policy learner + double-buffer builder）、`rsl_rl.py` / `rsl_rl_ppo.py` / `rsl_rl_runtime.py`（rsl_rl 封装）、`rsl_rl_training_state.py`（带 curriculum 进度存取的 OnPolicyRunner 扩展）、`common`（共享网络 / normalization / compile 辅助 / learner 样板 mixin）
 - `src/uni_rl/ipc/` — async runner、shm rollout/replay buffer、replay pipeline、DP gradient sync、memory budget
 - `src/uni_rl/offpolicy/` — 通用 off-policy double-buffer runner 脚手架；`actor_adapter.py` 是自定义 off-policy actor 的扩展 registry
-- `src/uni_rl/logging/` — tensorboard / wandb logger、trace recorder
+- `src/uni_rl/logging/` — tensorboard / wandb logger、trace recorder、collector 指标分发（metrics_drain）
 - `src/uni_rl/utils/` — device / seed / nan_guard / observations / final_observation
 - `src/uni_rl/env_contract.py` — 注入式 env contract
+- `src/uni_rl/training_state.py` — `TrainingStateProvider` 协议：owner 侧显式 checkpoint 训练进度（纯 JSON payload）
 
 ## 开发命令
 

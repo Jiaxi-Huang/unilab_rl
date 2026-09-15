@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import sys
 from collections import deque
 from collections.abc import Iterable
 from typing import Any
@@ -11,6 +10,7 @@ from uni_rl.algos.common.device import get_env_dims
 from uni_rl.env_contract import EnvFactory
 from uni_rl.ipc.async_runner import AsyncRunner
 from uni_rl.logging import OffPolicyLogger
+from uni_rl.logging.metrics_drain import drain_collector_metrics
 from uni_rl.offpolicy.actor_adapter import import_actor_adapter_modules
 from uni_rl.utils.device import get_default_device
 from uni_rl.utils.nan_guard import NanGuardCfg
@@ -234,46 +234,14 @@ class OffPolicyRunner(AsyncRunner):
         *,
         log_collector_reward: bool = True,
     ):
-        while True:
-            try:
-                metrics = queue.get_nowait()
-            except Exception:
-                break
-            if "error" in metrics:
-                logger.log_status(f"[red]Collector ERROR: {metrics['error']}[/]")
-                raise RuntimeError(f"Collector process failed: {metrics['error']}")
-
-            try:
-                updated_reward = False
-                if "runtime_manifest" in metrics:
-                    logger.update_runtime_manifest(metrics["runtime_manifest"])
-                if "mean_ep_reward" in metrics:
-                    reward_history.append(metrics["mean_ep_reward"])
-                    updated_reward = True
-                if "reward_components" in metrics:
-                    reward_components.clear()
-                    reward_components.update(metrics["reward_components"])
-                if "mean_ep_length" in metrics:
-                    logger.update_ep_length(metrics["mean_ep_length"])
-                if "collector_timing_ms" in metrics:
-                    logger.update_collector_timing(metrics["collector_timing_ms"])
-                active_steps_per_sec = metrics.get("collector_active_steps_per_sec")
-                if active_steps_per_sec is not None:
-                    logger.update_collector_active_steps_per_sec(float(active_steps_per_sec))
-                if "timeout_rate" in metrics:
-                    logger.update_timeout_rate(float(metrics["timeout_rate"]))
-                if "total_steps" in metrics and "buffer_size" in metrics:
-                    logger.log_collector(
-                        metrics["total_steps"],
-                        metrics["buffer_size"],
-                        (
-                            metrics.get("mean_ep_reward", 0.0)
-                            if updated_reward and log_collector_reward
-                            else 0.0
-                        ),
-                    )
-                if trace_recorder and "trace_events" in metrics:
-                    trace_recorder.extend(metrics["trace_events"])
-            except Exception as exc:
-                print(f"[OffPolicyRunner] metrics drain error: {exc}", file=sys.stderr)
-                break
+        drain_collector_metrics(
+            queue,
+            reward_history,
+            reward_components,
+            logger,
+            trace_recorder,
+            runner_label="OffPolicyRunner",
+            raise_on_collector_error=True,
+            require_buffer_size=True,
+            log_collector_reward=log_collector_reward,
+        )

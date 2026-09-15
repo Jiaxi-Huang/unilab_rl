@@ -8,7 +8,6 @@ Pipeline:
 
 import multiprocessing as mp
 import os
-import sys
 import time
 from collections import deque
 from copy import deepcopy
@@ -23,8 +22,9 @@ from uni_rl.algos.appo.worker import appo_collector_fn
 from uni_rl.env_contract import EnvFactory
 from uni_rl.ipc import AsyncRunner, RolloutRingBuffer, SharedWeightSync
 from uni_rl.logging import OffPolicyLogger
+from uni_rl.logging.metrics_drain import drain_collector_metrics
 from uni_rl.utils.nan_guard import NanGuardCfg
-from uni_rl.utils.observations import get_critic_base_dim, get_obs_dims
+from uni_rl.utils.observations import get_obs_dims
 from uni_rl.utils.seed import apply_training_seed, derive_worker_seed
 
 
@@ -122,7 +122,7 @@ class APPORunner(AsyncRunner):
         env = self.env_factory(1, self.env_cfg_overrides if self.env_cfg_overrides else None)
         obs_dim, critic_dim = get_obs_dims(dict(env.obs_groups_spec))
         self.critic_dim = critic_dim
-        self.critic_input_dim = get_critic_base_dim(dict(env.obs_groups_spec))
+        self.critic_input_dim = critic_dim
         assert env.action_space.shape is not None
         action_dim = env.action_space.shape[0]
         env.close()
@@ -440,45 +440,17 @@ class APPORunner(AsyncRunner):
     def _drain_metrics(queue, reward_history, reward_components, logger):
         """Drain all pending messages from the collector metrics queue.
 
-        Mirrors OffPolicyRunner._drain_metrics so APPO has the same
-        logger update coverage (ep_length, done rates, collector timing).
+        Shares the dispatch with OffPolicyRunner via
+        ``uni_rl.logging.metrics_drain.drain_collector_metrics``; APPO reports
+        collector errors on stderr instead of raising, and logs a buffer size
+        of 0 (shared memory, not a separate buffer).
         """
-        while not queue.empty():
-            try:
-                m = queue.get_nowait()
-                if "error" in m:
-                    logger.log_status(f"[red]Collector ERROR: {m['error']}[/]")
-                    raise RuntimeError(f"Collector process failed: {m['error']}")
-
-                if "mean_ep_reward" in m:
-                    reward_history.append(m["mean_ep_reward"])
-
-                if "reward_components" in m:
-                    reward_components.clear()
-                    reward_components.update(m["reward_components"])
-
-                if "mean_ep_length" in m:
-                    logger.update_ep_length(m["mean_ep_length"])
-
-                if "collector_timing_ms" in m:
-                    logger.update_collector_timing(m["collector_timing_ms"])
-
-                collector_active_steps_per_sec = m.get("collector_active_steps_per_sec")
-                if collector_active_steps_per_sec is not None:
-                    logger.update_collector_active_steps_per_sec(
-                        float(collector_active_steps_per_sec)
-                    )
-
-                if "timeout_rate" in m:
-                    logger.update_timeout_rate(float(m["timeout_rate"]))
-
-                if "total_steps" in m:
-                    logger.log_collector(
-                        m["total_steps"],
-                        0,  # APPO uses shared memory, not a separate buffer
-                        m.get("mean_ep_reward", 0.0),
-                    )
-
-            except Exception as e:
-                print(f"[APPORunner] metrics drain error: {e}", file=sys.stderr)
-                break
+        drain_collector_metrics(
+            queue,
+            reward_history,
+            reward_components,
+            logger,
+            runner_label="APPORunner",
+            raise_on_collector_error=False,
+            require_buffer_size=False,
+        )
