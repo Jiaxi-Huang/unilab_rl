@@ -1,9 +1,7 @@
-"""Optional native H2D submit helper with graceful fallback.
+"""Availability probe for the optional native H2D submit extension.
 
-Pre-validates build prerequisites before attempting JIT compilation.
-Falls back to ``dst.copy_(src, non_blocking=True)`` on a side stream
-when the native extension is unavailable — functionally identical for
-pinned-memory transfers (the ROCm path already uses this).
+Pre-validates build prerequisites before attempting JIT compilation so
+callers can report why the native path is unavailable.
 """
 
 from __future__ import annotations
@@ -13,8 +11,6 @@ import shutil
 from functools import lru_cache
 from pathlib import Path
 from typing import Any
-
-import torch
 
 logger = logging.getLogger(__name__)
 
@@ -117,17 +113,3 @@ def get_diagnostic() -> str:
     if _NATIVE_AVAILABLE is None:
         _try_load_extension()
     return _DIAGNOSTIC
-
-
-def submit_h2d(
-    dst: torch.Tensor,
-    src: torch.Tensor,
-    stream: torch.cuda.Stream,
-) -> None:
-    """Submit one async H2D copy on an existing CUDA stream."""
-    ext = _try_load_extension()
-    if ext is not None:
-        ext.submit_h2d(dst, src, int(stream.cuda_stream))
-    else:
-        with torch.cuda.stream(stream):
-            dst.copy_(src, non_blocking=True)

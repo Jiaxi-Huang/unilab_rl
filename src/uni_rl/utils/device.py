@@ -431,36 +431,3 @@ def get_device_info_dict() -> dict[str, str]:
     elif _is_windows():
         base.update(_get_device_info_windows())
     return base
-
-
-def get_device_info_line() -> str:
-    d = get_device_info_dict()
-    if _is_macos():
-        # Build core-type summary dynamically so M5 (super+performance) is shown correctly
-        if d.get("cpu_core_type_1") and d.get("cpu_core_type_2"):
-            t1 = d["cpu_core_type_1"][0].upper()
-            t2 = d["cpu_core_type_2"][0].upper()
-            core_summary = f"{d['cpu_core_count_1']}{t1}+{d['cpu_core_count_2']}{t2}"
-        elif (
-            d.get("cpu_performance_cores") != "unknown"
-            and d.get("cpu_efficiency_cores") != "unknown"
-        ):
-            core_summary = f"{d['cpu_performance_cores']}P+{d['cpu_efficiency_cores']}E"
-        else:
-            core_summary = "unknown"
-        return (
-            f"Device: {d.get('chip', 'unknown')} | "
-            f"CPU: {d.get('cpu_total_cores', 'unknown')} cores "
-            f"({core_summary}) | "
-            f"GPU: {d.get('gpu_cores', 'unknown')} cores | "
-            f"Memory: {d.get('memory', 'unknown')}"
-        )
-    else:
-        gpu_part = d.get("gpu_name", "unknown")
-        if "gpu_memory" in d:
-            gpu_part += f" ({d['gpu_memory']})"
-        return (
-            f"CPU: {d.get('chip', 'unknown')} ({d.get('cpu_total_cores', 'unknown')} cores) | "
-            f"GPU: {gpu_part} | "
-            f"Memory: {d.get('memory', 'unknown')}"
-        )

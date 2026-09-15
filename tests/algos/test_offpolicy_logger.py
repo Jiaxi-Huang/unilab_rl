@@ -171,7 +171,6 @@ def test_offpolicy_logger_discards_retired_collector_timing_names() -> None:
 
     logger.update_collector_timing(
         {
-            "inference_wait_ms": 2.0,
             "learner_action_wait_ms": 4.0,
             "sync_idle_ms": 3.0,
         }

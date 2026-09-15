@@ -18,7 +18,6 @@ class SharedWeightSync:
     def __init__(
         self, param_shapes: Dict, *, create: bool = True, shm_name: str | None = None, lock=None
     ):
-        self._param_shapes = param_shapes
         self._param_names = list(param_shapes.keys())
         self.trace_recorder: Any | None = None
         self.trace_thread_time = False

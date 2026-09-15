@@ -468,9 +468,6 @@ class OffPolicyLogger(BaseTrainingLogger):
 
     def update_collector_timing(self, timing_ms: dict[str, float]):
         normalized = dict(timing_ms)
-        legacy_action_wait = normalized.pop("inference_wait_ms", None)
-        if "learner_action_wait_ms" not in normalized and legacy_action_wait is not None:
-            normalized["learner_action_wait_ms"] = legacy_action_wait
         normalized.pop("sync_idle_ms", None)
         normalized.pop("bookkeeping_ms", None)
         self._collector_timing.update(normalized)
@@ -483,9 +480,6 @@ class OffPolicyLogger(BaseTrainingLogger):
 
     def update_buffer_utilization(self, utilization: float):
         self._buffer_utilization = float(utilization)
-
-    def update_replay_queue(self, current_len: int, max_size: int):
-        self.update_staging_pool(current_len, max_size)
 
     def update_staging_pool(self, current_len: int, max_size: int):
         self._staging_pool_len = current_len

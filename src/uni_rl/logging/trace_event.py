@@ -4,7 +4,6 @@ import json
 import os
 import threading
 import time
-from contextlib import contextmanager
 from pathlib import Path
 from typing import Any
 
@@ -71,28 +70,6 @@ class TraceRecorder:
         }
         with self._lock:
             self._events.append(event)
-
-    @contextmanager
-    def span(
-        self,
-        name: str,
-        *,
-        category: str,
-        tid: int | None = None,
-        args: dict[str, Any] | None = None,
-    ):
-        start_ns = time.perf_counter_ns()
-        try:
-            yield start_ns
-        finally:
-            self.add_slice(
-                name,
-                category=category,
-                start_ns=start_ns,
-                end_ns=time.perf_counter_ns(),
-                tid=tid,
-                args=args,
-            )
 
     def add_counter(
         self,

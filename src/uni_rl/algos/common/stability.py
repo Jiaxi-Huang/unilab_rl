@@ -29,20 +29,3 @@ def clip_gradients(parameters, max_norm: float = 10.0):
         max_norm: Maximum gradient norm
     """
     torch.nn.utils.clip_grad_norm_(parameters, max_norm=max_norm)
-
-
-def safe_tensor(
-    tensor: torch.Tensor, nan_value: float = 0.0, clamp_range: tuple = (-10.0, 10.0)
-) -> torch.Tensor:
-    """Make tensor numerically safe by clamping and replacing NaN values.
-
-    Args:
-        tensor: Input tensor
-        nan_value: Value to replace NaN with
-        clamp_range: (min, max) range to clamp values
-
-    Returns:
-        Safe tensor
-    """
-    tensor = torch.clamp(tensor, clamp_range[0], clamp_range[1])
-    return torch.nan_to_num(tensor, nan=nan_value)

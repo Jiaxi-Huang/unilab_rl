@@ -26,9 +26,3 @@ def get_obs_dims(obs_groups_spec: dict[str, int]) -> tuple[int, int]:
     """
     obs_dim = obs_groups_spec.get("obs", 0)
     return obs_dim, obs_groups_spec.get("critic", obs_dim)
-
-
-def get_critic_base_dim(obs_groups_spec: dict[str, int]) -> int:
-    """Get critic observation dim, falling back to actor obs when absent."""
-    critic_dim = obs_groups_spec.get("critic", 0)
-    return critic_dim if critic_dim > 0 else obs_groups_spec.get("obs", 0)

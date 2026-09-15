@@ -7,6 +7,59 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.2.1] - 2026-09-15
+
+### Removed
+
+- `FastSACRunner` and `FlashSACRunner` kwargs-style runner classes. They were
+  stale duplicates of the `build_*_double_buffer_runner` builder functions
+  (lacking `dp_sync`, `nan_guard_cfg`, `collector_cpu_ids`,
+  `actor_adapter_modules`, and `inference_request_timeout_sec` support) with no
+  consumers in uni_rl or UniLab. Use the builder functions instead; the
+  `FlashSACRunner` re-export in `uni_rl.algos.flash_sac` is gone with them.
+- The unused submit/ready half of the replay transfer backend contract:
+  `ReplayTransferBackend.submit_h2d` / `ready_query` /
+  `wait_current_stream_for_ready` / `synchronize_ready` / `clear_ready` /
+  `supports_async_submit`, the corresponding `CudaLikeReplayTransferBackend`
+  and `TorchCopyReplayTransferBackend` implementations, and
+  `native_h2d.submit_h2d`. `GPUResidentReplayPipeline` performs the H2D copy
+  inline; existing custom backends with extra methods remain compatible.
+  `native_h2d.is_available` / `get_diagnostic` are kept.
+- Dead public helpers with zero consumers in uni_rl and UniLab:
+  `uni_rl.algos.common.safe_tensor`, `EmpiricalNormalization.inverse`,
+  `TraceRecorder.span`, `OffPolicyLogger.update_replay_queue`,
+  `uni_rl.utils.device.get_device_info_line`,
+  `uni_rl.utils.seed.apply_configured_training_seed`,
+  `TrainingSeedInfo.to_dict`, and
+  `uni_rl.utils.observations.get_critic_base_dim` (equivalent to
+  `get_obs_dims(spec)[1]`).
+- Internal dead code: `APPOLearner.train_mode`, write-only attributes
+  (`SharedWeightSync._param_shapes`, `APPOLearner.last_update_metrics`,
+  `SACActor.device_`), and the `inference_wait_ms` metric key compatibility
+  branch (producers have emitted `learner_action_wait_ms` exclusively).
+
+### Changed
+
+- Shared learner boilerplate (AMP dtype resolution, grad-scaler/autocast,
+  gradient sync, obs-normalizer update, Polyak target update, CUDA-graph
+  release/compile helpers) is consolidated into
+  `uni_rl.algos.common.learner_boilerplate`; `fast_sac` and `flash_sac`
+  learners no longer carry 24 byte-identical method copies. Behavior is
+  bit-identical (verified by A/B comparison).
+- Collector metrics draining is shared between `APPORunner` and
+  `OffPolicyRunner` via `uni_rl.logging.metrics_drain.drain_collector_metrics`,
+  replacing two acknowledged copies of the dispatch logic.
+- `flash_sac`'s inlined categorical TD projection now calls
+  `update.compute_categorical_td_target`, removing the duplicated projection
+  math (verified bit-identical).
+
+### Fixed
+
+- Removed stale `dist/` build artifacts (1.0.0/1.1.0) that broke the
+  `make smoke` wheel glob, and the leftover `uni_rl.algos.hora` `__pycache__`.
+- `README_zh.md` now includes the "PPO curriculum checkpoint state" section,
+  in sync with the English README.
+
 ## [1.2.0] - 2026-09-10
 
 ### Changed

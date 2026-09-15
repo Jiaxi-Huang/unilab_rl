@@ -209,7 +209,6 @@ class APPOLearner:
         self.vtrace_clip_rho = vtrace_clip_rho
         self.vtrace_clip_c = vtrace_clip_c
         self._update_counter = 0
-        self.last_update_metrics: dict[str, float] = {}
         self.enable_compile = (
             bool(enable_compile) and get_torch_compile_for_cuda(device, warn=True) is not None
         )
@@ -316,11 +315,6 @@ class APPOLearner:
 
         loss = surrogate_loss + self.value_loss_coef * value_loss - self.entropy_coef * entropy
         return loss, surrogate_loss, value_loss, entropy, kl_mean, current_log_prob, ratio
-
-    def train_mode(self):
-        """Set actor/critic to training mode (enables EmpiricalNormalization.update)."""
-        self.actor.train()
-        self.critic.train()
 
     def update_target_network(self):
         """Soft update target actor: target = tau * current + (1 - tau) * target."""
@@ -581,5 +575,4 @@ class APPOLearner:
             "appo/updates_executed": float(num_updates),
         }
         metrics.update(batch_dict.get("_appo_process_metrics", {}))
-        self.last_update_metrics = metrics
         return metrics

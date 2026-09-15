@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import queue
+from collections import deque
 
 import numpy as np
 import pytest
@@ -181,9 +182,6 @@ class _FakeLogger:
 
     def finish(self) -> None:
         pass
-
-    def update_replay_queue(self, current_len: int, max_size: int) -> None:
-        del current_len, max_size
 
     def update_staging_pool(self, current_len: int, max_size: int) -> None:
         del current_len, max_size
@@ -499,3 +497,78 @@ def test_appo_runner_fails_fast_when_collector_dies_during_wait(
     # below the 60s total wait budget.
     assert elapsed < 5.0, f"chunked wait took {elapsed:.2f}s — should fail fast"
     assert call_count["n"] >= 2, "liveness check should be called at least twice"
+
+
+class _DrainFakeLogger:
+    def __init__(self) -> None:
+        self.statuses: list[str] = []
+        self.collector_calls: list[tuple[int, int, float]] = []
+        self.ep_lengths: list[float] = []
+        self.timeout_rates: list[float] = []
+        self.timing: list[dict[str, float]] = []
+        self.active_steps_per_sec: list[float] = []
+        self.manifests: list[dict] = []
+
+    def log_status(self, status: str) -> None:
+        self.statuses.append(status)
+
+    def update_runtime_manifest(self, manifest: dict) -> None:
+        self.manifests.append(dict(manifest))
+
+    def update_ep_length(self, mean_ep_length: float) -> None:
+        self.ep_lengths.append(mean_ep_length)
+
+    def update_collector_timing(self, timing_ms: dict[str, float]) -> None:
+        self.timing.append(dict(timing_ms))
+
+    def update_collector_active_steps_per_sec(self, steps_per_sec: float) -> None:
+        self.active_steps_per_sec.append(steps_per_sec)
+
+    def update_timeout_rate(self, timeout_rate: float) -> None:
+        self.timeout_rates.append(timeout_rate)
+
+    def log_collector(self, total_steps: int, buffer_size: int, mean_reward: float = 0.0) -> None:
+        self.collector_calls.append((total_steps, buffer_size, mean_reward))
+
+
+def test_drain_metrics_swallows_collector_error(capsys: pytest.CaptureFixture) -> None:
+    metrics = queue.Queue()
+    metrics.put({"error": "collector boom"})
+    logger = _DrainFakeLogger()
+
+    # Unlike OffPolicyRunner, APPO reports the collector error on stderr and
+    # keeps the drain loop alive instead of raising.
+    APPORunner._drain_metrics(metrics, deque(maxlen=10), {}, logger)
+
+    assert any("collector boom" in status for status in logger.statuses)
+    assert "Collector process failed: collector boom" in capsys.readouterr().err
+
+
+def test_drain_metrics_dispatches_shared_message_fields() -> None:
+    metrics = queue.Queue()
+    metrics.put(
+        {
+            "total_steps": 128,
+            "mean_ep_reward": 1.5,
+            "mean_ep_length": 42.0,
+            "timeout_rate": 0.25,
+            "collector_timing_ms": {"rollout": 3.0},
+            "collector_active_steps_per_sec": 1000,
+            "reward_components": {"task": 2.0},
+        }
+    )
+    reward_history: deque = deque(maxlen=10)
+    reward_components: dict = {}
+    logger = _DrainFakeLogger()
+
+    APPORunner._drain_metrics(metrics, reward_history, reward_components, logger)
+
+    # APPO uses shared memory, so buffer_size is always 0 even though the
+    # message carries no buffer_size key.
+    assert logger.collector_calls == [(128, 0, 1.5)]
+    assert logger.ep_lengths == [42.0]
+    assert logger.timeout_rates == [0.25]
+    assert logger.timing == [{"rollout": 3.0}]
+    assert logger.active_steps_per_sec == [1000.0]
+    assert list(reward_history) == [1.5]
+    assert reward_components == {"task": 2.0}

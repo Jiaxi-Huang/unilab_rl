@@ -74,6 +74,3 @@ class EmpiricalNormalization(nn.Module):
         self._var.copy_(M2 / new_count)
         self._std.copy_(self._var.sqrt())
         self.count.copy_(new_count)
-
-    def inverse(self, y):
-        return y * (self._std + self.eps) + self._mean

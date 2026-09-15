@@ -18,13 +18,6 @@ class TrainingSeedInfo:
     configured_seed_source: str | None
     effective_seed: int | None
 
-    def to_dict(self) -> dict[str, int | str | None]:
-        return {
-            "configured_seed": self.configured_seed,
-            "configured_seed_source": self.configured_seed_source,
-            "effective_seed": self.effective_seed,
-        }
-
 
 def _select_seed(cfg: Any, path: str) -> Any:
     if OmegaConf.is_config(cfg):
@@ -98,23 +91,3 @@ def apply_training_seed(
                 torch.cuda.manual_seed_all(effective_seed)
 
     return effective_seed
-
-
-def apply_configured_training_seed(
-    cfg: Any,
-    *,
-    torch_runtime: bool = True,
-    cuda: bool = True,
-) -> TrainingSeedInfo:
-    """Resolve and apply the configured training seed before runtime construction."""
-    seed_info = resolve_training_seed(cfg)
-    effective_seed = apply_training_seed(
-        seed_info.effective_seed,
-        torch_runtime=torch_runtime,
-        cuda=cuda,
-    )
-    return TrainingSeedInfo(
-        configured_seed=seed_info.configured_seed,
-        configured_seed_source=seed_info.configured_seed_source,
-        effective_seed=effective_seed,
-    )
