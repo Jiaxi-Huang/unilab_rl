@@ -66,6 +66,44 @@ def drain_collector_metrics(
                 logger.update_collector_active_steps_per_sec(float(active_steps_per_sec))
             if "timeout_rate" in metrics:
                 logger.update_timeout_rate(float(metrics["timeout_rate"]))
+            reason_rates = metrics.get("termination_reason_rates")
+            if isinstance(reason_rates, dict) and hasattr(logger, "update_metrics"):
+                # Canonical slash metrics are consumed by all logger
+                # backends and remain harmless for non-SONIC tasks.
+                logger.update_metrics(
+                    {
+                        f"termination/{str(name)}_rate": float(value)
+                        for name, value in reason_rates.items()
+                    }
+                )
+            reason_counts = metrics.get("termination_reason_counts")
+            if isinstance(reason_counts, dict) and hasattr(logger, "update_metrics"):
+                logger.update_metrics(
+                    {
+                        f"termination/{str(name)}_count": float(value)
+                        for name, value in reason_counts.items()
+                    }
+                )
+            adaptive_sampling = metrics.get("adaptive_sampling")
+            if isinstance(adaptive_sampling, dict):
+                sampling_scalars = adaptive_sampling.get("scalars")
+                if isinstance(sampling_scalars, dict) and hasattr(logger, "update_metrics"):
+                    logger.update_metrics(
+                        {
+                            f"sampling/{str(name)}": float(value)
+                            for name, value in sampling_scalars.items()
+                        }
+                    )
+                sampling_histograms = adaptive_sampling.get("histograms")
+                if isinstance(sampling_histograms, dict) and hasattr(
+                    logger, "update_histograms"
+                ):
+                    logger.update_histograms(
+                        {
+                            f"sampling/{str(name)}": value
+                            for name, value in sampling_histograms.items()
+                        }
+                    )
             if "total_steps" in metrics and (not require_buffer_size or "buffer_size" in metrics):
                 logger.log_collector(
                     metrics["total_steps"],

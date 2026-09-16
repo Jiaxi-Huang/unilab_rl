@@ -478,6 +478,18 @@ def test_offpolicy_terminal_averages_aggregated_samples_over_two_seconds(
     assert latest_backend_values["train/critic_loss"] == pytest.approx(4.0)
     assert latest_backend_values["perf/steps_per_sec"] == pytest.approx(800.0)
 
+    logger.update_metrics({"sonic_cycle_consistency": 0.25, "action_mean": -0.1})
+    logger.log_step(
+        iteration=99,
+        metrics={},
+        train_time=0.1,
+        iteration_time=0.1,
+        extra_info={},
+    )
+    latest_backend_values = {tag: value for tag, value, _ in writer.scalars}
+    assert latest_backend_values["train/sonic_cycle_consistency"] == pytest.approx(0.25)
+    assert latest_backend_values["train/action_mean"] == pytest.approx(-0.1)
+
     now = 103.1
     logger.log_step(
         iteration=3,

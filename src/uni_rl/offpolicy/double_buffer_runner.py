@@ -613,7 +613,7 @@ class DoubleBufferOffPolicyRunner(OffPolicyRunner):
         if actor_adapter is not None and actor_adapter.actor_context_from_obs is not None:
             actor_context = actor_adapter.actor_context_from_obs(obs_device, self.obs_dim)
         if self.obs_normalization:
-            actor_obs = self.learner.obs_normalizer(actor_obs, update=False)
+            actor_obs = self.learner.normalize_observations(actor_obs, update=False)
         forward_start_ns = time.perf_counter_ns()
         with torch.no_grad():
             actions_device = sample_offpolicy_actions(

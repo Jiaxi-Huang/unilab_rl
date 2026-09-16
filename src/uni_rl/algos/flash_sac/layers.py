@@ -15,6 +15,20 @@ def safe_tanh_log_det_jacobian(x: torch.Tensor) -> torch.Tensor:
     return cast(torch.Tensor, 2.0 * (math.log(2.0) - x - F.softplus(-2.0 * x)))
 
 
+def sample_normal_tanh(
+    mean: torch.Tensor, std: torch.Tensor
+) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
+        # ``std`` is positive by construction (exp of bounded log_std). The
+        # distribution's generic validation performs a GPU-to-host truth check,
+        # which CUDA forbids while this actor is captured into an optimizer graph.
+        dist = torch.distributions.Normal(mean, std, validate_args=False)
+        raw_action = dist.rsample()
+        tanh_action = torch.tanh(raw_action)
+        log_prob = dist.log_prob(raw_action)
+        log_prob = log_prob - safe_tanh_log_det_jacobian(raw_action)
+        log_prob = log_prob.sum(dim=-1)
+        return tanh_action, {"log_prob": log_prob, "mean": mean, "std": std}
+
 class UnitLinear(nn.Module):
     """Linear layer with post-step weight normalization."""
 
@@ -25,6 +39,11 @@ class UnitLinear(nn.Module):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return cast(torch.Tensor, self.w(x))
+
+    @property
+    def weight(self) -> torch.Tensor:
+        """Compatibility view matching ``nn.Linear.weight``."""
+        return self.w.weight
 
     def normalize_parameters(self) -> None:
         with torch.no_grad():
@@ -139,19 +158,26 @@ class NormalTanhPolicy(nn.Module):
         std = torch.exp(log_std)
         return mean, std
 
+    @staticmethod
+    def sample_from_mean_std(
+        mean: torch.Tensor,
+        std: torch.Tensor,
+        *,
+        action_scale: torch.Tensor | None = None,
+        action_bias: torch.Tensor | None = None,
+    ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
+        """Shared normalized-tanh Gaussian semantics for custom backbones."""
+        action, info = sample_normal_tanh(mean, std)
+        if action_scale is not None or action_bias is not None:
+            scale = torch.ones(mean.shape[-1], device=mean.device, dtype=mean.dtype) if action_scale is None else action_scale
+            bias = torch.zeros(mean.shape[-1], device=mean.device, dtype=mean.dtype) if action_bias is None else action_bias
+            action = action * scale + bias
+            info["log_prob"] = info["log_prob"] - torch.log(scale.abs() + 1e-6).sum()
+        return action, info
+
     def forward(self, x: torch.Tensor) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
         mean, std = self.get_mean_and_std(x)
-        # ``std`` is positive by construction (exp of bounded log_std). The
-        # distribution's generic validation performs a GPU-to-host truth check,
-        # which CUDA forbids while this actor is captured into an optimizer graph.
-        dist = torch.distributions.Normal(mean, std, validate_args=False)
-        raw_action = dist.rsample()
-        tanh_action = torch.tanh(raw_action)
-        log_prob = dist.log_prob(raw_action)
-        log_prob = log_prob - safe_tanh_log_det_jacobian(raw_action)
-        log_prob = log_prob.sum(dim=-1)
-        return tanh_action, {"log_prob": log_prob, "mean": mean, "std": std}
-
+        return self.sample_from_mean_std(mean, std)
 
 class EnsembleUnitLinear(nn.Module):
     def __init__(self, num_ensemble: int, input_dim: int, output_dim: int):

@@ -162,6 +162,7 @@ def off_policy_collector_fn(
     nan_guard_cfg=None,
     torch_thread_runtime=None,
     backend_device_binder=None,
+    adaptive_histogram_interval: int = 0,
 ):
     """Entry point for the off-policy collector subprocess.
 
@@ -188,6 +189,7 @@ def off_policy_collector_fn(
         nan_guard_cfg=nan_guard_cfg,
         torch_thread_runtime=torch_thread_runtime,
         backend_device_binder=backend_device_binder,
+        adaptive_histogram_interval=adaptive_histogram_interval,
     )
 
 
@@ -211,6 +213,7 @@ def _run_collector(
     nan_guard_cfg=None,
     torch_thread_runtime=None,
     backend_device_binder=None,
+    adaptive_histogram_interval: int = 0,
 ):
     # Spawn subprocesses do not inherit the parent's adapter registrations;
     # import the configured modules so registration side effects run here too.
@@ -261,6 +264,7 @@ def _run_collector(
     timing_counts: defaultdict[str, int] = defaultdict(int)
     done_count_window = 0
     timeout_count_window = 0
+    termination_reason_counts: defaultdict[str, int] = defaultdict(int)
 
     state = env.state
     assert state is not None
@@ -394,6 +398,37 @@ def _run_collector(
             done_count_window += int(np.count_nonzero(done_mask_np))
             timeout_count_window += int(np.count_nonzero(timeout_mask_np))
 
+            # SONIC environments expose a stable reason mask. Keep this
+            # diagnostic path optional so generic tasks retain their existing
+            # metrics contract.
+            reason_mask = state.info.get("termination_reason_mask")
+            reason_names = state.info.get("termination_reason_names")
+            if reason_mask is not None and reason_names is not None:
+                mask = np.asarray(reason_mask, dtype=bool)
+                if (
+                    mask.ndim == 2
+                    and mask.shape[0] == num_envs
+                    and mask.shape[1] == len(reason_names)
+                ):
+                    mask &= done_mask_np[:, None]
+                    for index, name in enumerate(reason_names):
+                        termination_reason_counts[str(name)] += int(
+                            np.count_nonzero(mask[:, index])
+                        )
+
+            adaptive_sampling = state.info.get("adaptive_sampling")
+            if (
+                adaptive_sampling is not None
+                and adaptive_histogram_interval > 0
+                and inference_tick % adaptive_histogram_interval == 0
+            ):
+                _, sampling_histograms = env.command_manager.get_diagnostics(
+                    include_histograms=True
+                )
+                if sampling_histograms:
+                    adaptive_sampling = dict(adaptive_sampling)
+                    adaptive_sampling["histograms"] = sampling_histograms
+
             terminal_contract = resolve_terminal_observation_contract(
                 next_obs_batch_size=next_obs_np.shape[0],
                 final_observation=state.final_observation,
@@ -473,6 +508,29 @@ def _run_collector(
                     if ep_rewards:
                         msg["mean_ep_reward"] = statistics.mean(ep_rewards)
                         msg["mean_ep_length"] = statistics.mean(ep_lengths) if ep_lengths else 0.0
+                    if termination_reason_counts:
+                        denominator = max(done_count_window, 1)
+                        msg["termination_reason_rates"] = {
+                            name: count / denominator
+                            for name, count in termination_reason_counts.items()
+                        }
+                        msg["termination_reason_counts"] = dict(termination_reason_counts)
+                        termination_reason_counts.clear()
+                    if isinstance(adaptive_sampling, dict):
+                        sampling_scalars = adaptive_sampling.get("scalars")
+                        if isinstance(sampling_scalars, dict):
+                            msg["adaptive_sampling"] = {
+                                "scalars": {
+                                    str(name): float(value)
+                                    for name, value in sampling_scalars.items()
+                                }
+                            }
+                        sampling_histograms = adaptive_sampling.get("histograms")
+                        if isinstance(sampling_histograms, dict):
+                            msg.setdefault("adaptive_sampling", {})["histograms"] = {
+                                str(name): np.asarray(value, dtype=np.float32)
+                                for name, value in sampling_histograms.items()
+                            }
                     # Add mean reward components
                     if ep_reward_components:
                         components_mean = {}
