@@ -40,7 +40,7 @@ PR 合入 `main` 前必须 CI 全绿（ruff lint / ruff format / mypy / pyright 
 
 1. 在 PR 中 bump `pyproject.toml` 的 `version` 并通过 CI 合入 main。
 2. 在 main 上打 tag：`git tag v<X.Y.Z> && git push origin v<X.Y.Z>`。
-3. `.github/workflows/release.yml` 自动：`uv build` → wheel 与 sdist 隔离 smoke → 发布到 **PyPI**（`PYPI_TOKEN` secret）。
+3. `.github/workflows/release.yml` 自动：`uv build` → wheel 与 sdist 隔离 smoke → 发布到 **PyPI**（`PYPI_TOKEN` secret）→ 创建 **GitHub Release**（附带 dist 产物，notes 取自 `CHANGELOG.md` 对应版本段落）。
 4. 验证：`uv run --isolated --no-project --with unilab-rl==<X.Y.Z> -- python -c "import uni_rl; print(uni_rl.__version__)"`（CDN 滞后时加 `--refresh-package unilab-rl` 重试）。
 
 正式发布渠道为 PyPI。

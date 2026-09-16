@@ -28,3 +28,39 @@ jobs:
         env:
           UV_PUBLISH_TOKEN: ${{ secrets.PYPI_TOKEN }}
         run: uv publish dist/*
+      - uses: actions/upload-artifact@v4
+        with:
+          name: release-dist
+          path: dist/*
+
+  github-release:
+    name: Create GitHub Release
+    needs: publish-pypi
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
+    timeout-minutes: 5
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v6.0.2
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@v4.3.0
+        with:
+          name: release-dist
+          path: dist
+      - name: Extract changelog notes
+        shell: bash
+        run: |
+          version="${GITHUB_REF_NAME#v}"
+          awk -v ver="$version" \
+            '$0 ~ "^## \\[" ver "\\]" {flag=1; next} /^## / && flag {exit} flag' \
+            CHANGELOG.md > release-notes.md
+          test -s release-notes.md || echo "See CHANGELOG.md for details." > release-notes.md
+      - name: Create GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: >-
+          gh release create "$GITHUB_REF_NAME" dist/*
+          --title "unilab-rl ${GITHUB_REF_NAME#v}"
+          --notes-file release-notes.md
