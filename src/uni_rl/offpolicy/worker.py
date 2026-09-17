@@ -30,6 +30,7 @@ COLLECTOR_TIMING_KEYS = (
 COLLECTOR_ACTIVE_TIMING_KEYS = tuple(
     key for key in COLLECTOR_TIMING_KEYS if key != "learner_action_wait_ms"
 )
+COLLECTOR_READY_TICK = -1
 
 
 def sample_offpolicy_actions(
@@ -100,6 +101,26 @@ def compute_collector_active_steps_per_sec(
     return int(num_envs) / (active_ms / 1000.0)
 
 
+def _publish_coordination_tick(
+    coordination_queue,
+    tick_id: int,
+    stop_event,
+    *,
+    timeout: float = 30.0,
+    action: str,
+) -> bool:
+    deadline = time.monotonic() + timeout
+    while stop_event is None or not stop_event.is_set():
+        if time.monotonic() >= deadline:
+            raise TimeoutError(f"Timed out publishing off-policy {action}")
+        try:
+            coordination_queue.put(int(tick_id), timeout=0.1)
+            return True
+        except queue.Full:
+            continue
+    return False
+
+
 def _publish_inference_tick(
     coordination_queue,
     tick_id: int,
@@ -107,16 +128,23 @@ def _publish_inference_tick(
     *,
     timeout: float = 30.0,
 ) -> bool:
-    deadline = time.monotonic() + timeout
-    while not stop_event.is_set():
-        if time.monotonic() >= deadline:
-            raise TimeoutError(f"Timed out publishing off-policy inference tick {tick_id}")
-        try:
-            coordination_queue.put(int(tick_id), timeout=0.1)
-            return True
-        except queue.Full:
-            continue
-    return False
+    return _publish_coordination_tick(
+        coordination_queue,
+        tick_id,
+        stop_event,
+        timeout=timeout,
+        action=f"inference tick {tick_id}",
+    )
+
+
+def _publish_collector_ready(coordination_queue, stop_event) -> bool:
+    """Signal that collector-owned cold-path initialization has completed."""
+    return _publish_coordination_tick(
+        coordination_queue,
+        COLLECTOR_READY_TICK,
+        stop_event,
+        action="collector ready signal",
+    )
 
 
 def _wait_for_inference_tick(
@@ -297,6 +325,9 @@ def _run_collector(
             metrics_queue.put_nowait(manifest_message)
         except queue.Full:
             pass
+
+    if not _publish_collector_ready(inference_request_queue, stop_event):
+        return
 
     inference_tick = 0
     # Collection loop

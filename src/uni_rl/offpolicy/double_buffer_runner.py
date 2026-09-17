@@ -36,7 +36,11 @@ from uni_rl.offpolicy.thread_budget import (
     format_torch_thread_runtime,
     torch_thread_env,
 )
-from uni_rl.offpolicy.worker import off_policy_collector_fn, sample_offpolicy_actions
+from uni_rl.offpolicy.worker import (
+    COLLECTOR_READY_TICK,
+    off_policy_collector_fn,
+    sample_offpolicy_actions,
+)
 from uni_rl.utils.device import resolve_backend_process_device
 from uni_rl.utils.seed import derive_worker_seed
 
@@ -183,9 +187,9 @@ class DoubleBufferOffPolicyRunner(OffPolicyRunner):
                 "inference_request_timeout_sec must be a positive number or None, "
                 f"got {inference_request_timeout_sec!r}"
             )
-        # Tick-0 wait covers collector env construction, whose cost is
-        # backend-owned (e.g. genesis kernel compilation at scale); owners of
-        # slow-start backends raise this via their task YAML.
+        # The timeout bounds steady-state inference ticks only. Collector
+        # construction and first reset are covered by the ready handshake
+        # below, not by this deadline.
         self.inference_request_timeout_sec = (
             float(inference_request_timeout_sec)
             if inference_request_timeout_sec is not None
@@ -198,6 +202,7 @@ class DoubleBufferOffPolicyRunner(OffPolicyRunner):
         # Backend-owned process-device binder forwarded to the collector
         # subprocess (e.g. mjwarp); None for backends that need no binding.
         self.backend_device_binder = backend_device_binder
+        self._collector_ready = False
         # Multi-GPU synchronous data parallelism (None = the bit-identical
         # single-rank path): startup model broadcast, then gradient averaging
         # before every actor/critic/temperature optimizer step.
@@ -552,10 +557,12 @@ class DoubleBufferOffPolicyRunner(OffPolicyRunner):
         ckpt_path: str | None,
         train_start_wall: float,
     ) -> int:
-        deadline = time.monotonic() + self.inference_request_timeout_sec
+        deadline = (
+            time.monotonic() + self.inference_request_timeout_sec if self._collector_ready else None
+        )
         while True:
             try:
-                tick_id = int(queue.get(timeout=0.1))
+                message = int(queue.get(timeout=0.1))
             except queue_module.Empty:
                 replay_pipeline.progress()
                 self._drain_metrics(
@@ -575,17 +582,27 @@ class DoubleBufferOffPolicyRunner(OffPolicyRunner):
                         ckpt_path,
                         train_start_wall,
                     )
-                if time.monotonic() >= deadline:
+                if deadline is not None and time.monotonic() >= deadline:
                     raise TimeoutError(
                         f"Timed out waiting for collector inference tick {expected_tick} "
                         f"(inference_request_timeout_sec={self.inference_request_timeout_sec})"
                     )
                 continue
-            if tick_id != int(expected_tick):
+            if message == COLLECTOR_READY_TICK:
+                if self._collector_ready:
+                    raise RuntimeError("Collector sent duplicate ready signal")
+                self._collector_ready = True
+                deadline = time.monotonic() + self.inference_request_timeout_sec
+                continue
+            if not self._collector_ready:
                 raise RuntimeError(
-                    f"Collector inference tick mismatch: expected {expected_tick}, got {tick_id}"
+                    f"Collector sent inference tick before its ready signal: got {message}"
                 )
-            return tick_id
+            if message != int(expected_tick):
+                raise RuntimeError(
+                    f"Collector inference tick mismatch: expected {expected_tick}, got {message}"
+                )
+            return message
 
     def _serve_learner_inference(
         self,
@@ -812,6 +829,7 @@ class DoubleBufferOffPolicyRunner(OffPolicyRunner):
         log_dir: str = "logs",
         logger_type: str = "tensorboard",
     ) -> None:
+        self._collector_ready = False
         if self._is_primary_rank():
             os.makedirs(log_dir, exist_ok=True)
         trace_output_path = None

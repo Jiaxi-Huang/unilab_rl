@@ -130,6 +130,6 @@ def build_sac_double_buffer_runner(
         collector_cpu_ids=collector_cpu_ids,
         dp_sync=dp_sync,
         backend_device_binder=backend_device_binder,
-        inference_request_timeout_sec=getattr(cfg.training, "inference_request_timeout_sec", None),
+        inference_request_timeout_sec=cfg.training.inference_request_timeout_sec,
         actor_adapter_modules=actor_adapter_modules,
     )
