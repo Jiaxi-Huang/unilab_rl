@@ -615,15 +615,27 @@ def test_runner_releases_action_before_replay_wait_and_sample(
     assert events.index("inference_response") < events.index("update_critic")
 
 
-def test_collector_ready_wait_excludes_cold_start_and_rejects_early_tick(
+def _wait_for_inference_request(runner, inference_queue, *, expected_tick: int) -> int:
+    return runner._wait_for_inference_request(
+        inference_queue,
+        expected_tick=expected_tick,
+        replay_pipeline=SimpleNamespace(progress=lambda: None),
+        metrics_queue=queue.Queue(),
+        reward_history=deque(maxlen=10),
+        latest_reward_components={},
+        logger=_FakeLogger(),
+        trace_recorder=None,
+        replay_buffer=SimpleNamespace(),
+        ckpt_path=None,
+        train_start_wall=0.0,
+    )
+
+
+def test_collector_ready_wait_rejects_early_tick(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     runner = _make_device_runner(monkeypatch)
-    runner._collector_process = object()
     inference_queue: queue.Queue[int] = queue.Queue()
-    replay_pipeline = SimpleNamespace(progress=lambda: None)
-    metrics_queue = queue.Queue()
-    logger = _FakeLogger()
 
     def fail_collector_died(*args, **kwargs):
         raise AssertionError("ready wait must not fail while the collector is alive")
@@ -631,42 +643,16 @@ def test_collector_ready_wait_excludes_cold_start_and_rejects_early_tick(
     monkeypatch.setattr(runner, "_drain_metrics", lambda *args, **kwargs: None)
     monkeypatch.setattr(runner, "_check_collector_alive", lambda: True)
     monkeypatch.setattr(runner, "_fail_collector_died", fail_collector_died)
-    threading.Timer(0.02, inference_queue.put, args=(-1,)).start()
-
-    runner._wait_for_collector_ready(
-        inference_queue,
-        replay_pipeline=replay_pipeline,
-        metrics_queue=metrics_queue,
-        reward_history=deque(maxlen=10),
-        latest_reward_components={},
-        logger=logger,
-        trace_recorder=None,
-        replay_buffer=SimpleNamespace(),
-        ckpt_path=None,
-        train_start_wall=0.0,
-    )
-
     inference_queue.put(0)
+
     with pytest.raises(RuntimeError, match="ready signal"):
-        runner._wait_for_collector_ready(
-            inference_queue,
-            replay_pipeline=replay_pipeline,
-            metrics_queue=metrics_queue,
-            reward_history=deque(maxlen=10),
-            latest_reward_components={},
-            logger=logger,
-            trace_recorder=None,
-            replay_buffer=SimpleNamespace(),
-            ckpt_path=None,
-            train_start_wall=0.0,
-        )
+        _wait_for_inference_request(runner, inference_queue, expected_tick=0)
 
 
 def test_inference_timeout_starts_after_collector_ready(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     runner = _make_device_runner(monkeypatch)
-    runner._collector_process = object()
     runner.inference_request_timeout_sec = 0.01
     inference_queue: queue.Queue[int] = queue.Queue()
     monotonic_values: list[int] = []
@@ -684,30 +670,20 @@ def test_inference_timeout_starts_after_collector_ready(
     monkeypatch.setattr(runner, "_check_collector_alive", lambda: True)
     threading.Timer(0.03, publish_ready_and_tick).start()
 
-    tick_id = runner._wait_for_inference_request(
-        inference_queue,
-        expected_tick=0,
-        replay_pipeline=SimpleNamespace(progress=lambda: None),
-        metrics_queue=queue.Queue(),
-        reward_history=deque(maxlen=10),
-        latest_reward_components={},
-        logger=_FakeLogger(),
-        trace_recorder=None,
-        replay_buffer=SimpleNamespace(),
-        ckpt_path=None,
-        train_start_wall=0.0,
-    )
+    tick_id = _wait_for_inference_request(runner, inference_queue, expected_tick=0)
 
     assert tick_id == 0
-    assert runner._collector_ready
-    assert monotonic_values == [1]
+    inference_queue.put(1)
+    next_tick_id = _wait_for_inference_request(runner, inference_queue, expected_tick=1)
+
+    assert next_tick_id == 1
+    assert monotonic_values == [1, 2]
 
 
 def test_collector_ready_wait_detects_dead_collector(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     runner = _make_device_runner(monkeypatch)
-    runner._collector_process = object()
     fail_calls: list[int] = []
 
     class _EmptyQueue:
@@ -724,18 +700,7 @@ def test_collector_ready_wait_detects_dead_collector(
     monkeypatch.setattr(runner, "_fail_collector_died", fail_collector_died)
 
     with pytest.raises(RuntimeError, match="collector died during readiness"):
-        runner._wait_for_collector_ready(
-            _EmptyQueue(),
-            replay_pipeline=SimpleNamespace(progress=lambda: None),
-            metrics_queue=queue.Queue(),
-            reward_history=deque(maxlen=10),
-            latest_reward_components={},
-            logger=_FakeLogger(),
-            trace_recorder=None,
-            replay_buffer=SimpleNamespace(),
-            ckpt_path=None,
-            train_start_wall=0.0,
-        )
+        _wait_for_inference_request(runner, _EmptyQueue(), expected_tick=0)
 
     assert fail_calls == [0]
 

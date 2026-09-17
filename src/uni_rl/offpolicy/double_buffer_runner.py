@@ -557,24 +557,12 @@ class DoubleBufferOffPolicyRunner(OffPolicyRunner):
         ckpt_path: str | None,
         train_start_wall: float,
     ) -> int:
-        if self._collector_process is not None and not self._collector_ready:
-            self._wait_for_collector_ready(
-                queue,
-                replay_pipeline=replay_pipeline,
-                metrics_queue=metrics_queue,
-                reward_history=reward_history,
-                latest_reward_components=latest_reward_components,
-                logger=logger,
-                trace_recorder=trace_recorder,
-                replay_buffer=replay_buffer,
-                ckpt_path=ckpt_path,
-                train_start_wall=train_start_wall,
-            )
-            self._collector_ready = True
-        deadline = time.monotonic() + self.inference_request_timeout_sec
+        deadline = (
+            time.monotonic() + self.inference_request_timeout_sec if self._collector_ready else None
+        )
         while True:
             try:
-                tick_id = int(queue.get(timeout=0.1))
+                message = int(queue.get(timeout=0.1))
             except queue_module.Empty:
                 replay_pipeline.progress()
                 self._drain_metrics(
@@ -594,61 +582,27 @@ class DoubleBufferOffPolicyRunner(OffPolicyRunner):
                         ckpt_path,
                         train_start_wall,
                     )
-                if time.monotonic() >= deadline:
+                if deadline is not None and time.monotonic() >= deadline:
                     raise TimeoutError(
                         f"Timed out waiting for collector inference tick {expected_tick} "
                         f"(inference_request_timeout_sec={self.inference_request_timeout_sec})"
                     )
                 continue
-            if tick_id != int(expected_tick):
-                raise RuntimeError(
-                    f"Collector inference tick mismatch: expected {expected_tick}, got {tick_id}"
-                )
-            return tick_id
-
-    def _wait_for_collector_ready(
-        self,
-        queue,
-        *,
-        replay_pipeline,
-        metrics_queue,
-        reward_history,
-        latest_reward_components,
-        logger,
-        trace_recorder,
-        replay_buffer,
-        ckpt_path: str | None,
-        train_start_wall: float,
-    ) -> None:
-        """Wait for collector initialization without bounding backend cold start."""
-        while True:
-            try:
-                message = int(queue.get(timeout=0.1))
-            except queue_module.Empty:
-                replay_pipeline.progress()
-                self._drain_metrics(
-                    metrics_queue,
-                    reward_history,
-                    latest_reward_components,
-                    logger,
-                    trace_recorder,
-                    log_collector_reward=self.dp_sync is None,
-                )
-                if not self._check_collector_alive():
-                    self._fail_collector_died(
-                        logger,
-                        replay_buffer,
-                        replay_pipeline,
-                        0,
-                        ckpt_path,
-                        train_start_wall,
-                    )
+            if message == COLLECTOR_READY_TICK:
+                if self._collector_ready:
+                    raise RuntimeError("Collector sent duplicate ready signal")
+                self._collector_ready = True
+                deadline = time.monotonic() + self.inference_request_timeout_sec
                 continue
-            if message != COLLECTOR_READY_TICK:
+            if not self._collector_ready:
                 raise RuntimeError(
                     f"Collector sent inference tick before its ready signal: got {message}"
                 )
-            return
+            if message != int(expected_tick):
+                raise RuntimeError(
+                    f"Collector inference tick mismatch: expected {expected_tick}, got {message}"
+                )
+            return message
 
     def _serve_learner_inference(
         self,
@@ -875,6 +829,7 @@ class DoubleBufferOffPolicyRunner(OffPolicyRunner):
         log_dir: str = "logs",
         logger_type: str = "tensorboard",
     ) -> None:
+        self._collector_ready = False
         if self._is_primary_rank():
             os.makedirs(log_dir, exist_ok=True)
         trace_output_path = None
