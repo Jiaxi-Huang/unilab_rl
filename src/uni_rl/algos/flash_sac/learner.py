@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import copy
+import math
 from collections.abc import Callable, Iterable
 from dataclasses import dataclass
 from typing import Any, cast
@@ -141,6 +142,10 @@ class RewardNormalizer:
 
 class FlashSACLearner(LearnerBoilerplateMixin):
     supports_cuda_graph_packed_staging = True
+    # Only learners that own the packed observation layout can translate the
+    # reference terms into expert actions; the generic learner must stay on
+    # replay-action BC.
+    supports_reference_bc = False
 
     def __init__(
         self,
@@ -163,6 +168,8 @@ class FlashSACLearner(LearnerBoilerplateMixin):
         temp_target_sigma: float = 0.15,
         temp_target_entropy: float | None = None,
         actor_bc_alpha: float = 0.0,
+        actor_bc_alpha_end: float | None = None,
+        actor_bc_target: str = "replay",
         actor_noise_zeta_mu: float = 2.0,
         actor_noise_zeta_max: int = 16,
         learning_rate_init: float = 3e-4,
@@ -187,7 +194,25 @@ class FlashSACLearner(LearnerBoilerplateMixin):
         self.gamma = gamma
         self.tau = tau
         self.n_step = n_step
+        if actor_bc_target not in ("replay", "reference"):
+            raise ValueError(
+                f"actor_bc_target must be 'replay' or 'reference', got {actor_bc_target!r}"
+            )
+        if actor_bc_alpha < 0.0 or not math.isfinite(actor_bc_alpha):
+            raise ValueError("actor_bc_alpha must be a finite non-negative value")
+        if actor_bc_alpha_end is not None and (
+            not math.isfinite(actor_bc_alpha_end) or actor_bc_alpha_end < 0.0
+        ):
+            raise ValueError("actor_bc_alpha_end must be None or a finite non-negative value")
+        if actor_bc_target == "reference" and not self.supports_reference_bc:
+            raise ValueError(
+                "actor_bc_target='reference' requires a learner that owns the packed "
+                "reference layout (e.g. SonicFlashSACLearner)"
+            )
         self.actor_bc_alpha = actor_bc_alpha
+        self.actor_bc_alpha_end = actor_bc_alpha_end
+        self.actor_bc_target = actor_bc_target
+        self._actor_bc_anneal_steps = max(float(learning_rate_decay_steps), 1.0)
         self.obs_dim = obs_dim
         self.critic_obs_dim = critic_obs_dim
         self.action_dim = action_dim
@@ -376,6 +401,20 @@ class FlashSACLearner(LearnerBoilerplateMixin):
         )
         return cast(torch.Tensor, -(target_probs.unsqueeze(0) * pred_log_probs).sum(dim=-1).mean())
 
+    def _effective_actor_bc_alpha(self) -> float:
+        """Return the current BC weight, linearly annealed to ``actor_bc_alpha_end``.
+
+        The schedule is anchored to ``actor_scheduler.last_epoch`` so eager and
+        CUDA-graph update paths stay in lockstep without extra state.
+        """
+        if self.actor_bc_alpha <= 0.0:
+            return 0.0
+        if self.actor_bc_alpha_end is None or self.actor_bc_alpha_end == self.actor_bc_alpha:
+            return self.actor_bc_alpha
+        last_epoch = float(getattr(self.actor_scheduler, "last_epoch", 0.0))
+        progress = min(max(last_epoch, 0.0) / self._actor_bc_anneal_steps, 1.0)
+        return self.actor_bc_alpha + progress * (self.actor_bc_alpha_end - self.actor_bc_alpha)
+
     def _actor_loss_tensors(
         self,
         log_probs: torch.Tensor,
@@ -383,12 +422,19 @@ class FlashSACLearner(LearnerBoilerplateMixin):
         actions: torch.Tensor,
         expert_actions: torch.Tensor,
         temp_value: torch.Tensor,
+        bc_mask: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         min_q = torch.min(q_values[0], q_values[1])
         actor_loss = (temp_value.detach() * log_probs - min_q).mean()
-        if self.actor_bc_alpha > 0:
-            bc_loss = torch.mean((actions - expert_actions) ** 2)
-            actor_loss = actor_loss + self.actor_bc_alpha * min_q.abs().mean().detach() * bc_loss
+        alpha = self._effective_actor_bc_alpha()
+        if alpha > 0.0:
+            squared = (actions - expert_actions) ** 2
+            if bc_mask is not None:
+                weighted = squared.flatten(1).mean(dim=1) * bc_mask.reshape(-1)
+                bc_loss = weighted.sum() / bc_mask.sum().clamp_min(1.0)
+            else:
+                bc_loss = squared.mean()
+            actor_loss = actor_loss + alpha * min_q.abs().mean().detach() * bc_loss
         entropy = -log_probs.detach().mean()
         return actor_loss, entropy
 
