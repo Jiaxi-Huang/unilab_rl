@@ -429,6 +429,7 @@ def test_flashsac_deferred_actor_metrics_read_once_at_cycle_end() -> None:
         "actor_entropy",
         "temperature",
         "temperature_loss",
+        "actor_lr",
     }
 
 
