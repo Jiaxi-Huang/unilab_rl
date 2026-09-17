@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.3.0] - 2026-09-17
+
+### Changed
+
+- The FastSAC, FlashSAC, and FastTD3 double-buffer builders now require and
+  directly read `training.inference_request_timeout_sec`.
+
 ### Fixed
 
 - Added an off-policy collector-ready handshake after environment
