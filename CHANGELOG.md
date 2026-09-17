@@ -7,6 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- Added an off-policy collector-ready handshake after environment
+  initialization and runtime-manifest publication. The learner now starts its
+  inference-tick timeout only after collector readiness, so backend-owned cold
+  starts (such as Genesis JIT and first reset) cannot consume the steady-state
+  tick budget. FlashSAC and FastTD3 builders also forward
+  `training.inference_request_timeout_sec`, matching FastSAC.
+
 ## [1.2.1] - 2026-09-15
 
 ### Removed

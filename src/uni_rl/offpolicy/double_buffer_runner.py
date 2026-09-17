@@ -36,7 +36,11 @@ from uni_rl.offpolicy.thread_budget import (
     format_torch_thread_runtime,
     torch_thread_env,
 )
-from uni_rl.offpolicy.worker import off_policy_collector_fn, sample_offpolicy_actions
+from uni_rl.offpolicy.worker import (
+    COLLECTOR_READY_TICK,
+    off_policy_collector_fn,
+    sample_offpolicy_actions,
+)
 from uni_rl.utils.device import resolve_backend_process_device
 from uni_rl.utils.seed import derive_worker_seed
 
@@ -183,9 +187,9 @@ class DoubleBufferOffPolicyRunner(OffPolicyRunner):
                 "inference_request_timeout_sec must be a positive number or None, "
                 f"got {inference_request_timeout_sec!r}"
             )
-        # Tick-0 wait covers collector env construction, whose cost is
-        # backend-owned (e.g. genesis kernel compilation at scale); owners of
-        # slow-start backends raise this via their task YAML.
+        # The timeout bounds steady-state inference ticks only. Collector
+        # construction and first reset are covered by the ready handshake
+        # below, not by this deadline.
         self.inference_request_timeout_sec = (
             float(inference_request_timeout_sec)
             if inference_request_timeout_sec is not None
@@ -198,6 +202,7 @@ class DoubleBufferOffPolicyRunner(OffPolicyRunner):
         # Backend-owned process-device binder forwarded to the collector
         # subprocess (e.g. mjwarp); None for backends that need no binding.
         self.backend_device_binder = backend_device_binder
+        self._collector_ready = False
         # Multi-GPU synchronous data parallelism (None = the bit-identical
         # single-rank path): startup model broadcast, then gradient averaging
         # before every actor/critic/temperature optimizer step.
@@ -552,6 +557,20 @@ class DoubleBufferOffPolicyRunner(OffPolicyRunner):
         ckpt_path: str | None,
         train_start_wall: float,
     ) -> int:
+        if self._collector_process is not None and not self._collector_ready:
+            self._wait_for_collector_ready(
+                queue,
+                replay_pipeline=replay_pipeline,
+                metrics_queue=metrics_queue,
+                reward_history=reward_history,
+                latest_reward_components=latest_reward_components,
+                logger=logger,
+                trace_recorder=trace_recorder,
+                replay_buffer=replay_buffer,
+                ckpt_path=ckpt_path,
+                train_start_wall=train_start_wall,
+            )
+            self._collector_ready = True
         deadline = time.monotonic() + self.inference_request_timeout_sec
         while True:
             try:
@@ -586,6 +605,50 @@ class DoubleBufferOffPolicyRunner(OffPolicyRunner):
                     f"Collector inference tick mismatch: expected {expected_tick}, got {tick_id}"
                 )
             return tick_id
+
+    def _wait_for_collector_ready(
+        self,
+        queue,
+        *,
+        replay_pipeline,
+        metrics_queue,
+        reward_history,
+        latest_reward_components,
+        logger,
+        trace_recorder,
+        replay_buffer,
+        ckpt_path: str | None,
+        train_start_wall: float,
+    ) -> None:
+        """Wait for collector initialization without bounding backend cold start."""
+        while True:
+            try:
+                message = int(queue.get(timeout=0.1))
+            except queue_module.Empty:
+                replay_pipeline.progress()
+                self._drain_metrics(
+                    metrics_queue,
+                    reward_history,
+                    latest_reward_components,
+                    logger,
+                    trace_recorder,
+                    log_collector_reward=self.dp_sync is None,
+                )
+                if not self._check_collector_alive():
+                    self._fail_collector_died(
+                        logger,
+                        replay_buffer,
+                        replay_pipeline,
+                        0,
+                        ckpt_path,
+                        train_start_wall,
+                    )
+                continue
+            if message != COLLECTOR_READY_TICK:
+                raise RuntimeError(
+                    f"Collector sent inference tick before its ready signal: got {message}"
+                )
+            return
 
     def _serve_learner_inference(
         self,

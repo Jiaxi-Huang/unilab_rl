@@ -88,4 +88,5 @@ def build_td3_double_buffer_runner(
         collector_cpu_ids=collector_cpu_ids,
         dp_sync=dp_sync,
         backend_device_binder=backend_device_binder,
+        inference_request_timeout_sec=getattr(cfg.training, "inference_request_timeout_sec", None),
     )

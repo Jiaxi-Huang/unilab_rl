@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import copy
 import queue
+import threading
 from collections import deque
 from types import SimpleNamespace
 
@@ -612,6 +613,131 @@ def test_runner_releases_action_before_replay_wait_and_sample(
     assert events.index("inference_response") < events.index("replay_batch_ready")
     assert events.index("inference_response") < events.index("replay_sample")
     assert events.index("inference_response") < events.index("update_critic")
+
+
+def test_collector_ready_wait_excludes_cold_start_and_rejects_early_tick(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runner = _make_device_runner(monkeypatch)
+    runner._collector_process = object()
+    inference_queue: queue.Queue[int] = queue.Queue()
+    replay_pipeline = SimpleNamespace(progress=lambda: None)
+    metrics_queue = queue.Queue()
+    logger = _FakeLogger()
+
+    def fail_collector_died(*args, **kwargs):
+        raise AssertionError("ready wait must not fail while the collector is alive")
+
+    monkeypatch.setattr(runner, "_drain_metrics", lambda *args, **kwargs: None)
+    monkeypatch.setattr(runner, "_check_collector_alive", lambda: True)
+    monkeypatch.setattr(runner, "_fail_collector_died", fail_collector_died)
+    threading.Timer(0.02, inference_queue.put, args=(-1,)).start()
+
+    runner._wait_for_collector_ready(
+        inference_queue,
+        replay_pipeline=replay_pipeline,
+        metrics_queue=metrics_queue,
+        reward_history=deque(maxlen=10),
+        latest_reward_components={},
+        logger=logger,
+        trace_recorder=None,
+        replay_buffer=SimpleNamespace(),
+        ckpt_path=None,
+        train_start_wall=0.0,
+    )
+
+    inference_queue.put(0)
+    with pytest.raises(RuntimeError, match="ready signal"):
+        runner._wait_for_collector_ready(
+            inference_queue,
+            replay_pipeline=replay_pipeline,
+            metrics_queue=metrics_queue,
+            reward_history=deque(maxlen=10),
+            latest_reward_components={},
+            logger=logger,
+            trace_recorder=None,
+            replay_buffer=SimpleNamespace(),
+            ckpt_path=None,
+            train_start_wall=0.0,
+        )
+
+
+def test_inference_timeout_starts_after_collector_ready(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runner = _make_device_runner(monkeypatch)
+    runner._collector_process = object()
+    runner.inference_request_timeout_sec = 0.01
+    inference_queue: queue.Queue[int] = queue.Queue()
+    monotonic_values: list[int] = []
+
+    def monotonic() -> float:
+        monotonic_values.append(len(monotonic_values) + 1)
+        return float(monotonic_values[-1])
+
+    def publish_ready_and_tick() -> None:
+        inference_queue.put(-1)
+        inference_queue.put(0)
+
+    monkeypatch.setattr(device_runner_module, "time", SimpleNamespace(monotonic=monotonic))
+    monkeypatch.setattr(runner, "_drain_metrics", lambda *args, **kwargs: None)
+    monkeypatch.setattr(runner, "_check_collector_alive", lambda: True)
+    threading.Timer(0.03, publish_ready_and_tick).start()
+
+    tick_id = runner._wait_for_inference_request(
+        inference_queue,
+        expected_tick=0,
+        replay_pipeline=SimpleNamespace(progress=lambda: None),
+        metrics_queue=queue.Queue(),
+        reward_history=deque(maxlen=10),
+        latest_reward_components={},
+        logger=_FakeLogger(),
+        trace_recorder=None,
+        replay_buffer=SimpleNamespace(),
+        ckpt_path=None,
+        train_start_wall=0.0,
+    )
+
+    assert tick_id == 0
+    assert runner._collector_ready
+    assert monotonic_values == [1]
+
+
+def test_collector_ready_wait_detects_dead_collector(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runner = _make_device_runner(monkeypatch)
+    runner._collector_process = object()
+    fail_calls: list[int] = []
+
+    class _EmptyQueue:
+        def get(self, timeout=None):
+            del timeout
+            raise queue.Empty
+
+    def fail_collector_died(*args, **kwargs):
+        fail_calls.append(args[3])
+        raise RuntimeError("collector died during readiness")
+
+    monkeypatch.setattr(runner, "_drain_metrics", lambda *args, **kwargs: None)
+    monkeypatch.setattr(runner, "_check_collector_alive", lambda: False)
+    monkeypatch.setattr(runner, "_fail_collector_died", fail_collector_died)
+
+    with pytest.raises(RuntimeError, match="collector died during readiness"):
+        runner._wait_for_collector_ready(
+            _EmptyQueue(),
+            replay_pipeline=SimpleNamespace(progress=lambda: None),
+            metrics_queue=queue.Queue(),
+            reward_history=deque(maxlen=10),
+            latest_reward_components={},
+            logger=_FakeLogger(),
+            trace_recorder=None,
+            replay_buffer=SimpleNamespace(),
+            ckpt_path=None,
+            train_start_wall=0.0,
+        )
+
+    assert fail_calls == [0]
 
 
 def test_drain_metrics_propagates_collector_error():

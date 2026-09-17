@@ -30,6 +30,7 @@ COLLECTOR_TIMING_KEYS = (
 COLLECTOR_ACTIVE_TIMING_KEYS = tuple(
     key for key in COLLECTOR_TIMING_KEYS if key != "learner_action_wait_ms"
 )
+COLLECTOR_READY_TICK = -1
 
 
 def sample_offpolicy_actions(
@@ -117,6 +118,17 @@ def _publish_inference_tick(
         except queue.Full:
             continue
     return False
+
+
+def _publish_collector_ready(coordination_queue, stop_event) -> bool:
+    """Signal that collector-owned cold-path initialization has completed."""
+    if stop_event is not None and stop_event.is_set():
+        return False
+    try:
+        coordination_queue.put(COLLECTOR_READY_TICK, timeout=30.0)
+    except queue.Full as exc:
+        raise TimeoutError("Timed out publishing off-policy collector ready signal") from exc
+    return True
 
 
 def _wait_for_inference_tick(
@@ -297,6 +309,9 @@ def _run_collector(
             metrics_queue.put_nowait(manifest_message)
         except queue.Full:
             pass
+
+    if not _publish_collector_ready(inference_request_queue, stop_event):
+        return
 
     inference_tick = 0
     # Collection loop

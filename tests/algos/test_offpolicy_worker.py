@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import queue
 import threading
+from types import SimpleNamespace
 
 import pytest
 import torch
@@ -9,12 +10,74 @@ import torch
 import uni_rl.offpolicy.worker as worker_module
 from uni_rl.algos.common.collector_timing import extract_env_step_breakdown_timing_ms
 from uni_rl.offpolicy.worker import (
+    _publish_collector_ready,
     _publish_inference_tick,
     _wait_for_inference_tick,
     compute_collector_active_steps_per_sec,
     resolve_offpolicy_actor_priv_info,
     sample_offpolicy_actions,
 )
+
+
+def test_collector_publishes_ready_after_initialization(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    events: list[str] = []
+    stop_event = threading.Event()
+    inference_request_queue: queue.Queue[int] = queue.Queue()
+    metrics_queue: queue.Queue[dict] = queue.Queue()
+
+    class _Env:
+        state = None
+
+        def init_state(self) -> None:
+            self.state = SimpleNamespace(obs={"obs": torch.zeros((1, 2))}, info={})
+            events.append("env_init")
+
+    class _ReplayBuffer:
+        trace_recorder = None
+        trace_thread_time = False
+
+        def attach_stop_event(self, stop) -> None:
+            del stop
+
+    def publish_ready(coordination_queue, event) -> bool:
+        assert not metrics_queue.empty()
+        events.append("ready")
+        event.set()
+        assert _publish_collector_ready(coordination_queue, None)
+
+    monkeypatch.setattr(worker_module, "apply_torch_thread_runtime", lambda *args, **kwargs: None)
+    monkeypatch.setattr(worker_module, "apply_training_seed", lambda *args, **kwargs: None)
+    monkeypatch.setattr(worker_module, "_publish_collector_ready", publish_ready)
+    monkeypatch.setattr(
+        worker_module,
+        "_publish_inference_tick",
+        lambda *args, **kwargs: events.append("inference_tick"),
+    )
+
+    worker_module._run_collector(
+        stop_event=stop_event,
+        env_factory=lambda num_envs, env_cfg_override=None: _Env(),
+        num_envs=1,
+        replay_buffer=_ReplayBuffer(),
+        inference_slot=None,
+        inference_request_queue=inference_request_queue,
+        inference_response_queue=queue.Queue(),
+        algo_type="sac",
+        actor_adapter_modules=None,
+        metrics_queue=metrics_queue,
+        sim_backend="mujoco",
+        backend_device=None,
+        env_cfg_override=None,
+        seed=None,
+        trace_enabled=False,
+        trace_thread_time=False,
+    )
+
+    assert events == ["env_init", "ready"]
+    assert metrics_queue.get_nowait()["runtime_manifest"]["inference_owner"] == "learner"
+    assert inference_request_queue.get_nowait() == worker_module.COLLECTOR_READY_TICK
 
 
 def test_collector_binds_backend_device_before_env_materialization(
