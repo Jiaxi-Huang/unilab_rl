@@ -235,14 +235,18 @@ class FlashSACLearner(LearnerBoilerplateMixin):
         self.use_cuda_graph_actor_packed_staging = bool(
             use_cuda_graph_actor_packed_staging and self.use_cuda_graph_actor
         )
-        self.actor = actor_module if actor_module is not None else FlashSACActor(
-            num_blocks=actor_num_blocks,
-            input_dim=obs_dim,
-            hidden_dim=actor_hidden_dim,
-            action_dim=action_dim,
-            noise_zeta_mu=actor_noise_zeta_mu,
-            noise_zeta_max=actor_noise_zeta_max,
-            device=self.device,
+        self.actor = (
+            actor_module
+            if actor_module is not None
+            else FlashSACActor(
+                num_blocks=actor_num_blocks,
+                input_dim=obs_dim,
+                hidden_dim=actor_hidden_dim,
+                action_dim=action_dim,
+                noise_zeta_mu=actor_noise_zeta_mu,
+                noise_zeta_max=actor_noise_zeta_max,
+                device=self.device,
+            )
         )
         self.actor.to(self.device)
         self.critic = FlashSACDoubleCritic(
@@ -293,8 +297,12 @@ class FlashSACLearner(LearnerBoilerplateMixin):
         optimizer_kwargs: dict[str, Any] = {"fused": self.device.type == "cuda"}
         if self.device.type == "cuda":
             optimizer_kwargs["capturable"] = True
-        self.actor_optimizer = optim.Adam(self.actor.parameters(), lr=actor_peak, **optimizer_kwargs)
-        self.critic_optimizer = optim.Adam(self.critic.parameters(), lr=critic_peak, **optimizer_kwargs)
+        self.actor_optimizer = optim.Adam(
+            self.actor.parameters(), lr=actor_peak, **optimizer_kwargs
+        )
+        self.critic_optimizer = optim.Adam(
+            self.critic.parameters(), lr=critic_peak, **optimizer_kwargs
+        )
         self.temperature_optimizer = optim.Adam(
             self.temperature.parameters(), lr=actor_peak, **optimizer_kwargs
         )

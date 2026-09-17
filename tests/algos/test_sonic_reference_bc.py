@@ -58,9 +58,7 @@ def _reference_learner(**kwargs: Any) -> SonicFlashSACLearner:
     torch.manual_seed(7)
     kwargs.setdefault("actor_bc_alpha", 2.5)
     kwargs.setdefault("actor_bc_target", "reference")
-    kwargs.setdefault(
-        "bc_joint_default", torch.zeros(ACTION_DIM, dtype=torch.float32)
-    )
+    kwargs.setdefault("bc_joint_default", torch.zeros(ACTION_DIM, dtype=torch.float32))
     kwargs.setdefault("bc_action_scale", torch.full((ACTION_DIM,), 0.5))
     return _make_learner(**kwargs)
 
@@ -120,9 +118,7 @@ def test_actor_loss_respects_bc_mask_and_alpha() -> None:
     temp = torch.tensor(0.1)
     mask = torch.tensor([1.0, 1.0, 1.0, 0.0, 0.0, 0.0])
 
-    loss_masked, _ = learner._actor_loss_tensors(
-        log_probs, q_values, actions, expert, temp, mask
-    )
+    loss_masked, _ = learner._actor_loss_tensors(log_probs, q_values, actions, expert, temp, mask)
     min_q = torch.minimum(q_values[0], q_values[1])
     sac = (temp * log_probs - min_q).mean()
     kept = ((actions[:3] - expert[:3]) ** 2).mean()
@@ -167,8 +163,7 @@ def test_update_actor_reports_reference_bc_metrics() -> None:
     batch = _batch()
     joints = torch.randn(batch["next_obs"].shape[0], ACTION_DIM) * 0.1
     batch["next_obs"] = _plant_reference_joints(batch["next_obs"], joints)
-    batch["dones"] = torch.tensor([0.0, 1.0, 0.0, 0.0, 0.0, 0.0,
-                                   0.0, 0.0, 0.0, 0.0, 0.0, 0.0])
+    batch["dones"] = torch.tensor([0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0])
     metrics = learner.update_actor(batch)
     assert "actor_bc_loss" in metrics
     assert "actor_bc_alpha" in metrics

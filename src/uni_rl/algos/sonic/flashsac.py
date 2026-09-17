@@ -55,7 +55,8 @@ class _SonicPackedInputMixin:
             (
                 g1_flat[:, :g1_command_width].reshape(-1, cfg.num_future_frames, g1_command_dim),
                 g1_flat[:, g1_command_width:].reshape(-1, cfg.num_future_frames, _TERM_6D_DIM),
-            ), dim=-1,
+            ),
+            dim=-1,
         )
         smpl_human_dim = cfg.smpl_frame_dim - _TERM_6D_DIM
         smpl_human_width = cfg.num_future_frames * smpl_human_dim
@@ -63,7 +64,8 @@ class _SonicPackedInputMixin:
             (
                 smpl_flat[:, :smpl_human_width].reshape(-1, cfg.num_future_frames, smpl_human_dim),
                 smpl_flat[:, smpl_human_width:].reshape(-1, cfg.num_future_frames, _TERM_6D_DIM),
-            ), dim=-1,
+            ),
+            dim=-1,
         )
         return actor_obs, g1_reference, smpl_reference, observations[:, offset : offset + 2]
 
@@ -105,7 +107,9 @@ class SonicFlashSACActor(_SonicPackedInputMixin, nn.Module):
             compute_action_decoder = legacy_decoder_head
         self.compute_action_decoder = bool(compute_action_decoder)
         if actor_hidden_dim is None:
-            actor_hidden_dim = model_config.actor_hidden_dim or model_config.g1_control_decoder_hidden_dims[-1]
+            actor_hidden_dim = (
+                model_config.actor_hidden_dim or model_config.g1_control_decoder_hidden_dims[-1]
+            )
         if actor_hidden_dim <= 0 or actor_num_blocks <= 0:
             raise ValueError("SONIC FlashSAC actor dimensions must be positive")
         # Training uses the generic FlashSAC actor trunk on the SONIC token and
@@ -154,20 +158,24 @@ class SonicFlashSACActor(_SonicPackedInputMixin, nn.Module):
         self.register_buffer("_repeat_target", torch.zeros(0, dtype=torch.int32), persistent=False)
         self.to(device)
 
-
     def _policy_parameters(
         self, observations: torch.Tensor, *, compute_auxiliary: bool
     ) -> tuple[torch.Tensor, torch.Tensor, dict[str, torch.Tensor]]:
         actor_obs, g1_reference, smpl_reference, encoder_index = self._unpack(observations)
         output = self.backbone(
-            actor_obs, g1_reference, smpl_reference, encoder_index,
+            actor_obs,
+            g1_reference,
+            smpl_reference,
+            encoder_index,
             compute_auxiliary=compute_auxiliary,
             compute_action_decoder=self.compute_action_decoder,
         )
         if self._legacy_decoder_head:
             features = output.action_features
         else:
-            policy_input = torch.cat((actor_obs, output.selected_tokens.flatten(start_dim=1)), dim=-1)
+            policy_input = torch.cat(
+                (actor_obs, output.selected_tokens.flatten(start_dim=1)), dim=-1
+            )
             features = self.policy_embedder(policy_input, training=compute_auxiliary)
             for block in self.policy_encoder:
                 features = block(features, training=compute_auxiliary)
@@ -525,8 +533,7 @@ class SonicFlashSACLearner(FlashSACLearner):
             "actor_policy_loss": float(policy_loss.detach().cpu()),
             "actor_auxiliary_loss": float(auxiliary_loss.detach().cpu()),
             "actor_auxiliary_to_rl_ratio": float(
-                (auxiliary_loss.detach().abs()
-                 / policy_loss.detach().abs().clamp_min(1.0e-8)).cpu()
+                (auxiliary_loss.detach().abs() / policy_loss.detach().abs().clamp_min(1.0e-8)).cpu()
             ),
             "actor_entropy": float(entropy.detach().cpu()),
             "temperature": float(temp_value.detach().cpu()),
@@ -563,9 +570,7 @@ class SonicFlashSACLearner(FlashSACLearner):
     ) -> dict[str, torch.Tensor]:
         prepared = {
             "obs": self._maybe_normalize_obs(batch["obs"].to(self.device), update=False),
-            "next_obs": self._maybe_normalize_obs(
-                batch["next_obs"].to(self.device), update=False
-            ),
+            "next_obs": self._maybe_normalize_obs(batch["next_obs"].to(self.device), update=False),
             "actions": batch["actions"].to(self.device),
             "critic": batch["critic"].to(self.device),
             "dones": batch["dones"].to(self.device),
