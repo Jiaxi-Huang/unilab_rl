@@ -310,6 +310,15 @@ class SonicReleasePPOActor(_SonicPackedInputMixin, nn.Module):
 class SonicFlashSACLearner(FlashSACLearner):
     """FlashSAC learner with a SONIC actor and unchanged distributional critics."""
 
+    supports_reference_bc = True
+    # The SONIC update_actor override returns its auxiliary-loss metric dict
+    # eagerly and does not implement the deferred metric-staging protocol;
+    # opt out so the runner keeps the plain update_actor(batch) call.
+    supports_deferred_update_metrics = False
+    # Actor graph inputs gain the transition dones so reference-BC can mask
+    # terminal rows; the packed-staging layout already reserves a dones offset.
+    _ACTOR_GRAPH_INPUT_KEYS = ("obs", "next_obs", "actions", "critic", "dones")
+
     def _maybe_normalize_obs(self, obs: torch.Tensor, *, update: bool) -> torch.Tensor:
         """Normalize continuous packed terms while preserving encoder masks."""
         if obs.shape[-1] != self.obs_dim or self.obs_dim < 2:
@@ -339,6 +348,9 @@ class SonicFlashSACLearner(FlashSACLearner):
     ) -> None:
         pretrained_checkpoint = kwargs.pop("pretrained_checkpoint", None)
         freeze_sonic_backbone = bool(kwargs.pop("freeze_sonic_backbone", False))
+        bc_joint_default = kwargs.pop("bc_joint_default", None)
+        bc_action_scale = kwargs.pop("bc_action_scale", None)
+        self.model_config = model_config
         actor = SonicFlashSACActor(
             model_config,
             auxiliary_config,
@@ -387,6 +399,64 @@ class SonicFlashSACLearner(FlashSACLearner):
             decay_steps=int(kwargs.get("learning_rate_decay_steps", 500000)),
         )
         self.actor_scheduler = optim.lr_scheduler.LambdaLR(self.actor_optimizer, schedule)
+        self._init_reference_bc(bc_joint_default, bc_action_scale)
+
+    def _init_reference_bc(
+        self,
+        bc_joint_default: torch.Tensor | None,
+        bc_action_scale: torch.Tensor | None,
+    ) -> None:
+        """Resolve the env-owned action contract used to build reference BC targets."""
+        self.bc_joint_default: torch.Tensor | None = None
+        self.bc_action_scale: torch.Tensor | None = None
+        if self.actor_bc_target != "reference":
+            if bc_joint_default is not None or bc_action_scale is not None:
+                raise ValueError(
+                    "bc_joint_default/bc_action_scale are only consumed by "
+                    "actor_bc_target='reference'"
+                )
+            return
+        if not isinstance(self.obs_normalizer, nn.Identity):
+            raise ValueError(
+                "reference BC reads raw reference joints from the packed observations; "
+                "obs_normalization must be disabled"
+            )
+        if bc_joint_default is None or bc_action_scale is None:
+            raise ValueError(
+                "actor_bc_target='reference' requires bc_joint_default and bc_action_scale"
+            )
+        default = torch.as_tensor(bc_joint_default, dtype=torch.float32, device=self.device)
+        scale = torch.as_tensor(bc_action_scale, dtype=torch.float32, device=self.device)
+        if tuple(default.shape) != (self.action_dim,) or tuple(scale.shape) != (self.action_dim,):
+            raise ValueError(
+                f"reference BC contract tensors must have shape ({self.action_dim},), got "
+                f"{tuple(default.shape)} and {tuple(scale.shape)}"
+            )
+        if not bool((scale > 0.0).all()):
+            raise ValueError("bc_action_scale entries must be strictly positive")
+        self.bc_joint_default = default.detach().clone()
+        self.bc_action_scale = scale.detach().clone()
+
+    def _reference_expert_actions(self, next_obs: torch.Tensor) -> torch.Tensor:
+        """Convert packed next-step reference joints into normalized policy actions.
+
+        The SONIC reference advances after the transition's reward is computed,
+        so the g1 command block of ``next_obs`` starts at the joint positions
+        the executed action was meant to reach (policy joint order).  The env
+        action contract is ``target = default + scale * action``.
+        """
+        offset = self.model_config.actor_obs_dim
+        ref_joints = next_obs[:, offset : offset + self.action_dim]
+        expert = (ref_joints - self.bc_joint_default) / self.bc_action_scale
+        return expert.clamp_(-1.0, 1.0)
+
+    def _reference_bc_batch_terms(
+        self, next_obs: torch.Tensor, dones: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Return (expert actions, keep mask) for reference-mode actor BC."""
+        expert_actions = self._reference_expert_actions(next_obs)
+        keep = (dones.reshape(-1) < 0.5).to(dtype=expert_actions.dtype)
+        return expert_actions, keep
 
     def freeze_sonic_backbone(self) -> None:
         """Freeze official encoders/tokenizer/kinematic decoder for finetuning."""
@@ -405,6 +475,16 @@ class SonicFlashSACLearner(FlashSACLearner):
         obs = batch["obs"].to(self.device)
         expert_actions = batch["actions"].to(self.device)
         critic_obs = batch["critic"].to(self.device)
+        bc_mask = None
+        bc_alpha = 0.0
+        if self.actor_bc_target == "reference":
+            bc_alpha = self._effective_actor_bc_alpha()
+            if bc_alpha > 0.0:
+                # Raw (un-normalized) next observations: their g1 command block
+                # holds the reference joints the executed action had to reach.
+                expert_actions, bc_mask = self._reference_bc_batch_terms(
+                    batch["next_obs"].to(self.device), batch["dones"].to(self.device)
+                )
         # Keep SONIC's custom actor update aligned with the shared FlashSAC
         # contract: actor observations are normalized by the learner-owned
         # running statistics before both policy evaluations.
@@ -417,7 +497,7 @@ class SonicFlashSACLearner(FlashSACLearner):
             q_values, _ = self.critic(critic_obs, actions, training=False)
             self._set_requires_grad(self.critic, True)
             policy_loss, entropy = self._actor_loss_tensors(
-                log_probs, q_values, actions, expert_actions, self.temperature()
+                log_probs, q_values, actions, expert_actions, self.temperature(), bc_mask
             )
             auxiliary_loss = actor_info_all["auxiliary_loss"]
             actor_loss = policy_loss + auxiliary_loss
@@ -464,6 +544,12 @@ class SonicFlashSACLearner(FlashSACLearner):
         for name, value in actor_info_all.items():
             if name.startswith("sonic_") and value.numel() == 1:
                 metrics[name] = float(value.detach().cpu())
+        if bc_mask is not None:
+            row_mse = ((actions.detach() - expert_actions) ** 2).mean(dim=1)
+            metrics["actor_bc_loss"] = float(
+                ((row_mse * bc_mask).sum() / bc_mask.sum().clamp_min(1.0)).cpu()
+            )
+            metrics["actor_bc_alpha"] = float(bc_alpha)
         # ``_policy_parameters`` exposes decoder diagnostics through the
         # auxiliary dictionary only during training; keep them under train/.
         for name in ("decoder_action_overflow", "decoder_action_abs_max"):
@@ -471,14 +557,46 @@ class SonicFlashSACLearner(FlashSACLearner):
                 metrics[f"sonic_{name}"] = float(actor_info_all[name].detach().cpu())
         return metrics
 
+    @staticmethod
+    def _actor_graph_input_keys() -> tuple[str, ...]:
+        return SonicFlashSACLearner._ACTOR_GRAPH_INPUT_KEYS
+
+    def _prepare_actor_graph_inputs(
+        self,
+        batch: dict[str, torch.Tensor],
+    ) -> dict[str, torch.Tensor]:
+        prepared = {
+            "obs": self._maybe_normalize_obs(batch["obs"].to(self.device), update=False),
+            "next_obs": self._maybe_normalize_obs(
+                batch["next_obs"].to(self.device), update=False
+            ),
+            "actions": batch["actions"].to(self.device),
+            "critic": batch["critic"].to(self.device),
+            "dones": batch["dones"].to(self.device),
+        }
+        if "sac_graph_packed_source" in batch:
+            prepared["sac_graph_packed_source"] = batch["sac_graph_packed_source"].to(self.device)
+        return prepared
+
     def _update_actor_capture_candidate(
         self, inputs: dict[str, torch.Tensor]
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-        """CUDA-graph actor update including SONIC auxiliary objectives."""
+        """CUDA-graph actor update including SONIC auxiliary objectives.
+
+        Reference-mode BC weights are captured as constants: annealing the BC
+        term requires eager actor updates (``use_cuda_graph_actor=false``).
+        """
         obs = self._maybe_normalize_obs(inputs["obs"], update=False)
         next_obs = self._maybe_normalize_obs(inputs["next_obs"], update=False)
         expert_actions = inputs["actions"]
         critic_obs = inputs["critic"]
+        bc_mask = None
+        if self.actor_bc_target == "reference" and self._effective_actor_bc_alpha() > 0.0:
+            # Graph mode requires an identity obs normalizer, so the prepared
+            # next_obs still carries the raw reference joints.
+            expert_actions, bc_mask = self._reference_bc_batch_terms(
+                inputs["next_obs"], inputs["dones"]
+            )
         obs_all = torch.cat([obs, next_obs], dim=0)
 
         with self._autocast():
@@ -490,7 +608,7 @@ class SonicFlashSACLearner(FlashSACLearner):
             self._set_requires_grad(self.critic, True)
             temp_value = self.temperature()
             actor_loss, entropy = self._actor_loss_tensors(
-                log_probs, q_values, actions, expert_actions, temp_value
+                log_probs, q_values, actions, expert_actions, temp_value, bc_mask
             )
             auxiliary_loss = actor_info_all.get("auxiliary_loss")
             if auxiliary_loss is not None:
