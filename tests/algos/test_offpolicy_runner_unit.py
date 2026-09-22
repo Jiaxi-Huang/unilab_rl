@@ -31,7 +31,7 @@ from uni_rl.offpolicy.runner import (
 
 @pytest.mark.parametrize(
     ("algo_type", "expected"),
-    [("sac", "SAC"), ("td3", "TD3"), ("flashsac", "FlashSAC"), ("my_algo", "MY_ALGO")],
+    [("sac", "SAC"), ("flashsac", "FlashSAC"), ("my_algo", "MY_ALGO")],
 )
 def test_algo_display_name(algo_type, expected):
     assert algo_display_name(algo_type) == expected
@@ -717,20 +717,16 @@ def test_drain_metrics_propagates_collector_error():
         )
 
 
-@pytest.mark.parametrize("algo_type", ["sac", "td3", "flashsac"])
+@pytest.mark.parametrize("algo_type", ["sac", "flashsac"])
 def test_learner_inference_matches_existing_actor_exploration(algo_type: str) -> None:
     if algo_type == "sac":
         from uni_rl.algos.fast_sac.learner import SACActor
 
         actor = SACActor(3, 2, hidden_dim=8, use_layer_norm=False)
-    elif algo_type == "flashsac":
+    else:
         from uni_rl.algos.flash_sac.network import FlashSACActor
 
         actor = FlashSACActor(num_blocks=1, input_dim=3, hidden_dim=8, action_dim=2)
-    else:
-        from uni_rl.algos.fast_td3.learner import TD3Actor
-
-        actor = TD3Actor(3, 2, num_envs=2, init_scale=0.01, hidden_dim=8)
     expected_actor = copy.deepcopy(actor)
     observations = np.arange(6, dtype=np.float32).reshape(2, 3) / 10.0
     dones = np.array([0.0, 1.0], dtype=np.float32)

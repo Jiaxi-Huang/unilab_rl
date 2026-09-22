@@ -37,30 +37,6 @@ class TestBuildActor:
         )
         assert hasattr(actor, "forward")
 
-    def test_builds_td3_actor(self) -> None:
-        actor = build_actor(
-            algo_type="td3",
-            obs_dim=10,
-            action_dim=4,
-            actor_hidden_dim=256,
-            use_layer_norm=True,
-            device="cpu",
-            num_envs=1,
-        )
-        assert hasattr(actor, "forward")
-
-    def test_builds_td3_actor_for_multiple_envs(self) -> None:
-        actor = build_actor(
-            algo_type="td3",
-            obs_dim=8,
-            action_dim=2,
-            actor_hidden_dim=128,
-            use_layer_norm=False,
-            device="cpu",
-            num_envs=4,
-        )
-        assert hasattr(actor, "forward")
-
     def test_builds_flashsac_actor(self) -> None:
         actor = build_actor(
             algo_type="flashsac",

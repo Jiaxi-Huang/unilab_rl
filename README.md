@@ -41,7 +41,7 @@ environment stack.
 - **Async PPO (APPO)**: native collector/learner multiprocess implementation
   (actor/critic networks built on
   [rsl_rl](https://github.com/leggedrobotics/rsl_rl) model classes)
-- **Off-policy**: FastSAC, FastTD3, and FlashSAC with double-buffer async runners
+- **Off-policy**: FastSAC and FlashSAC with double-buffer async runners
 - **Runtime infrastructure**: shared-memory rollout/replay buffers, replay
   pipelines, data-parallel gradient sync, memory budgeting, tensorboard/wandb
   training loggers, and a trace recorder
@@ -49,7 +49,7 @@ environment stack.
 ## Layout
 
 - `uni_rl.algos.*` — the algorithm layer: async on-policy (`appo`),
-  off-policy learners (`fast_sac`, `fast_td3`, `flash_sac`), and shared
+  off-policy learners (`fast_sac`, `flash_sac`), and shared
   algorithm helpers (`common`)
 - `uni_rl.ipc` — runtime infrastructure: async runner, shared-memory
   rollout/replay buffers, replay pipelines, DP gradient sync, memory budget

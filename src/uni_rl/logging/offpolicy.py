@@ -1,4 +1,4 @@
-"""Rich-based training logger for off-policy RL algorithms (SAC, TD3, etc)."""
+"""Rich-based training logger for off-policy RL algorithms (SAC, etc)."""
 
 from __future__ import annotations
 
@@ -165,7 +165,7 @@ def _dedupe_metric_aliases(metrics: dict[str, float] | None) -> dict[str, float]
 
 
 class OffPolicyLogger(BaseTrainingLogger):
-    """Rich logger for off-policy RL algorithms (SAC, TD3, etc)."""
+    """Rich logger for off-policy RL algorithms (SAC, etc)."""
 
     def __init__(
         self,
