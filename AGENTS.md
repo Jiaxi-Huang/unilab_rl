@@ -14,7 +14,7 @@ uni_rl（distribution 名 `unilab-rl`）是从 UniLab 拆出的 **RL 算法与�
 
 ## Layout
 
-- `src/uni_rl/algos/` — `appo`（异步 PPO）、`fast_sac` / `fast_td3` / `flash_sac`（off-policy learner + double-buffer builder）、`rsl_rl.py` / `rsl_rl_ppo.py` / `rsl_rl_runtime.py`（rsl_rl 封装）、`rsl_rl_training_state.py`（带 curriculum 进度存取的 OnPolicyRunner 扩展）、`common`（共享网络 / normalization / compile 辅助 / learner 样板 mixin）
+- `src/uni_rl/algos/` — `appo`（异步 PPO）、`fast_sac` / `fast_td3` / `flash_sac`（off-policy learner + double-buffer builder）、`rsl_rl.py`（env contract → RSL-RL VecEnv 适配器，供 APPO 与外部 rsl_rl 入口使用）、`common`（共享网络 / normalization / compile 辅助 / learner 样板 mixin）
 - `src/uni_rl/ipc/` — async runner、shm rollout/replay buffer、replay pipeline、DP gradient sync、memory budget
 - `src/uni_rl/offpolicy/` — 通用 off-policy double-buffer runner 脚手架；`actor_adapter.py` 是自定义 off-policy actor 的扩展 registry
 - `src/uni_rl/logging/` — tensorboard / wandb logger、trace recorder、collector 指标分发（metrics_drain）
@@ -50,7 +50,7 @@ PR 合入 `main` 前必须 CI 全绿（ruff lint / ruff format / mypy / pyright 
 面向做论文级算法改动的研究者，按侵入性从低到高有三档：
 
 1. **纯配置**：只调 UniLab 侧 `conf/<algo>/` 的 owner YAML 超参（学习率、网络宽度、loss 系数等），不改任何代码。算法超参数直接走 YAML compose，不经 Python 层解释。
-2. **`runtime_resolver` 指向外部包（不 fork）**：在自己的仓库把 uni_rl 当库 import，实现 resolver —— 签名 `(rl_cfg: dict) -> Runtime | None`，返回带 `runner_cls` 属性的对象；APPO 还需 `play_fn`，PPO（rsl_rl 封装）是 `wrapper_cls`。现有实现参考 `src/uni_rl/algos/appo/runtime.py`（`resolve_appo_runtime`）与 `src/uni_rl/algos/rsl_rl_runtime.py`（`resolve_rsl_rl_ppo_runtime`）。然后在 UniLab owner YAML 写 `algo.runtime_resolver: my_repo.algos.myppo:resolve_runtime`（dotted path）；policy / algorithm 类选择另有 `class_name` dotted path。resolver 必须可被运行环境 import（安装自己的包或把仓库放上 PYTHONPATH）。
+2. **`runtime_resolver` 指向外部包（不 fork）**：在自己的仓库把 uni_rl 当库 import，实现 resolver —— 签名 `(rl_cfg: dict) -> Runtime | None`，返回带 `runner_cls` 属性的对象；APPO 还需 `play_fn`。现有实现参考 `src/uni_rl/algos/appo/runtime.py`（`resolve_appo_runtime`）。然后在 UniLab owner YAML 写 `algo.runtime_resolver: my_repo.algos.myppo:resolve_runtime`（dotted path）；policy / algorithm 类选择另有 `class_name` dotted path。resolver 必须可被运行环境 import（安装自己的包或把仓库放上 PYTHONPATH）。（UniLab 的 PPO 已直驱上游 rsl_rl，不再经 uni_rl 解析 runtime；该机制适用于 APPO。）
 3. **fork unilab_rl 改 `uni_rl/algos/`**：最大自由度，直接改 runner / learner / collector；pin 自己的 fork（commit 或 tag）保证实验可复现。
 
 两点说明：

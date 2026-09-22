@@ -7,6 +7,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Removed
+
+- The RSL-RL PPO wrapper layer, which UniLab no longer consumes now that its
+  PPO path drives upstream rsl_rl directly:
+  `uni_rl.algos.rsl_rl_ppo.FinalObservationAwarePPO`,
+  `uni_rl.algos.rsl_rl_runtime` (`RslRlPPORuntime` /
+  `resolve_rsl_rl_ppo_runtime`), and
+  `uni_rl.algos.rsl_rl_training_state.TrainingStateOnPolicyRunner`, plus the
+  PPO script-assembly helpers in `uni_rl.algos.rsl_rl`
+  (`apply_rsl_rl_rank_seed`, `resolve_rsl_rl_device`,
+  `ppo_samples_per_iteration`, `finish_rsl_rl_distributed`,
+  `rsl_rl_single_process_topology`, `normalize_ppo_train_cfg`).
+  `RslRlVecEnvWrapper` and `get_policy_obs_dims` remain; the APPO path still
+  uses the wrapper. `uni_rl.training_state.TrainingStateProvider` also remains
+  as the owner progress-checkpoint protocol.
+
 ## [1.3.0] - 2026-09-17
 
 ### Changed

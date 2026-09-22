@@ -22,8 +22,10 @@ env 注入 `uni_rl`。`uni_rl` 永远不 import `unilab` / `unisim`，也不自�
 构造 env——任何满足 contract 的向量化环境（包括 UniLab 之外的仿真器）都
 可以驱动本包中的算法。
 
-如果你用 UniLab 训练，`uni_rl` 会作为依赖自动带入；只有当你想把这套算法
-与异步 runtime 复用到自己的环境栈时，才需要直接安装 `unilab-rl`。
+UniLab 以可选依赖（`unilab[uni_rl]`）消费 `uni_rl`，用于 APPO、off-policy
+算法与多卡数据并行 PPO 启动；其单进程 PPO 直接驱动上游 rsl_rl。只有当你
+想把这套算法与异步 runtime 复用到自己的环境栈时，才需要直接安装
+`unilab-rl`。
 
 > 命名说明：最初想要的 distribution 名 `uni-rl` 在 PyPI 上不可注册
 > （与既有 `unirl` 项目 ultranormalized 冲突），因此以 `unilab-rl`
@@ -31,8 +33,8 @@ env 注入 `uni_rl`。`uni_rl` 永远不 import `unilab` / `unisim`，也不自�
 
 ## 内容
 
-- **On-policy**：基于 [rsl_rl](https://github.com/leggedrobotics/rsl_rl)
-  的 PPO（`FinalObservationAwarePPO`、`RslRlVecEnvWrapper`）
+- **RSL-RL 适配器**：`RslRlVecEnvWrapper` 把注入式 env contract 适配到
+  [rsl_rl](https://github.com/leggedrobotics/rsl_rl) 的 `VecEnv` 接口
 - **异步 PPO（APPO)**：原生 collector/learner 多进程实现
 - **Off-policy**：FastSAC、FastTD3、FlashSAC，配 double-buffer 异步 runner
 - **Runtime 基础设施**：共享内存 rollout/replay buffer、replay pipeline、
@@ -40,9 +42,9 @@ env 注入 `uni_rl`。`uni_rl` 永远不 import `unilab` / `unisim`，也不自�
 
 ## 目录结构
 
-- `uni_rl.algos.*` — 算法层：on-policy(`rsl_rl` PPO 封装）、异步
-  on-policy(`appo`)、off-policy learner(`fast_sac`、`fast_td3`、
-  `flash_sac`）与共享算法辅助（`common`)
+- `uni_rl.algos.*` — 算法层：RSL-RL env 适配器（`rsl_rl`）、异步
+  on-policy（`appo`）、off-policy learner（`fast_sac`、`fast_td3`、
+  `flash_sac`）与共享算法辅助（`common`）
 - `uni_rl.ipc` — runtime 基础设施：异步 runner、共享内存 rollout/replay
   buffer、replay pipeline、DP 梯度同步、显存预算
 - `uni_rl.offpolicy` — 通用 off-policy double-buffer runner 脚手架
@@ -83,43 +85,6 @@ env contract 是一个最小化的、基于 numpy 的自动 reset 向量化环�
 [`src/uni_rl/env_contract.py`](src/uni_rl/env_contract.py) 的模块
 docstring；如何不 fork 本仓库、通过 `runtime_resolver` 接入自定义算法，
 见 [`AGENTS.md`](AGENTS.md) 的「新算法扩展方式」一节。
-
-### PPO curriculum checkpoint 状态
-
-`RslRlPPORuntime.runner_cls` 是可选的：训练入口可藉此在 wrapper 之外选择
-自定义 runner。取 `None` 时保持入口既有的标准 runner；旧的仅提供 wrapper
-的 resolver 继续可用。
-
-对于必须恢复 curriculum 进度的训练，请选择
-`uni_rl.algos.rsl_rl_training_state.TrainingStateOnPolicyRunner`。其 wrapper
-必须显式实现 `uni_rl.training_state.TrainingStateProvider` 协议，否则调用方
-必须向 runner 传入 `training_state_provider=`:
-
-```python
-def export_training_state(self) -> Mapping[str, object]:
-    return {"schema": "my-task-v1", "steps": self.steps, "difficulty": self.difficulty}
-
-
-def import_training_state(self, state: Mapping[str, object]) -> None:
-    # Validate the complete owner schema before changing any state.
-    ...
-```
-
-runner 会在 `checkpoint["infos"]["uni_rl_training_state"]` 中存放一个
-version-1 envelope;payload 为纯 JSON 数据，schema/version 归 provider
-所有。数组必须显式转换为 list。runner 不会探测嵌套的 env，也不会序列化
-owner 对象。算法、optimizer、iteration 与 logger 的既有行为仍由父 runner
-负责。
-
-`load()` 默认要求存在有效的 training state。只有显式的 actor-only
-`load_cfg={"actor": True}` 才允许对 legacy checkpoint 使用
-`restore_training_state=False`。envelope 错误会在算法加载之前被拒绝；
-provider 的 import 错误会直接传播，且必须中止 resume。算法与 provider 的
-加载不是事务性回滚。本 contract 覆盖训练进度，不包含物理或 RNG 快照。
-
-该 runner 独立于任何具体任务或仿真器。下游 provider 必须把自身的计数器与
-自适应 curriculum 状态一起恢复；如果下一步会重新计算某个派生计数器，只
-恢复它本身是不够的。
 
 ## 设计契约
 
