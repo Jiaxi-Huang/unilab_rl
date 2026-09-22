@@ -9,12 +9,12 @@ uni_rl（distribution 名 `unilab-rl`）是从 UniLab 拆出的 **RL 算法与�
 1. **Dependency boundary（不可破坏）**: uni_rl 永远不 import `unilab` / `unisim`；`tests/test_smoke.py::test_no_unilab_dependency` 强制该契约。
 2. **Env 注入**: uni_rl 不构造 env。算法通过 `uni_rl.env_contract.EnvFactory = Callable[[int, Mapping | None], EnvProtocol]` 接收 env 工厂；factory 必须可被 pickle 引用（collector 跑在 spawn 子进程），禁止闭包 / lambda。
 3. ** layering**：`uni_rl/algos/` 是算法层（runner / learner / collector）；`ipc/`、`logging/`、`offpolicy/`、`utils/`、`env_contract.py` 是 runtime 基础设施，留在顶层。algos 可以依赖基础设施层，基础设施层不依赖 algos。
-4. **Import 纪律**: 只用绝对 import；注意不要与第三方 `rsl_rl` 包混淆（`uni_rl.algos.rsl_rl*` 是我们的封装层）。
+4. **Import 纪律**: 只用绝对 import；`appo` 的网络层直接依赖第三方 `rsl_rl` 包，注意不要混淆。
 5. **Fix at owner layer**: 算法行为归属 algo owner 模块，不在消费方（UniLab）打补丁。
 
 ## Layout
 
-- `src/uni_rl/algos/` — `appo`（异步 PPO）、`fast_sac` / `fast_td3` / `flash_sac`（off-policy learner + double-buffer builder）、`rsl_rl.py`（env contract → RSL-RL VecEnv 适配器，供 APPO 与外部 rsl_rl 入口使用）、`common`（共享网络 / normalization / compile 辅助 / learner 样板 mixin）
+- `src/uni_rl/algos/` — `appo`（异步 PPO）、`fast_sac` / `fast_td3` / `flash_sac`（off-policy learner + double-buffer builder）、`common`（共享网络 / normalization / compile 辅助 / learner 样板 mixin）
 - `src/uni_rl/ipc/` — async runner、shm rollout/replay buffer、replay pipeline、DP gradient sync、memory budget
 - `src/uni_rl/offpolicy/` — 通用 off-policy double-buffer runner 脚手架；`actor_adapter.py` 是自定义 off-policy actor 的扩展 registry
 - `src/uni_rl/logging/` — tensorboard / wandb logger、trace recorder、collector 指标分发（metrics_drain）

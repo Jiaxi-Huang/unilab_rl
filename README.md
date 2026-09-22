@@ -38,9 +38,9 @@ environment stack.
 
 ## Contents
 
-- **RSL-RL adapter**: `RslRlVecEnvWrapper` adapts the injected env contract to
-  [rsl_rl](https://github.com/leggedrobotics/rsl_rl)'s `VecEnv` interface
 - **Async PPO (APPO)**: native collector/learner multiprocess implementation
+  (actor/critic networks built on
+  [rsl_rl](https://github.com/leggedrobotics/rsl_rl) model classes)
 - **Off-policy**: FastSAC, FastTD3, and FlashSAC with double-buffer async runners
 - **Runtime infrastructure**: shared-memory rollout/replay buffers, replay
   pipelines, data-parallel gradient sync, memory budgeting, tensorboard/wandb
@@ -48,9 +48,9 @@ environment stack.
 
 ## Layout
 
-- `uni_rl.algos.*` — the algorithm layer: the RSL-RL env adapter (`rsl_rl`),
-  async on-policy (`appo`), off-policy learners (`fast_sac`, `fast_td3`,
-  `flash_sac`), and shared algorithm helpers (`common`)
+- `uni_rl.algos.*` — the algorithm layer: async on-policy (`appo`),
+  off-policy learners (`fast_sac`, `fast_td3`, `flash_sac`), and shared
+  algorithm helpers (`common`)
 - `uni_rl.ipc` — runtime infrastructure: async runner, shared-memory
   rollout/replay buffers, replay pipelines, DP gradient sync, memory budget
 - `uni_rl.offpolicy` — the generic off-policy double-buffer runner scaffolding

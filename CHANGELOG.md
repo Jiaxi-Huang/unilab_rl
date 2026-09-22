@@ -9,19 +9,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Removed
 
-- The RSL-RL PPO wrapper layer, which UniLab no longer consumes now that its
-  PPO path drives upstream rsl_rl directly:
-  `uni_rl.algos.rsl_rl_ppo.FinalObservationAwarePPO`,
-  `uni_rl.algos.rsl_rl_runtime` (`RslRlPPORuntime` /
-  `resolve_rsl_rl_ppo_runtime`), and
-  `uni_rl.algos.rsl_rl_training_state.TrainingStateOnPolicyRunner`, plus the
-  PPO script-assembly helpers in `uni_rl.algos.rsl_rl`
+- The RSL-RL wrapper layer (`uni_rl.algos.rsl_rl`,
+  `uni_rl.algos.rsl_rl_ppo`, `uni_rl.algos.rsl_rl_runtime`,
+  `uni_rl.algos.rsl_rl_training_state`): `FinalObservationAwarePPO`,
+  `resolve_rsl_rl_ppo_runtime` / `RslRlPPORuntime`,
+  `TrainingStateOnPolicyRunner`, `RslRlVecEnvWrapper`,
+  `get_policy_obs_dims`, and the PPO script-assembly helpers
   (`apply_rsl_rl_rank_seed`, `resolve_rsl_rl_device`,
   `ppo_samples_per_iteration`, `finish_rsl_rl_distributed`,
-  `rsl_rl_single_process_topology`, `normalize_ppo_train_cfg`).
-  `RslRlVecEnvWrapper` and `get_policy_obs_dims` remain; the APPO path still
-  uses the wrapper. `uni_rl.training_state.TrainingStateProvider` also remains
-  as the owner progress-checkpoint protocol.
+  `rsl_rl_single_process_topology`, `normalize_ppo_train_cfg`). UniLab's PPO
+  path now drives upstream rsl_rl directly and owns the VecEnv adapter
+  (`unilab.rl`), so nothing here has a consumer left. APPO keeps using
+  rsl_rl's model classes (`MLPModel`, `GaussianDistribution`); only the
+  wrapper/runtime layer is gone. `uni_rl.training_state.TrainingStateProvider`
+  remains as the owner progress-checkpoint protocol.
 
 ## [1.3.0] - 2026-09-17
 
