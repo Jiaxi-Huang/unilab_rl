@@ -26,11 +26,10 @@ def polyak_update_target(target: nn.Module, source: nn.Module, tau: float) -> No
         target_params = cast(list[torch.Tensor], list(target.parameters()))
         source_params = cast(list[torch.Tensor], list(source.parameters()))
         try:
-            torch._foreach_mul_(target_params, 1.0 - tau)
-            torch._foreach_add_(target_params, source_params, alpha=tau)
+            torch._foreach_lerp_(target_params, source_params, tau)
         except RuntimeError:
             for tgt, src in zip(target_params, source_params):
-                tgt.mul_(1.0 - tau).add_(src, alpha=tau)
+                tgt.lerp_(src, tau)
 
 
 class LearnerBoilerplateMixin:
@@ -52,6 +51,7 @@ class LearnerBoilerplateMixin:
     _active_cuda_graph_gradient_sync_calls: list[int] | None
     _critic_loss_tensors: Callable[..., Any]
     _actor_loss_tensors: Callable[..., Any]
+    _compile_loss_cudagraphs: bool = False
 
     def _reset_critic_cuda_graph(self) -> None:
         raise NotImplementedError
@@ -97,7 +97,7 @@ class LearnerBoilerplateMixin:
         if compile_fn is None:
             return
 
-        compile_kwargs = {"options": {"triton.cudagraphs": False}}
+        compile_kwargs = {"options": {"triton.cudagraphs": bool(self._compile_loss_cudagraphs)}}
         if not self.use_cuda_graph_critic:
             self._critic_loss_tensors = compile_fn(self._critic_loss_tensors, **compile_kwargs)
         if not self.use_cuda_graph_actor:
