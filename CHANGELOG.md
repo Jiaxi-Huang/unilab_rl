@@ -5,6 +5,20 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.3.2] - 2026-09-22
+
+### Removed
+
+- The TD3 (FastTD3) algorithm: the whole `uni_rl.algos.fast_td3` package
+  (`TD3Actor`, `FastTD3Learner`, `build_td3_double_buffer_runner`), the
+  built-in `td3` actor branch in `uni_rl.algos.common.actor_factory`, the
+  `"td3"` entries in the off-policy worker exploration routing and the
+  double-buffer runner display names, and the TD3-only
+  `Critic` / `DistributionalQNetwork` networks in
+  `uni_rl.algos.common` (FastSAC and FlashSAC each define their own critic
+  networks). UniLab has dropped its TD3 task configs and dispatch branches
+  accordingly.
+
 ## [1.3.1] - 2026-09-22
 
 ### Removed

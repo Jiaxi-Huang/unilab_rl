@@ -48,7 +48,6 @@ from uni_rl.utils.seed import derive_worker_seed
 # user-facing (no internal "Fast*" implementation prefixes).
 _ALGO_DISPLAY_NAMES = {
     "sac": "SAC",
-    "td3": "TD3",
     "flashsac": "FlashSAC",
 }
 

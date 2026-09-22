@@ -71,10 +71,10 @@ def test_shared_memory_budget_raises_before_over_allocating(
     estimate = {"total": 81 * 1024, "breakdown": "test"}
 
     with pytest.raises(MemoryError) as excinfo:
-        raise_if_shared_memory_over_budget(estimate, label="Off-policy (td3)", threshold=0.8)
+        raise_if_shared_memory_over_budget(estimate, label="Off-policy (sac)", threshold=0.8)
 
     message = str(excinfo.value)
-    assert "Off-policy (td3)" in message
+    assert "Off-policy (sac)" in message
     assert "/dev/shm" in message
     assert "estimated" in message
     assert "available" in message

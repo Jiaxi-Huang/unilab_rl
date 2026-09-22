@@ -101,29 +101,6 @@ def _sac_cfg() -> Any:
     )
 
 
-def _td3_cfg() -> Any:
-    return OmegaConf.create(
-        {
-            "training": _training_cfg(),
-            "algo": _algo_cfg(
-                {
-                    "algo_params": {
-                        "v_min": -10.0,
-                        "v_max": 10.0,
-                        "init_scale": 1.0,
-                        "log_std_min": -5.0,
-                        "log_std_max": 2.0,
-                        "weight_decay": 0.0,
-                        "use_cdq": True,
-                        "policy_noise": 0.2,
-                        "noise_clip": 0.5,
-                    },
-                }
-            ),
-        }
-    )
-
-
 def _flashsac_cfg() -> Any:
     return OmegaConf.create(
         {
@@ -176,31 +153,6 @@ def test_sac_builder_forwards_backend_device_binder(
         kwargs["backend_device_binder"] = _binder
     runner = module.build_sac_double_buffer_runner(
         _sac_cfg(),
-        env_factory=_fake_env_factory,
-        env_cfg_override=None,
-        replay_prefetch_mode="one_tick",
-        device="cpu",
-        **kwargs,
-    )
-
-    assert runner.kwargs["backend_device_binder"] is (_binder if with_binder else None)
-    assert runner.kwargs["inference_request_timeout_sec"] == 17.0
-
-
-@pytest.mark.parametrize("with_binder", [False, True])
-def test_td3_builder_forwards_backend_device_binder(
-    monkeypatch: pytest.MonkeyPatch, with_binder: bool
-) -> None:
-    import uni_rl.algos.fast_td3.double_buffer as module
-
-    monkeypatch.setattr(module, "FastTD3Learner", _FakeLearner)
-    monkeypatch.setattr(module, "DoubleBufferOffPolicyRunner", _FakeRunner)
-
-    kwargs: dict[str, Any] = {}
-    if with_binder:
-        kwargs["backend_device_binder"] = _binder
-    runner = module.build_td3_double_buffer_runner(
-        _td3_cfg(),
         env_factory=_fake_env_factory,
         env_cfg_override=None,
         replay_prefetch_mode="one_tick",

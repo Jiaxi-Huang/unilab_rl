@@ -48,19 +48,6 @@ def build_actor(
             use_layer_norm=use_layer_norm,
             device=device,
         )
-    if algo_type == "td3":
-        from uni_rl.algos.fast_td3.learner import TD3Actor
-
-        return TD3Actor(
-            obs_dim=obs_dim,
-            n_act=action_dim,
-            num_envs=num_envs,
-            hidden_dim=actor_hidden_dim,
-            init_scale=kwargs.get("init_scale", 0.01),
-            log_std_min=kwargs.get("log_std_min", -1.6),
-            log_std_max=kwargs.get("log_std_max", -0.22),
-            device=device,
-        )
     if algo_type == "flashsac":
         from uni_rl.algos.flash_sac.network import FlashSACActor
 

@@ -189,7 +189,7 @@ class SACActor(nn.Module):
 
         Args:
             obs: Batched observations.
-            dones: Unused for SAC; kept for API alignment with TD3 actor.
+            dones: Unused for SAC; kept for API alignment with other off-policy actors.
             deterministic: Whether to return deterministic policy actions.
         """
         # Backward compatibility: previous signature was explore(obs, deterministic=False).

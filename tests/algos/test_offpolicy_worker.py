@@ -201,7 +201,7 @@ def test_compute_collector_active_steps_per_sec_returns_none_without_active_time
     )
 
 
-@pytest.mark.parametrize("algo_type", ["sac", "td3", "flashsac"])
+@pytest.mark.parametrize("algo_type", ["sac", "flashsac"])
 def test_sample_offpolicy_actions_uses_actor_explore(algo_type: str) -> None:
     actor = _DummyActor()
     obs = torch.zeros(4, 5)
