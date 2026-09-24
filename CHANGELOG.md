@@ -5,6 +5,31 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.3.3] - 2026-09-24
+
+### Changed
+
+- FastSAC's `torch.compile` path now enables Inductor CUDA Graph replay for
+  fused critic/actor loss kernels and defers scalar metric reads to the final
+  update in each learner cycle.
+- FastSAC actor updates no longer accumulate unused critic-parameter gradients.
+  The policy still receives the same `dQ/da` gradient.
+- Compiled FastSAC updates replace per-loss host finite-check synchronization
+  with fused-optimizer device gating, preserving non-finite step suppression
+  without fragmenting the learner window.
+- FastSAC critic CUDA Graph replay now captures the Polyak target-network
+  update, removing the graph-external foreach launches between critic replays.
+- The off-policy runtime manifest now reports the effective CUDA Graph replay,
+  packed-staging, target-update capture, and eager-fallback state.
+
+### Fixed
+
+- Removed a redundant CUDA stream synchronization between learner-owned actor
+  inference and its blocking D2H action copy. CUDA event timing preserves the
+  forward-duration metric without adding another graph-boundary sync.
+- FastSAC CUDA Graph calls now fail closed to eager updates when observation
+  normalization is active, matching the existing FlashSAC safety behavior.
+
 ## [1.3.2] - 2026-09-22
 
 ### Removed
@@ -53,29 +78,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   starts (such as Genesis JIT and first reset) cannot consume the steady-state
   tick budget. FlashSAC and FastTD3 builders also forward
   `training.inference_request_timeout_sec`, matching FastSAC.
-
-### Changed
-
-- FastSAC's `torch.compile` path now enables Inductor CUDA Graph replay for
-  fused critic/actor loss kernels and defers scalar metric reads to the final
-  update in each learner cycle.
-- FastSAC actor updates no longer accumulate unused critic-parameter gradients.
-  The policy still receives the same `dQ/da` gradient.
-- Compiled FastSAC updates replace per-loss host finite-check synchronization
-  with fused-optimizer device gating, preserving non-finite step suppression
-  without fragmenting the learner window.
-- FastSAC critic CUDA Graph replay now captures the Polyak target-network
-  update, removing the graph-external foreach launches between critic replays.
-- The off-policy runtime manifest now reports the effective CUDA Graph replay,
-  packed-staging, target-update capture, and eager-fallback state.
-
-### Fixed
-
-- Removed a redundant CUDA stream synchronization between learner-owned actor
-  inference and its blocking D2H action copy. CUDA event timing preserves the
-  forward-duration metric without adding another graph-boundary sync.
-- FastSAC CUDA Graph calls now fail closed to eager updates when observation
-  normalization is active, matching the existing FlashSAC safety behavior.
 
 ## [1.2.1] - 2026-09-15
 
