@@ -71,6 +71,18 @@ def test_flashsac_learner_exposes_expected_dims():
     assert learner.action_dim == 29
 
 
+def test_flashsac_learner_honors_distinct_actor_and_critic_learning_rates() -> None:
+    learner = _make_small_learner(
+        actor_lr=1.0e-4,
+        critic_lr=2.0e-4,
+        learning_rate_init=3.0e-4,
+        learning_rate_peak=3.0e-4,
+        learning_rate_end=5.0e-5,
+    )
+    assert learner.actor_optimizer.param_groups[0]["lr"] == pytest.approx(1.0e-4)
+    assert learner.critic_optimizer.param_groups[0]["lr"] == pytest.approx(2.0e-4)
+
+
 def test_flashsac_cuda_graph_options_are_opt_in() -> None:
     default_learner = _make_small_learner()
 

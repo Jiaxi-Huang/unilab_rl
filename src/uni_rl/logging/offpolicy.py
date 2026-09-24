@@ -253,6 +253,10 @@ class OffPolicyLogger(BaseTrainingLogger):
         self._training_timer_started: bool = False
         self._terminal_samples: deque[_TerminalSample] = deque(maxlen=_TERMINAL_AVERAGE_MAX_SAMPLES)
         self._terminal_snapshot: _TerminalSnapshot | None = None
+        self._pending_metrics: dict[str, float] = {}
+        self._pending_histograms: dict[str, Any] = {}
+        self._latest_histograms: dict[str, Any] = {}
+        self._last_histogram_step: int = -1
 
     def _format_tensorboard_message(self, tb_dir: str) -> str:
         return f"[dim]TensorBoard logging to: {tb_dir}[/]"
@@ -478,6 +482,21 @@ class OffPolicyLogger(BaseTrainingLogger):
     def update_timeout_rate(self, timeout_rate: float):
         self._timeout_rate = float(timeout_rate)
 
+    def update_metrics(self, metrics: dict[str, float]) -> None:
+        """Merge asynchronous collector diagnostics into the next log step."""
+        if not isinstance(metrics, dict):
+            raise TypeError("metrics must be a mapping")
+        normalized = {str(key): float(value) for key, value in metrics.items()}
+        self._latest_metrics.update(normalized)
+        self._pending_metrics.update(normalized)
+
+    def update_histograms(self, histograms: dict[str, Any]) -> None:
+        """Merge low-frequency collector histogram diagnostics."""
+        if not isinstance(histograms, dict):
+            raise TypeError("histograms must be a mapping")
+        for key, value in histograms.items():
+            self._pending_histograms[str(key)] = value
+
     def update_buffer_utilization(self, utilization: float):
         self._buffer_utilization = float(utilization)
 
@@ -567,8 +586,15 @@ class OffPolicyLogger(BaseTrainingLogger):
             self._effective_batch_size = 0
             self._replay_samples_per_iter = 0
             self._learner_samples_per_iter = 0
-        if metrics:
-            self._latest_metrics.update(metrics)
+        merged_metrics = dict(self._pending_metrics)
+        merged_metrics.update(metrics or {})
+        self._pending_metrics.clear()
+        merged_histograms = dict(self._pending_histograms)
+        self._pending_histograms.clear()
+        if merged_histograms:
+            self._latest_histograms.update(merged_histograms)
+        if merged_metrics:
+            self._latest_metrics.update(merged_metrics)
         if reward is not None:
             self._reward_history.append(reward)
         if reward_components:
@@ -576,14 +602,14 @@ class OffPolicyLogger(BaseTrainingLogger):
         self._status = "Training"
         self._backend_log_step(
             iteration,
-            metrics,
+            merged_metrics,
             reward,
             reward_metrics,
             reward_components,
             train_time,
         )
         self._record_terminal_sample(
-            metrics=metrics,
+            metrics=merged_metrics,
             reward=reward,
             reward_components=reward_components,
         )
@@ -617,6 +643,17 @@ class OffPolicyLogger(BaseTrainingLogger):
             if metrics:
                 for key, value in metrics.items():
                     writer.add_scalar(_metric_backend_key(key), value, global_step)
+            # Histogram logging is throttled to one snapshot per million
+            # environment steps to avoid oversized event files.
+            if self._latest_histograms and (
+                self._last_histogram_step < 0 or global_step - self._last_histogram_step >= 1_000_000
+            ):
+                for key, values in self._latest_histograms.items():
+                    try:
+                        writer.add_histogram(_metric_backend_key(key), values, global_step)
+                    except (AttributeError, TypeError, ValueError):
+                        continue
+                self._last_histogram_step = global_step
             if reward is not None:
                 writer.add_scalar("reward/mean", reward, global_step)
             if reward_metrics:
