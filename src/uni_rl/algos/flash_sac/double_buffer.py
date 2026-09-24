@@ -94,6 +94,9 @@ def build_flashsac_double_buffer_runner(
         "use_amp": cfg.training.use_amp,
         "amp_dtype": cfg.algo.algo_params.amp_dtype,
         "use_compile": cfg.algo.algo_params.use_compile,
+        "compile_full_objectives": bool(
+            getattr(cfg.algo.algo_params, "compile_full_objectives", False)
+        ),
         "use_cuda_graph_critic": cfg.algo.algo_params.use_cuda_graph_critic,
         "use_cuda_graph_actor": cfg.algo.algo_params.use_cuda_graph_actor,
         "use_cuda_graph_critic_packed_staging": (

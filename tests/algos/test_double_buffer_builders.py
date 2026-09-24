@@ -29,8 +29,11 @@ def _fake_env_factory(num_envs, env_cfg_override):
 
 
 class _FakeLearner:
+    last_kwargs: dict[str, Any] = {}
+
     def __init__(self, *args, **kwargs):
-        del args, kwargs
+        del args
+        type(self).last_kwargs = kwargs
 
 
 class _FakeRunner:
@@ -128,6 +131,7 @@ def _flashsac_cfg() -> Any:
                         "n_step": 1,
                         "amp_dtype": "bf16",
                         "use_compile": False,
+                        "compile_full_objectives": True,
                         "use_cuda_graph_critic": False,
                         "use_cuda_graph_actor": False,
                         "use_cuda_graph_critic_packed_staging": False,
@@ -190,3 +194,4 @@ def test_flashsac_builder_forwards_backend_device_binder(
 
     assert runner.kwargs["backend_device_binder"] is (_binder if with_binder else None)
     assert runner.kwargs["inference_request_timeout_sec"] == 17.0
+    assert _FakeLearner.last_kwargs["compile_full_objectives"] is True

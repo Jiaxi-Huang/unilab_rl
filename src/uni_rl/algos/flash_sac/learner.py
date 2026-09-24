@@ -3,7 +3,8 @@
 from __future__ import annotations
 
 import copy
-from collections.abc import Callable, Iterable
+from collections.abc import Callable, Iterable, Iterator
+from contextlib import contextmanager
 from dataclasses import dataclass
 from typing import Any, cast
 
@@ -141,6 +142,11 @@ class RewardNormalizer:
 
 class FlashSACLearner(LearnerBoilerplateMixin):
     supports_cuda_graph_packed_staging = True
+    # FlashSAC's loss/actor kernels are compatible with Inductor CUDA Graph
+    # replay.  Keeping this enabled removes repeated host launches; metric
+    # tensors are staged and read once per learner cycle below.
+    _compile_loss_cudagraphs = True
+    supports_deferred_update_metrics = True
 
     def __init__(
         self,
@@ -177,6 +183,7 @@ class FlashSACLearner(LearnerBoilerplateMixin):
         use_amp: bool = False,
         amp_dtype: str = "auto",
         use_compile: bool = False,
+        compile_full_objectives: bool = False,
         use_cuda_graph_critic: bool = False,
         use_cuda_graph_actor: bool = False,
         use_cuda_graph_critic_packed_staging: bool = False,
@@ -197,8 +204,23 @@ class FlashSACLearner(LearnerBoilerplateMixin):
         self.use_compile = bool(
             use_compile and get_torch_compile_for_cuda(self.device, warn=True) is not None
         )
+        self.compile_full_objectives = bool(compile_full_objectives and self.use_compile)
+        self._device_type = self.device.type
+        # Host-side ``Tensor.item``/truth checks synchronize CUDA.  Compiled
+        # and manually captured paths use the fused optimizer's device gate;
+        # CPU/eager CUDA paths retain the explicit safety behavior.
+        self._host_finite_checks = not (
+            self._device_type == "cuda"
+            and (self.use_compile or use_cuda_graph_critic or use_cuda_graph_actor)
+        )
         self.use_cuda_graph_critic = bool(use_cuda_graph_critic)
         self.use_cuda_graph_actor = bool(use_cuda_graph_actor)
+        # When a manual graph owns the full update, Inductor should only fuse
+        # kernels.  Its internal CUDA Graph Trees cannot be nested safely in
+        # the outer capture.  Pure torch.compile keeps Trees enabled.
+        self._compile_loss_cudagraphs = not (
+            self.use_cuda_graph_critic or self.use_cuda_graph_actor
+        )
         self._gradient_sync: Callable[[Iterable[torch.Tensor]], None] | None = None
         self._gradient_sync_graph_replay_recorder: Callable[[int], None] | None = None
         self.dp_cuda_graph_gradient_sync = False
@@ -230,6 +252,9 @@ class FlashSACLearner(LearnerBoilerplateMixin):
         self.target_critic = copy.deepcopy(self.critic).to(self.device)
         self.target_critic.eval()
         self.temperature = FlashSACTemperature(temp_initial_value).to(self.device)
+        self._zero_metric = torch.zeros((), device=self.device)
+        self._optimizer_grad_scale = torch.ones((), device=self.device)
+        self._optimizer_found_inf = torch.zeros((), device=self.device)
 
         self.target_entropy = resolve_target_entropy(
             action_dim=action_dim,
@@ -269,6 +294,7 @@ class FlashSACLearner(LearnerBoilerplateMixin):
         self._cuda_graph_sac_static_packed_input: torch.Tensor | None = None
         self._cuda_graph_sac_static_source_ptr: int | None = None
         self._cuda_graph_critic_outputs: tuple[torch.Tensor, torch.Tensor] | None = None
+        self._cuda_graph_critic_metric_buffers: tuple[torch.Tensor, torch.Tensor] | None = None
         self._cuda_graph_critic_shapes: dict[str, torch.Size] | None = None
         self._cuda_graph_critic_gradient_sync_calls = 0
         self._cuda_graph_actor: torch.cuda.CUDAGraph | None = None
@@ -277,8 +303,12 @@ class FlashSACLearner(LearnerBoilerplateMixin):
         self._cuda_graph_actor_outputs: (
             tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor] | None
         ) = None
+        self._cuda_graph_actor_metric_buffers: (
+            tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor] | None
+        ) = None
         self._cuda_graph_actor_shapes: dict[str, torch.Size] | None = None
         self._cuda_graph_actor_gradient_sync_calls = 0
+        self._pending_actor_metric_values: torch.Tensor | None = None
 
         scheduler_fn = build_lr_lambda(
             init_lr=learning_rate_init,
@@ -301,11 +331,76 @@ class FlashSACLearner(LearnerBoilerplateMixin):
         if compile_fn is None:
             return
 
-        compile_kwargs = {"options": {"triton.cudagraphs": False}}
+        compile_kwargs = {"options": {"triton.cudagraphs": bool(self._compile_loss_cudagraphs)}}
+        if self.compile_full_objectives:
+            self._critic_objective_tensors = compile_fn(  # type: ignore[method-assign]
+                self._critic_objective_tensors, **compile_kwargs
+            )
+            self._actor_objective_tensors = compile_fn(  # type: ignore[method-assign]
+                self._actor_objective_tensors, **compile_kwargs
+            )
+            return
         self.actor.get_mean_and_std = compile_fn(  # type: ignore[method-assign]
             self.actor.get_mean_and_std, **compile_kwargs
         )
         super()._compile_training_methods()
+
+    @contextmanager
+    def _optimizer_finite_gate(
+        self,
+        optimizer: optim.Optimizer,
+        loss: torch.Tensor,
+    ) -> Iterator[None]:
+        """Skip fused CUDA optimizer steps on non-finite values on-device."""
+        if self._host_finite_checks or self._device_type != "cuda":
+            yield
+            return
+        found_inf = self._optimizer_found_inf
+        found_inf.copy_(torch.logical_not(torch.isfinite(loss.detach()).all()))
+        if self._gradient_sync is not None:
+            gradients = [
+                parameter.grad
+                for group in optimizer.param_groups
+                for parameter in group["params"]
+                if parameter.grad is not None
+            ]
+            if gradients:
+                torch._amp_foreach_non_finite_check_and_unscale_(
+                    gradients,
+                    found_inf,
+                    self._optimizer_grad_scale,
+                )
+        setattr(optimizer, "grad_scale", self._optimizer_grad_scale)
+        setattr(optimizer, "found_inf", found_inf)
+        try:
+            yield
+        finally:
+            delattr(optimizer, "grad_scale")
+            delattr(optimizer, "found_inf")
+
+    @contextmanager
+    def _critic_parameters_frozen(self) -> Iterator[None]:
+        """Exclude critic parameters from actor autograd while keeping dQ/da."""
+        states = [(parameter, parameter.requires_grad) for parameter in self.critic.parameters()]
+        for parameter, _ in states:
+            parameter.requires_grad_(False)
+        try:
+            yield
+        finally:
+            for parameter, requires_grad in states:
+                parameter.requires_grad_(requires_grad)
+
+    @staticmethod
+    def _snapshot_module_buffers(*modules: nn.Module) -> list[tuple[torch.Tensor, torch.Tensor]]:
+        return [
+            (buffer, buffer.detach().clone()) for module in modules for buffer in module.buffers()
+        ]
+
+    @staticmethod
+    def _restore_module_buffers(snapshot: list[tuple[torch.Tensor, torch.Tensor]]) -> None:
+        with torch.no_grad():
+            for buffer, saved in snapshot:
+                buffer.copy_(saved)
 
     def _maybe_normalize_obs(self, obs: torch.Tensor, *, update: bool) -> torch.Tensor:
         if isinstance(self.obs_normalizer, nn.Identity):
@@ -506,18 +601,17 @@ class FlashSACLearner(LearnerBoilerplateMixin):
         for key, tensor in self._cuda_graph_critic_static_inputs.items():
             tensor.copy_(inputs[key])
 
-    def _update_critic_capture_candidate(
+    def _critic_objective_tensors(
         self,
-        inputs: dict[str, torch.Tensor],
+        actions: torch.Tensor,
+        rewards: torch.Tensor,
+        next_obs: torch.Tensor,
+        dones: torch.Tensor,
+        truncated: torch.Tensor,
+        critic_obs: torch.Tensor,
+        critic_next_obs: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        actions = inputs["actions"]
-        rewards = inputs["rewards"]
-        next_obs = inputs["next_obs"]
-        dones = inputs["dones"]
-        truncated = inputs["truncated"]
-        critic_obs = inputs["critic"]
-        critic_next_obs = inputs["next_critic"]
-
+        """Full critic forward/target/projection/loss objective."""
         gamma = self.gamma**self.n_step
         obs_all = torch.cat([critic_obs, critic_next_obs], dim=0)
 
@@ -545,17 +639,80 @@ class FlashSACLearner(LearnerBoilerplateMixin):
                 pred_log_probs,
                 gamma,
             )
-
-        self.critic_optimizer.zero_grad(set_to_none=True)
-        critic_loss.backward()
-        self._sync_gradients(self.critic.parameters())
-        self.critic_optimizer.step()
         reward_scale_std = (
             torch.sqrt(self.reward_normalizer.rms.var)
             if self.reward_normalizer is not None
             else torch.ones((), device=self.device)
         )
         return critic_loss, reward_scale_std
+
+    def _actor_objective_tensors(
+        self,
+        obs: torch.Tensor,
+        next_obs: torch.Tensor,
+        expert_actions: torch.Tensor,
+        critic_obs: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Full actor/critic forward and actor objective."""
+        obs_all = torch.cat([obs, next_obs], dim=0)
+        with self._autocast():
+            actions_all, actor_info_all = self.actor(obs_all, training=True)
+            actions = actions_all.chunk(2, dim=0)[0]
+            log_probs = actor_info_all["log_prob"].chunk(2, dim=0)[0]
+            q_values, _ = self.critic(critic_obs, actions, training=False)
+            actor_loss, entropy = self._actor_loss_tensors(
+                log_probs, q_values, actions, expert_actions, self.temperature()
+            )
+        return actor_loss, entropy
+
+    def _update_critic_capture_candidate(
+        self,
+        inputs: dict[str, torch.Tensor],
+        *,
+        update_target: bool = False,
+        normalize_parameters: bool = False,
+        metric_buffers: tuple[torch.Tensor, torch.Tensor] | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        actions = inputs["actions"]
+        rewards = inputs["rewards"]
+        next_obs = inputs["next_obs"]
+        dones = inputs["dones"]
+        truncated = inputs["truncated"]
+        critic_obs = inputs["critic"]
+        critic_next_obs = inputs["next_critic"]
+
+        critic_loss, reward_scale_std = self._critic_objective_tensors(
+            actions,
+            rewards,
+            next_obs,
+            dones,
+            truncated,
+            critic_obs,
+            critic_next_obs,
+        )
+        # AOTAutograd/Inductor plan temporary storage across the compiled
+        # forward/backward boundary.  A clone made during outer graph capture
+        # still lives in that graph's private pool and may be reused by later
+        # optimizer kernels.  Pre-capture buffers give replay metrics stable
+        # addresses and explicit lifetimes outside the graph pool.
+        if metric_buffers is None:
+            metric_critic_loss = critic_loss.detach().clone()
+            metric_reward_scale_std = reward_scale_std.detach().clone()
+        else:
+            metric_critic_loss, metric_reward_scale_std = metric_buffers
+            metric_critic_loss.copy_(critic_loss.detach().reshape(()))
+            metric_reward_scale_std.copy_(reward_scale_std.detach().reshape(()))
+
+        self.critic_optimizer.zero_grad(set_to_none=True)
+        critic_loss.backward()
+        self._sync_gradients(self.critic.parameters())
+        with self._optimizer_finite_gate(self.critic_optimizer, critic_loss):
+            self.critic_optimizer.step()
+        if normalize_parameters:
+            self.critic.normalize_parameters()
+        if update_target:
+            polyak_update_target(self.target_critic, self.critic, self.tau)
+        return metric_critic_loss, metric_reward_scale_std
 
     def _reset_critic_cuda_graph(self) -> None:
         graph = self._cuda_graph_critic
@@ -566,6 +723,7 @@ class FlashSACLearner(LearnerBoilerplateMixin):
         self._cuda_graph_sac_static_packed_input = None
         self._cuda_graph_sac_static_source_ptr = None
         self._cuda_graph_critic_outputs = None
+        self._cuda_graph_critic_metric_buffers = None
         self._cuda_graph_critic_shapes = None
         self._cuda_graph_critic_gradient_sync_calls = 0
 
@@ -579,15 +737,25 @@ class FlashSACLearner(LearnerBoilerplateMixin):
         ]
         cpu_rng_state = torch.random.get_rng_state()
         cuda_rng_state = torch.cuda.get_rng_state() if self.device.type == "cuda" else None
+        module_buffers = self._snapshot_module_buffers(
+            self.actor,
+            self.critic,
+            self.target_critic,
+        )
         try:
             for group in self.critic_optimizer.param_groups:
                 group["lr"] = 0.0
                 group["weight_decay"] = 0.0
-            self._update_critic_capture_candidate(inputs)
+            self._update_critic_capture_candidate(
+                inputs,
+                update_target=False,
+                normalize_parameters=False,
+            )
         finally:
             torch.random.set_rng_state(cpu_rng_state)
             if cuda_rng_state is not None:
                 torch.cuda.set_rng_state(cuda_rng_state)
+            self._restore_module_buffers(module_buffers)
             for group, lr, weight_decay in zip(
                 self.critic_optimizer.param_groups,
                 optimizer_lrs,
@@ -628,6 +796,10 @@ class FlashSACLearner(LearnerBoilerplateMixin):
         self._copy_critic_graph_inputs(inputs)
 
         graph = torch.cuda.CUDAGraph()
+        self._cuda_graph_critic_metric_buffers = (
+            torch.empty((), device=self.device),
+            torch.empty((), device=self.device),
+        )
         capture_stream = cast(torch.cuda.Stream, torch.cuda.Stream())
         capture_stream.wait_stream(torch.cuda.current_stream())
         sync_calls = [0]
@@ -635,7 +807,10 @@ class FlashSACLearner(LearnerBoilerplateMixin):
         try:
             with torch.cuda.stream(capture_stream), torch.cuda.graph(graph):
                 self._cuda_graph_critic_outputs = self._update_critic_capture_candidate(
-                    self._cuda_graph_critic_static_inputs
+                    self._cuda_graph_critic_static_inputs,
+                    update_target=True,
+                    normalize_parameters=True,
+                    metric_buffers=self._cuda_graph_critic_metric_buffers,
                 )
         finally:
             self._active_cuda_graph_gradient_sync_calls = None
@@ -649,10 +824,10 @@ class FlashSACLearner(LearnerBoilerplateMixin):
             return {}
         assert self._cuda_graph_critic_outputs is not None
         critic_loss, reward_scale_std = self._cuda_graph_critic_outputs
-        return {
-            "critic_loss": float(critic_loss.detach().cpu()),
-            "reward_scale_std": float(reward_scale_std.detach().cpu()),
-        }
+        return self._read_metric_tensors(
+            ("critic_loss", "reward_scale_std"),
+            (critic_loss, reward_scale_std),
+        )
 
     def update_critic_cuda_graph(
         self,
@@ -661,21 +836,26 @@ class FlashSACLearner(LearnerBoilerplateMixin):
         read_metrics: bool = True,
     ) -> dict[str, float]:
         if not self.use_cuda_graph_critic:
-            return self.update_critic(batch)
+            return self.update_critic(batch, read_metrics=read_metrics)
         if self.device.type != "cuda":
-            return self.update_critic(batch)
+            return self.update_critic(batch, read_metrics=read_metrics)
         if self.scaler is not None:
-            return self.update_critic(batch)
+            return self.update_critic(batch, read_metrics=read_metrics)
         if not isinstance(self.obs_normalizer, nn.Identity):
-            return self.update_critic(batch)
+            return self.update_critic(batch, read_metrics=read_metrics)
 
         inputs = self._prepare_critic_graph_inputs(batch)
         if self._cuda_graph_critic_shapes != self._critic_graph_input_shapes(inputs):
             self._reset_critic_cuda_graph()
             self._materialize_capturable_critic_optimizer_state(inputs)
             self._capture_critic_cuda_graph(inputs)
+            # Capturing records kernels but does not execute the training
+            # update.  Replay once so the first call has the same semantics as
+            # every subsequent call instead of silently dropping one update.
+            assert self._cuda_graph_critic is not None
+            self._cuda_graph_critic.replay()
+            self._record_cuda_graph_gradient_replay(self._cuda_graph_critic_gradient_sync_calls)
             self.critic_scheduler.step()
-            self.critic.normalize_parameters()
             return self._critic_graph_output_metrics(read_items=read_metrics)
 
         assert self._cuda_graph_critic is not None
@@ -683,7 +863,6 @@ class FlashSACLearner(LearnerBoilerplateMixin):
         self._cuda_graph_critic.replay()
         self._record_cuda_graph_gradient_replay(self._cuda_graph_critic_gradient_sync_calls)
         self.critic_scheduler.step()
-        self.critic.normalize_parameters()
         return self._critic_graph_output_metrics(read_items=read_metrics)
 
     @staticmethod
@@ -734,37 +913,54 @@ class FlashSACLearner(LearnerBoilerplateMixin):
     def _update_actor_capture_candidate(
         self,
         inputs: dict[str, torch.Tensor],
+        *,
+        normalize_parameters: bool = False,
+        metric_buffers: (
+            tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor] | None
+        ) = None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         obs = inputs["obs"]
         next_obs = inputs["next_obs"]
         expert_actions = inputs["actions"]
         critic_obs = inputs["critic"]
-        obs_all = torch.cat([obs, next_obs], dim=0)
-
-        with self._autocast():
-            actions_all, actor_info_all = self.actor(obs_all, training=True)
-            actions = actions_all.chunk(2, dim=0)[0]
-            log_probs = actor_info_all["log_prob"].chunk(2, dim=0)[0]
-
-            self._set_requires_grad(self.critic, False)
-            q_values, _ = self.critic(critic_obs, actions, training=False)
-            self._set_requires_grad(self.critic, True)
-            temp_value = self.temperature()
-            actor_loss, entropy = self._actor_loss_tensors(
-                log_probs, q_values, actions, expert_actions, temp_value
+        with self._critic_parameters_frozen():
+            actor_loss, entropy = self._actor_objective_tensors(
+                obs,
+                next_obs,
+                expert_actions,
+                critic_obs,
             )
+        if metric_buffers is None:
+            metric_actor_loss = actor_loss.detach().clone()
+            metric_entropy = entropy.detach().clone()
+        else:
+            metric_actor_loss, metric_entropy, _, _ = metric_buffers
+            metric_actor_loss.copy_(actor_loss.detach().reshape(()))
+            metric_entropy.copy_(entropy.detach().reshape(()))
 
         self.actor_optimizer.zero_grad(set_to_none=True)
         actor_loss.backward()
         self._sync_gradients(self.actor.parameters())
-        self.actor_optimizer.step()
+        with self._optimizer_finite_gate(self.actor_optimizer, actor_loss):
+            self.actor_optimizer.step()
+        if normalize_parameters:
+            self.actor.normalize_parameters()
 
+        temp_value = self.temperature()
         temp_loss = temp_value * (entropy - self.target_entropy)
+        if metric_buffers is None:
+            metric_temp_value = temp_value.detach().clone()
+            metric_temp_loss = temp_loss.detach().clone()
+        else:
+            _, _, metric_temp_value, metric_temp_loss = metric_buffers
+            metric_temp_value.copy_(temp_value.detach().reshape(()))
+            metric_temp_loss.copy_(temp_loss.detach().reshape(()))
         self.temperature_optimizer.zero_grad(set_to_none=True)
         temp_loss.backward()
         self._sync_gradients(self.temperature.parameters())
-        self.temperature_optimizer.step()
-        return actor_loss, entropy, temp_value, temp_loss
+        with self._optimizer_finite_gate(self.temperature_optimizer, temp_loss):
+            self.temperature_optimizer.step()
+        return metric_actor_loss, metric_entropy, metric_temp_value, metric_temp_loss
 
     def _reset_actor_cuda_graph(self) -> None:
         graph = self._cuda_graph_actor
@@ -774,6 +970,7 @@ class FlashSACLearner(LearnerBoilerplateMixin):
         self._cuda_graph_actor_static_inputs = None
         self._cuda_graph_actor_static_packed_input = None
         self._cuda_graph_actor_outputs = None
+        self._cuda_graph_actor_metric_buffers = None
         self._cuda_graph_actor_shapes = None
         self._cuda_graph_actor_gradient_sync_calls = 0
 
@@ -790,16 +987,18 @@ class FlashSACLearner(LearnerBoilerplateMixin):
         ]
         cpu_rng_state = torch.random.get_rng_state()
         cuda_rng_state = torch.cuda.get_rng_state() if self.device.type == "cuda" else None
+        module_buffers = self._snapshot_module_buffers(self.actor, self.critic)
         try:
             for optimizer in optimizers:
                 for group in optimizer.param_groups:
                     group["lr"] = 0.0
                     group["weight_decay"] = 0.0
-            self._update_actor_capture_candidate(inputs)
+            self._update_actor_capture_candidate(inputs, normalize_parameters=False)
         finally:
             torch.random.set_rng_state(cpu_rng_state)
             if cuda_rng_state is not None:
                 torch.cuda.set_rng_state(cuda_rng_state)
+            self._restore_module_buffers(module_buffers)
             for optimizer, lrs, weight_decays in zip(
                 optimizers,
                 optimizer_lrs,
@@ -853,6 +1052,12 @@ class FlashSACLearner(LearnerBoilerplateMixin):
         self._copy_actor_graph_inputs(inputs)
 
         graph = torch.cuda.CUDAGraph()
+        self._cuda_graph_actor_metric_buffers = (
+            torch.empty((), device=self.device),
+            torch.empty((), device=self.device),
+            torch.empty((), device=self.device),
+            torch.empty((), device=self.device),
+        )
         capture_stream = cast(torch.cuda.Stream, torch.cuda.Stream())
         capture_stream.wait_stream(torch.cuda.current_stream())
         sync_calls = [0]
@@ -860,7 +1065,9 @@ class FlashSACLearner(LearnerBoilerplateMixin):
         try:
             with torch.cuda.stream(capture_stream), torch.cuda.graph(graph):
                 self._cuda_graph_actor_outputs = self._update_actor_capture_candidate(
-                    self._cuda_graph_actor_static_inputs
+                    self._cuda_graph_actor_static_inputs,
+                    normalize_parameters=True,
+                    metric_buffers=self._cuda_graph_actor_metric_buffers,
                 )
         finally:
             self._active_cuda_graph_gradient_sync_calls = None
@@ -874,12 +1081,10 @@ class FlashSACLearner(LearnerBoilerplateMixin):
             return {}
         assert self._cuda_graph_actor_outputs is not None
         actor_loss, entropy, temp_value, temp_loss = self._cuda_graph_actor_outputs
-        return {
-            "actor_loss": float(actor_loss.detach().cpu()),
-            "actor_entropy": float(entropy.detach().cpu()),
-            "temperature": float(temp_value.detach().cpu()),
-            "temperature_loss": float(temp_loss.detach().cpu()),
-        }
+        return self._read_metric_tensors(
+            ("actor_loss", "actor_entropy", "temperature", "temperature_loss"),
+            (actor_loss, entropy, temp_value, temp_loss),
+        )
 
     def update_actor_cuda_graph(
         self,
@@ -888,22 +1093,24 @@ class FlashSACLearner(LearnerBoilerplateMixin):
         read_metrics: bool = True,
     ) -> dict[str, float]:
         if not self.use_cuda_graph_actor:
-            return self.update_actor(batch)
+            return self.update_actor(batch, read_metrics=read_metrics)
         if self.device.type != "cuda":
-            return self.update_actor(batch)
+            return self.update_actor(batch, read_metrics=read_metrics)
         if self.scaler is not None:
-            return self.update_actor(batch)
+            return self.update_actor(batch, read_metrics=read_metrics)
         if not isinstance(self.obs_normalizer, nn.Identity):
-            return self.update_actor(batch)
+            return self.update_actor(batch, read_metrics=read_metrics)
 
         inputs = self._prepare_actor_graph_inputs(batch)
         if self._cuda_graph_actor_shapes != self._actor_graph_input_shapes(inputs):
             self._reset_actor_cuda_graph()
             self._materialize_capturable_actor_optimizer_state(inputs)
             self._capture_actor_cuda_graph(inputs)
+            assert self._cuda_graph_actor is not None
+            self._cuda_graph_actor.replay()
+            self._record_cuda_graph_gradient_replay(self._cuda_graph_actor_gradient_sync_calls)
             self.actor_scheduler.step()
             self.temperature_scheduler.step()
-            self.actor.normalize_parameters()
             return self._actor_graph_output_metrics(read_items=read_metrics)
 
         assert self._cuda_graph_actor is not None
@@ -912,10 +1119,14 @@ class FlashSACLearner(LearnerBoilerplateMixin):
         self._record_cuda_graph_gradient_replay(self._cuda_graph_actor_gradient_sync_calls)
         self.actor_scheduler.step()
         self.temperature_scheduler.step()
-        self.actor.normalize_parameters()
         return self._actor_graph_output_metrics(read_items=read_metrics)
 
-    def update_critic(self, batch: dict[str, torch.Tensor]) -> dict[str, float]:
+    def update_critic(
+        self,
+        batch: dict[str, torch.Tensor],
+        *,
+        read_metrics: bool = True,
+    ) -> dict[str, float]:
         obs = batch["obs"].to(self.device)
         actions = batch["actions"].to(self.device)
         rewards = batch["rewards"].to(self.device)
@@ -931,59 +1142,39 @@ class FlashSACLearner(LearnerBoilerplateMixin):
         if self.reward_normalizer is not None:
             rewards = self.reward_normalizer.normalize(rewards)
 
-        gamma = self.gamma**self.n_step
-
-        obs_all = torch.cat([critic_obs, critic_next_obs], dim=0)
-
-        with torch.no_grad():
-            with self._autocast():
-                next_actions, actor_info = self.actor(next_obs, training=False)
-                actor_entropy = self.temperature().detach() * actor_info["log_prob"]
-                act_all = torch.cat([actions, next_actions], dim=0)
-                qs_all, q_info_all = self.target_critic(obs_all, act_all, training=True)
-                next_q_values = qs_all.chunk(2, dim=1)[1]
-                next_q_log_probs_full = q_info_all["log_prob"].chunk(2, dim=1)[1]
-                support = cast(torch.Tensor, self.target_critic.predictor.support)
-
-        with self._autocast():
-            _, pred_info_all = self.critic(obs_all, act_all, training=True)
-            pred_log_probs = pred_info_all["log_prob"].chunk(2, dim=1)[0]
-            critic_loss = self._critic_loss_tensors(
-                next_q_values,
-                next_q_log_probs_full,
-                support,
-                rewards,
-                dones,
-                truncated,
-                actor_entropy,
-                pred_log_probs,
-                gamma,
-            )
+        critic_loss, reward_scale_std = self._critic_objective_tensors(
+            actions, rewards, next_obs, dones, truncated, critic_obs, critic_next_obs
+        )
 
         self.critic_optimizer.zero_grad(set_to_none=True)
-        if self.scaler is not None:
-            self.scaler.scale(critic_loss).backward()
-            self._sync_gradients(self.critic.parameters())
-            self.scaler.unscale_(self.critic_optimizer)
-            self.scaler.step(self.critic_optimizer)
-            self.scaler.update()
-        else:
-            critic_loss.backward()
-            self._sync_gradients(self.critic.parameters())
-            self.critic_optimizer.step()
+        if not self._host_finite_checks or bool(torch.isfinite(critic_loss)):
+            if self.scaler is not None:
+                self.scaler.scale(critic_loss).backward()
+                self._sync_gradients(self.critic.parameters())
+                self.scaler.unscale_(self.critic_optimizer)
+                self.scaler.step(self.critic_optimizer)
+                self.scaler.update()
+            else:
+                critic_loss.backward()
+                self._sync_gradients(self.critic.parameters())
+                with self._optimizer_finite_gate(self.critic_optimizer, critic_loss):
+                    self.critic_optimizer.step()
         self.critic_scheduler.step()
         self.critic.normalize_parameters()
 
-        return {
-            "critic_loss": float(critic_loss.detach().cpu()),
-            "reward_scale_std": float(
-                torch.sqrt(self.reward_normalizer.rms.var).detach().cpu()
-                if self.reward_normalizer is not None
-                else torch.tensor(1.0)
-            ),
-        }
+        if not read_metrics:
+            return {}
+        return self._read_metric_tensors(
+            ("critic_loss", "reward_scale_std"),
+            (critic_loss, reward_scale_std),
+        )
 
-    def update_actor(self, batch: dict[str, torch.Tensor]) -> dict[str, float]:
+    def update_actor(
+        self,
+        batch: dict[str, torch.Tensor],
+        *,
+        read_metrics: bool = True,
+    ) -> dict[str, float]:
         obs = batch["obs"].to(self.device)
         next_obs = batch["next_obs"].to(self.device)
         expert_actions = batch["actions"].to(self.device)
@@ -992,48 +1183,87 @@ class FlashSACLearner(LearnerBoilerplateMixin):
         obs = self._maybe_normalize_obs(obs, update=False)
         next_obs = self._maybe_normalize_obs(next_obs, update=False)
 
-        obs_all = torch.cat([obs, next_obs], dim=0)
-
-        with self._autocast():
-            actions_all, actor_info_all = self.actor(obs_all, training=True)
-            actions = actions_all.chunk(2, dim=0)[0]
-            log_probs = actor_info_all["log_prob"].chunk(2, dim=0)[0]
-
-            self._set_requires_grad(self.critic, False)
-            q_values, _ = self.critic(critic_obs, actions, training=False)
-            self._set_requires_grad(self.critic, True)
-            actor_loss, entropy = self._actor_loss_tensors(
-                log_probs, q_values, actions, expert_actions, self.temperature()
+        self._pending_actor_metric_values = None
+        with self._critic_parameters_frozen():
+            actor_loss, entropy = self._actor_objective_tensors(
+                obs,
+                next_obs,
+                expert_actions,
+                critic_obs,
             )
 
         self.actor_optimizer.zero_grad(set_to_none=True)
-        if self.scaler is not None:
-            self.scaler.scale(actor_loss).backward()
-            self._sync_gradients(self.actor.parameters())
-            self.scaler.unscale_(self.actor_optimizer)
-            self.scaler.step(self.actor_optimizer)
-            self.scaler.update()
-        else:
-            actor_loss.backward()
-            self._sync_gradients(self.actor.parameters())
-            self.actor_optimizer.step()
+        if not self._host_finite_checks or bool(torch.isfinite(actor_loss)):
+            if self.scaler is not None:
+                self.scaler.scale(actor_loss).backward()
+                self._sync_gradients(self.actor.parameters())
+                self.scaler.unscale_(self.actor_optimizer)
+                self.scaler.step(self.actor_optimizer)
+                self.scaler.update()
+            else:
+                actor_loss.backward()
+                self._sync_gradients(self.actor.parameters())
+                with self._optimizer_finite_gate(self.actor_optimizer, actor_loss):
+                    self.actor_optimizer.step()
         self.actor_scheduler.step()
         self.actor.normalize_parameters()
 
         temp_value = self.temperature()
         temp_loss = temp_value * (entropy - self.target_entropy)
         self.temperature_optimizer.zero_grad(set_to_none=True)
-        temp_loss.backward()
-        self._sync_gradients(self.temperature.parameters())
-        self.temperature_optimizer.step()
+        if not self._host_finite_checks or bool(torch.isfinite(temp_loss)):
+            temp_loss.backward()
+            self._sync_gradients(self.temperature.parameters())
+            with self._optimizer_finite_gate(self.temperature_optimizer, temp_loss):
+                self.temperature_optimizer.step()
         self.temperature_scheduler.step()
 
+        actor_metric_tensors = (actor_loss, entropy, temp_value, temp_loss)
+        if not read_metrics:
+            # Keep a private device-side snapshot.  The cycle-end drain below
+            # performs the only D2H read, after all compiled replays finish.
+            self._pending_actor_metric_values = torch.stack(
+                [tensor.detach().reshape(()) for tensor in actor_metric_tensors]
+            )
+            return {}
+        return self._read_metric_tensors(
+            ("actor_loss", "actor_entropy", "temperature", "temperature_loss"),
+            actor_metric_tensors,
+        )
+
+    @staticmethod
+    def _read_metric_tensors(
+        names: tuple[str, ...],
+        tensors: tuple[torch.Tensor, ...],
+    ) -> dict[str, float]:
+        values = torch.stack([tensor.detach().reshape(()) for tensor in tensors]).cpu().tolist()
+        return {name: float(value) for name, value in zip(names, values, strict=True)}
+
+    def read_deferred_actor_metrics(self) -> dict[str, float]:
+        values = self._pending_actor_metric_values
+        self._pending_actor_metric_values = None
+        if values is None:
+            if self._cuda_graph_actor_outputs is None:
+                return {}
+            return self._actor_graph_output_metrics(read_items=True)
         return {
-            "actor_loss": float(actor_loss.detach().cpu()),
-            "actor_entropy": float(entropy.detach().cpu()),
-            "temperature": float(temp_value.detach().cpu()),
-            "temperature_loss": float(temp_loss.detach().cpu()),
+            name: float(value)
+            for name, value in zip(
+                ("actor_loss", "actor_entropy", "temperature", "temperature_loss"),
+                values.cpu().tolist(),
+                strict=True,
+            )
         }
+
+    @property
+    def cuda_graph_critic_captures_target_update(self) -> bool:
+        """Whether critic graph replay already performs the Polyak update."""
+        return bool(
+            self.use_cuda_graph_critic
+            and self._device_type == "cuda"
+            and self.scaler is None
+            and isinstance(self.obs_normalizer, nn.Identity)
+        )
 
     def soft_update_target(self) -> None:
         polyak_update_target(self.target_critic, self.critic, self.tau)

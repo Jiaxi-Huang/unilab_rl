@@ -58,10 +58,12 @@ def compute_categorical_td_target(
 
     bootstrap = torch.clamp(1.0 - dones + truncated, 0.0, 1.0)
     target_bin_values = reward + bootstrap * gamma * (support - actor_entropy)
-    target_bin_values = torch.clamp(target_bin_values, float(support.min()), float(support.max()))
+    support_min = support[..., :1]
+    support_max = support[..., -1:]
+    target_bin_values = torch.maximum(torch.minimum(target_bin_values, support_max), support_min)
 
-    bin_width = float(support[0, 1] - support[0, 0])
-    offsets = (target_bin_values - float(support.min())) / max(bin_width, 1e-8)
+    bin_width = (support[..., 1:2] - support_min).clamp_min(1e-8)
+    offsets = (target_bin_values - support_min) / bin_width
     lower = torch.floor(offsets).long().clamp(0, num_bins - 1)
     upper = torch.ceil(offsets).long().clamp(0, num_bins - 1)
     frac = offsets - lower.float()
