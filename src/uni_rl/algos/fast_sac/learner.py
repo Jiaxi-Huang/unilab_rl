@@ -393,6 +393,12 @@ class FastSACLearner(LearnerBoilerplateMixin):
     - Distributional critic (C51, num_atoms=101)
     """
 
+    # Keep Inductor's fused loss kernels and remove their repeated host launch
+    # overhead.  This outperforms capturing the unfused eager loss on current
+    # Ada-class GPUs while remaining scoped to use_compile=True.
+    _compile_loss_cudagraphs = True
+    supports_deferred_update_metrics = True
+
     def __init__(
         self,
         obs_dim: int,
@@ -439,6 +445,13 @@ class FastSACLearner(LearnerBoilerplateMixin):
         self.use_amp = bool(use_amp) and self._device_type in ("cuda", "xpu")
         self.use_compile = (
             bool(use_compile) and get_torch_compile_for_cuda(self.device, warn=True) is not None
+        )
+        # Manual CUDA Graph replay cannot branch on host-visible finite checks.
+        # The compiled CUDA Graph hot path follows the same capture-safe
+        # semantics and relies on the existing NaN guard/metrics boundary.
+        self._host_finite_checks = not (
+            self._device_type == "cuda"
+            and (self.use_compile or use_cuda_graph_critic or use_cuda_graph_actor)
         )
         self.use_cuda_graph_critic = bool(use_cuda_graph_critic) and self._device_type == "cuda"
         requested_cuda_graph_critic_packed_staging = bool(use_cuda_graph_critic_packed_staging)
@@ -495,6 +508,8 @@ class FastSACLearner(LearnerBoilerplateMixin):
         self.log_alpha = torch.tensor([math.log(alpha_init)], requires_grad=True, device=device)
         self.target_entropy = -action_dim * target_entropy_ratio
         self._zero_metric = torch.zeros((), device=device)
+        self._optimizer_grad_scale = torch.ones((), device=device)
+        self._optimizer_found_inf = torch.zeros((), device=device)
 
         self.obs_normalizer: EmpiricalNormalization | nn.Identity
         if obs_normalization:
@@ -503,7 +518,7 @@ class FastSACLearner(LearnerBoilerplateMixin):
             self.obs_normalizer = nn.Identity()
 
         # fused AdamW requires CUDA; MPS and CPU do not support it
-        _fused = isinstance(device, str) and device.startswith("cuda")
+        _fused = self._device_type == "cuda"
         _optimizer_cuda_kwargs = {"capturable": True} if _fused else {}
 
         # Optimizers (AdamW with holosoma betas)
@@ -586,6 +601,7 @@ class FastSACLearner(LearnerBoilerplateMixin):
         ) = None
         self._cuda_graph_actor_shapes: dict[str, torch.Size] | None = None
         self._cuda_graph_actor_gradient_sync_calls = 0
+        self._pending_actor_metric_values: torch.Tensor | None = None
         if self.use_compile:
             self._compile_training_methods()
 
@@ -598,6 +614,55 @@ class FastSACLearner(LearnerBoilerplateMixin):
             self._update_obs_normalizer(obs)
             return cast(torch.Tensor, normalizer(obs, update=False))
         return cast(torch.Tensor, normalizer(obs, update=False))
+
+    @contextmanager
+    def _optimizer_finite_gate(
+        self,
+        optimizer: optim.Optimizer,
+        loss: torch.Tensor,
+    ) -> Iterator[None]:
+        """Skip a fused CUDA optimizer step on non-finite values without a host sync."""
+        if self._host_finite_checks or self._device_type != "cuda":
+            yield
+            return
+        found_inf = self._optimizer_found_inf
+        found_inf.copy_(torch.logical_not(torch.isfinite(loss.detach()).all()))
+        # A non-finite gradient from one rank propagates through the preceding
+        # all-reduce even when another rank's local loss is finite.  Preserve
+        # the lean single-GPU path while making the DP gate inspect the
+        # synchronized gradients on device.
+        if self._gradient_sync is not None:
+            gradients = [
+                parameter.grad
+                for group in optimizer.param_groups
+                for parameter in group["params"]
+                if parameter.grad is not None
+            ]
+            if gradients:
+                torch._amp_foreach_non_finite_check_and_unscale_(
+                    gradients,
+                    found_inf,
+                    self._optimizer_grad_scale,
+                )
+        setattr(optimizer, "grad_scale", self._optimizer_grad_scale)
+        setattr(optimizer, "found_inf", found_inf)
+        try:
+            yield
+        finally:
+            delattr(optimizer, "grad_scale")
+            delattr(optimizer, "found_inf")
+
+    @contextmanager
+    def _critic_parameters_frozen(self) -> Iterator[None]:
+        """Keep critic weights out of actor autograd without splitting its compiled graph."""
+        states = [(parameter, parameter.requires_grad) for parameter in self.qnet.parameters()]
+        for parameter, _ in states:
+            parameter.requires_grad_(False)
+        try:
+            yield
+        finally:
+            for parameter, requires_grad in states:
+                parameter.requires_grad_(requires_grad)
 
     def _get_actions_and_log_probs_for_critic(
         self,
@@ -699,11 +764,12 @@ class FastSACLearner(LearnerBoilerplateMixin):
         obs: torch.Tensor,
         critic_obs: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-        actor_loss, policy_entropy, action_std = self._actor_loss_tensors(
-            obs,
-            critic_obs,
-            action_eps=self._cuda_graph_actor_action_noise,
-        )
+        with self._critic_parameters_frozen():
+            actor_loss, policy_entropy, action_std = self._actor_loss_tensors(
+                obs,
+                critic_obs,
+                action_eps=self._cuda_graph_actor_action_noise,
+            )
 
         self.actor_optimizer.zero_grad(set_to_none=True)
         if self.scaler:
@@ -726,7 +792,8 @@ class FastSACLearner(LearnerBoilerplateMixin):
                 )
             else:
                 actor_grad_norm = self._zero_metric
-            self.actor_optimizer.step()
+            with self._optimizer_finite_gate(self.actor_optimizer, actor_loss):
+                self.actor_optimizer.step()
 
         return actor_loss, actor_grad_norm, policy_entropy, action_std
 
@@ -739,6 +806,8 @@ class FastSACLearner(LearnerBoilerplateMixin):
         critic_next_obs: torch.Tensor,
         dones: torch.Tensor,
         truncated: torch.Tensor,
+        *,
+        update_target: bool = False,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         qf_loss, target_q_max, target_q_min, next_log_probs = self._critic_loss_tensors(
             critic_obs,
@@ -772,7 +841,8 @@ class FastSACLearner(LearnerBoilerplateMixin):
                 )
             else:
                 critic_grad_norm = self._zero_metric
-            self.q_optimizer.step()
+            with self._optimizer_finite_gate(self.q_optimizer, qf_loss):
+                self.q_optimizer.step()
 
         alpha_loss = self._zero_metric
         if self.use_autotune:
@@ -780,7 +850,16 @@ class FastSACLearner(LearnerBoilerplateMixin):
             alpha_loss = self._alpha_loss_tensor(next_log_probs)
             alpha_loss.backward()
             self._sync_gradients((self.log_alpha,))
-            self.alpha_optimizer.step()
+            with self._optimizer_finite_gate(self.alpha_optimizer, alpha_loss):
+                self.alpha_optimizer.step()
+
+        # Keep the steady-state target update inside the critic graph.  This
+        # removes the two graph-external foreach launches which otherwise sit
+        # between every pair of critic replays.  Optimizer-state
+        # materialization explicitly leaves this disabled because that dry run
+        # must not mutate the target network.
+        if update_target:
+            polyak_update_target(self.qnet_target, self.qnet, self.tau)
 
         return (
             qf_loss,
@@ -989,6 +1068,7 @@ class FastSACLearner(LearnerBoilerplateMixin):
                 batch["next_critic"],
                 batch["dones"],
                 batch["truncated"],
+                update_target=False,
             )
         finally:
             torch.random.set_rng_state(cpu_rng_state)
@@ -1146,12 +1226,10 @@ class FastSACLearner(LearnerBoilerplateMixin):
             return {}
         assert self._cuda_graph_actor_outputs is not None
         actor_loss, actor_grad_norm, policy_entropy, action_std = self._cuda_graph_actor_outputs
-        return {
-            "actor_loss": actor_loss.item(),
-            "actor_grad_norm": actor_grad_norm.item(),
-            "policy_entropy": policy_entropy.item(),
-            "action_std": action_std.item(),
-        }
+        return self._read_metric_tensors(
+            ("actor_loss", "actor_grad_norm", "policy_entropy", "action_std"),
+            (actor_loss, actor_grad_norm, policy_entropy, action_std),
+        )
 
     def _capture_critic_cuda_graph(self, batch: Dict[str, torch.Tensor]) -> None:
         if not self.use_cuda_graph_critic:
@@ -1209,6 +1287,7 @@ class FastSACLearner(LearnerBoilerplateMixin):
                     self._cuda_graph_critic_static_inputs["next_critic"],
                     self._cuda_graph_critic_static_inputs["dones"],
                     self._cuda_graph_critic_static_inputs["truncated"],
+                    update_target=True,
                 )
         finally:
             self._active_cuda_graph_gradient_sync_calls = None
@@ -1224,14 +1303,39 @@ class FastSACLearner(LearnerBoilerplateMixin):
         qf_loss, critic_grad_norm, target_q_max, target_q_min, alpha_loss, alpha = (
             self._cuda_graph_critic_outputs
         )
-        return {
-            "qf_loss": qf_loss.item(),
-            "critic_grad_norm": critic_grad_norm.item(),
-            "target_q_max": target_q_max.item(),
-            "target_q_min": target_q_min.item(),
-            "alpha_loss": alpha_loss.item(),
-            "alpha": alpha.item(),
-        }
+        return self._read_metric_tensors(
+            (
+                "qf_loss",
+                "critic_grad_norm",
+                "target_q_max",
+                "target_q_min",
+                "alpha_loss",
+                "alpha",
+            ),
+            (qf_loss, critic_grad_norm, target_q_max, target_q_min, alpha_loss, alpha),
+        )
+
+    @staticmethod
+    def _read_metric_tensors(
+        names: tuple[str, ...],
+        tensors: tuple[torch.Tensor, ...],
+    ) -> Dict[str, float]:
+        if not all(isinstance(tensor, torch.Tensor) for tensor in tensors):
+            return {name: float(tensor.item()) for name, tensor in zip(names, tensors, strict=True)}
+        values = torch.stack([tensor.detach().reshape(()) for tensor in tensors]).cpu().tolist()
+        return {name: float(value) for name, value in zip(names, values, strict=True)}
+
+    def read_deferred_actor_metrics(self) -> Dict[str, float]:
+        values = self._pending_actor_metric_values
+        self._pending_actor_metric_values = None
+        if values is not None:
+            names = ("actor_loss", "actor_grad_norm", "policy_entropy", "action_std")
+            return {
+                name: float(value) for name, value in zip(names, values.cpu().tolist(), strict=True)
+            }
+        if self._cuda_graph_actor_outputs is not None:
+            return self._actor_graph_output_metrics(read_items=True)
+        return {}
 
     def update_critic_cuda_graph(
         self,
@@ -1240,11 +1344,13 @@ class FastSACLearner(LearnerBoilerplateMixin):
         read_metrics: bool = True,
     ) -> Dict[str, float]:
         if not self.use_cuda_graph_critic:
-            return self.update_critic(batch)
+            return self.update_critic(batch, read_metrics=read_metrics)
         if self._device_type != "cuda":
-            return self.update_critic(batch)
+            return self.update_critic(batch, read_metrics=read_metrics)
         if self.scaler is not None:
-            return self.update_critic(batch)
+            return self.update_critic(batch, read_metrics=read_metrics)
+        if not isinstance(self.obs_normalizer, nn.Identity):
+            return self.update_critic(batch, read_metrics=read_metrics)
         if self._cuda_graph_critic_shapes != self._critic_graph_input_shapes(batch):
             self._reset_critic_cuda_graph()
             self._materialize_capturable_critic_optimizer_state(batch)
@@ -1270,11 +1376,13 @@ class FastSACLearner(LearnerBoilerplateMixin):
         read_metrics: bool = True,
     ) -> Dict[str, float]:
         if not self.use_cuda_graph_actor:
-            return self.update_actor(batch)
+            return self.update_actor(batch, read_metrics=read_metrics)
         if self._device_type != "cuda":
-            return self.update_actor(batch)
+            return self.update_actor(batch, read_metrics=read_metrics)
         if self.scaler is not None:
-            return self.update_actor(batch)
+            return self.update_actor(batch, read_metrics=read_metrics)
+        if not isinstance(self.obs_normalizer, nn.Identity):
+            return self.update_actor(batch, read_metrics=read_metrics)
         if self._cuda_graph_actor_shapes != self._actor_graph_input_shapes(batch):
             self._reset_actor_cuda_graph()
             self._materialize_capturable_actor_optimizer_state(batch)
@@ -1293,7 +1401,12 @@ class FastSACLearner(LearnerBoilerplateMixin):
         with _cuda_nvtx_range("actor_graph/output_metrics_item", self.nvtx_profile_ranges):
             return self._actor_graph_output_metrics(read_items=read_metrics)
 
-    def update_critic(self, batch: Dict[str, torch.Tensor]) -> Dict[str, float]:
+    def update_critic(
+        self,
+        batch: Dict[str, torch.Tensor],
+        *,
+        read_metrics: bool = True,
+    ) -> Dict[str, float]:
         """One critic update step."""
         obs = batch["obs"]
         critic_obs = batch["critic"]
@@ -1319,7 +1432,7 @@ class FastSACLearner(LearnerBoilerplateMixin):
             )
 
         # Skip if NaN
-        if torch.isfinite(qf_loss):
+        if not self._host_finite_checks or torch.isfinite(qf_loss):
             self.q_optimizer.zero_grad(set_to_none=True)
             if self.scaler:
                 with _cuda_nvtx_range("critic/backward", self.nvtx_profile_ranges):
@@ -1348,7 +1461,8 @@ class FastSACLearner(LearnerBoilerplateMixin):
                 else:
                     critic_grad_norm = self._zero_metric
                 with _cuda_nvtx_range("critic/q_optimizer_step", self.nvtx_profile_ranges):
-                    self.q_optimizer.step()
+                    with self._optimizer_finite_gate(self.q_optimizer, qf_loss):
+                        self.q_optimizer.step()
         else:
             critic_grad_norm = self._zero_metric
 
@@ -1359,33 +1473,53 @@ class FastSACLearner(LearnerBoilerplateMixin):
                 self.alpha_optimizer.zero_grad(set_to_none=True)
                 with _cuda_nvtx_range("critic/alpha_loss", self.nvtx_profile_ranges):
                     alpha_loss = self._alpha_loss_tensor(next_log_probs)
-                if torch.isfinite(alpha_loss):
+                if not self._host_finite_checks or torch.isfinite(alpha_loss):
                     with _cuda_nvtx_range("critic/alpha_backward", self.nvtx_profile_ranges):
                         alpha_loss.backward()
                     self._sync_gradients((self.log_alpha,))
                     with _cuda_nvtx_range("critic/alpha_optimizer_step", self.nvtx_profile_ranges):
-                        self.alpha_optimizer.step()
+                        with self._optimizer_finite_gate(self.alpha_optimizer, alpha_loss):
+                            self.alpha_optimizer.step()
 
-        return {
-            "qf_loss": qf_loss.item(),
-            "critic_grad_norm": critic_grad_norm.item(),
-            "target_q_max": target_q_max.item(),
-            "target_q_min": target_q_min.item(),
-            "alpha_loss": alpha_loss.item(),
-            "alpha": self.log_alpha.exp().item(),
-        }
+        if not read_metrics:
+            return {}
+        return self._read_metric_tensors(
+            (
+                "qf_loss",
+                "critic_grad_norm",
+                "target_q_max",
+                "target_q_min",
+                "alpha_loss",
+                "alpha",
+            ),
+            (
+                qf_loss,
+                critic_grad_norm,
+                target_q_max,
+                target_q_min,
+                alpha_loss,
+                self.log_alpha.exp(),
+            ),
+        )
 
-    def update_actor(self, batch: Dict[str, torch.Tensor]) -> Dict[str, float]:
+    def update_actor(
+        self,
+        batch: Dict[str, torch.Tensor],
+        *,
+        read_metrics: bool = True,
+    ) -> Dict[str, float]:
         """One actor update step."""
         obs = batch["obs"]
         critic_obs = batch["critic"]
 
         obs = self.normalize_obs(obs, update=False)
+        self._pending_actor_metric_values = None
         with _cuda_nvtx_range("actor/loss_compiled", self.nvtx_profile_ranges):
-            actor_loss, policy_entropy, action_std = self._actor_loss_tensors(obs, critic_obs)
+            with self._critic_parameters_frozen():
+                actor_loss, policy_entropy, action_std = self._actor_loss_tensors(obs, critic_obs)
 
         # Skip if NaN
-        if torch.isfinite(actor_loss):
+        if not self._host_finite_checks or torch.isfinite(actor_loss):
             self.actor_optimizer.zero_grad(set_to_none=True)
             if self.scaler:
                 with _cuda_nvtx_range("actor/backward", self.nvtx_profile_ranges):
@@ -1414,21 +1548,44 @@ class FastSACLearner(LearnerBoilerplateMixin):
                 else:
                     actor_grad_norm = self._zero_metric
                 with _cuda_nvtx_range("actor/optimizer_step", self.nvtx_profile_ranges):
-                    self.actor_optimizer.step()
+                    with self._optimizer_finite_gate(self.actor_optimizer, actor_loss):
+                        self.actor_optimizer.step()
         else:
             actor_grad_norm = self._zero_metric
 
-        return {
-            "actor_loss": actor_loss.item(),
-            "actor_grad_norm": actor_grad_norm.item(),
-            "policy_entropy": policy_entropy.item(),
-            "action_std": action_std.item(),
-        }
+        actor_metric_tensors = (
+            actor_loss,
+            actor_grad_norm,
+            policy_entropy,
+            action_std,
+        )
+        if not read_metrics:
+            # Inductor CUDA Graph Trees overwrite their output storage on a
+            # later compiled call.  Stage the four scalars now so they remain
+            # valid until the single cycle-end D2H read.
+            self._pending_actor_metric_values = torch.stack(
+                [tensor.detach().reshape(()) for tensor in actor_metric_tensors]
+            )
+            return {}
+        return self._read_metric_tensors(
+            ("actor_loss", "actor_grad_norm", "policy_entropy", "action_std"),
+            actor_metric_tensors,
+        )
 
     def soft_update_target(self) -> None:
         """Polyak-average update of the target Q-network."""
         with _cuda_nvtx_range("target/soft_update_loop", self.nvtx_profile_ranges):
             polyak_update_target(self.qnet_target, self.qnet, self.tau)
+
+    @property
+    def cuda_graph_critic_captures_target_update(self) -> bool:
+        """Whether each critic graph replay already performs the Polyak update."""
+        return bool(
+            self.use_cuda_graph_critic
+            and self._device_type == "cuda"
+            and self.scaler is None
+            and isinstance(self.obs_normalizer, nn.Identity)
+        )
 
     def dp_initial_sync_tensors(self) -> Dict[str, torch.Tensor]:
         """Model state broadcast once from rank 0 before collection starts.

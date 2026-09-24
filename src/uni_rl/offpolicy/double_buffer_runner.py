@@ -221,6 +221,7 @@ class DoubleBufferOffPolicyRunner(OffPolicyRunner):
             "learner_actor_reused": True,
             "logger_owner_rank": 0,
             "logger_cross_rank_aggregation": self.dp_sync is not None,
+            "cuda_graph": self._cuda_graph_runtime_manifest(),
         }
         if self.dp_sync is not None:
             captures_gradient_sync = bool(
@@ -249,6 +250,50 @@ class DoubleBufferOffPolicyRunner(OffPolicyRunner):
             self.dp_sync.allreduce_gradients,
             graph_replay_recorder=self.dp_sync.record_cuda_graph_gradient_replay,
         )
+
+    def _cuda_graph_runtime_manifest(self) -> dict[str, object]:
+        """Describe the effective learner graph path and any eager fallback."""
+        critic_enabled = bool(getattr(self.learner, "use_cuda_graph_critic", False))
+        actor_enabled = bool(getattr(self.learner, "use_cuda_graph_actor", False))
+        compile_enabled = bool(getattr(self.learner, "use_compile", False))
+        compile_loss_cudagraphs = bool(getattr(self.learner, "_compile_loss_cudagraphs", False))
+        scaler_active = getattr(self.learner, "scaler", None) is not None
+        normalizer = getattr(self.learner, "obs_normalizer", None)
+        obs_normalization_active = normalizer is not None and not isinstance(
+            normalizer, torch.nn.Identity
+        )
+
+        fallback_reasons: list[str] = []
+        if (critic_enabled or actor_enabled) and scaler_active:
+            fallback_reasons.append("fp16_grad_scaler")
+        if (critic_enabled or actor_enabled) and obs_normalization_active:
+            fallback_reasons.append("obs_normalization")
+        replay_ready = not fallback_reasons
+        return {
+            "critic_enabled": critic_enabled,
+            "actor_enabled": actor_enabled,
+            "critic_replay_active": critic_enabled and replay_ready,
+            "actor_replay_active": actor_enabled and replay_ready,
+            "inductor_critic_cudagraphs": (
+                compile_enabled and compile_loss_cudagraphs and not critic_enabled
+            ),
+            "inductor_actor_cudagraphs": (
+                compile_enabled and compile_loss_cudagraphs and not actor_enabled
+            ),
+            "device_finite_optimizer_gating": not bool(
+                getattr(self.learner, "_host_finite_checks", True)
+            ),
+            "critic_packed_staging": bool(
+                getattr(self.learner, "use_cuda_graph_critic_packed_staging", False)
+            ),
+            "actor_packed_staging": bool(
+                getattr(self.learner, "use_cuda_graph_actor_packed_staging", False)
+            ),
+            "critic_captures_target_update": bool(
+                getattr(self.learner, "cuda_graph_critic_captures_target_update", False)
+            ),
+            "fallback_reasons": fallback_reasons,
+        }
 
     def _dp_initial_sync_tensors(self) -> dict[str, torch.Tensor]:
         """Live model-state references broadcast once before collection."""
@@ -631,6 +676,16 @@ class DoubleBufferOffPolicyRunner(OffPolicyRunner):
         if self.obs_normalization:
             actor_obs = self.learner.obs_normalizer(actor_obs, update=False)
         forward_start_ns = time.perf_counter_ns()
+        cuda_forward_events: tuple[torch.cuda.Event, torch.cuda.Event] | None = None
+        if device.type == "cuda":
+            cuda_forward_events = getattr(self, "_inference_forward_cuda_events", None)
+            if cuda_forward_events is None:
+                cuda_forward_events = (
+                    torch.cuda.Event(enable_timing=True),
+                    torch.cuda.Event(enable_timing=True),
+                )
+                self._inference_forward_cuda_events = cuda_forward_events
+            cuda_forward_events[0].record(torch.cuda.current_stream(device))
         with torch.no_grad():
             actions_device = sample_offpolicy_actions(
                 actor=self.learner.actor,
@@ -639,9 +694,12 @@ class DoubleBufferOffPolicyRunner(OffPolicyRunner):
                 prev_dones_torch=dones_device,
                 priv_info_torch=actor_context,
             )
-        if device.type == "cuda":
-            torch.cuda.current_stream(device).synchronize()
+        if cuda_forward_events is not None:
+            cuda_forward_events[1].record(torch.cuda.current_stream(device))
         elif device.type == "mps":
+            # MPS has no public timing-event equivalent.  Preserve the
+            # existing measurement boundary there; CUDA relies on the
+            # following blocking D2H copy and reads elapsed event time after it.
             torch.mps.synchronize()
         forward_end_ns = time.perf_counter_ns()
 
@@ -653,9 +711,14 @@ class DoubleBufferOffPolicyRunner(OffPolicyRunner):
             non_blocking=False,
         )
         d2h_end_ns = time.perf_counter_ns()
+        inference_forward_time = (forward_end_ns - forward_start_ns) / 1e9
+        if cuda_forward_events is not None:
+            inference_forward_time = (
+                cuda_forward_events[0].elapsed_time(cuda_forward_events[1]) / 1e3
+            )
         timings = {
             "inference_h2d_time": (h2d_end_ns - h2d_start_ns) / 1e9,
-            "inference_forward_time": (forward_end_ns - forward_start_ns) / 1e9,
+            "inference_forward_time": inference_forward_time,
             "inference_d2h_time": (d2h_end_ns - d2h_start_ns) / 1e9,
             "inference_time": (d2h_end_ns - h2d_start_ns) / 1e9,
         }
@@ -963,6 +1026,19 @@ class DoubleBufferOffPolicyRunner(OffPolicyRunner):
         logger.log_status(f"Replay pack layout: {self.replay_pack_layout}")
         logger.log_status(f"Replay pack executor: {self.replay_pack_executor}")
         logger.log_status(f"Replay H2D submitter: {self.replay_h2d_submitter}")
+        graph_manifest = cast(dict[str, object], self.runtime_manifest["cuda_graph"])
+        logger.log_status(
+            "CUDA Graph: "
+            f"critic={graph_manifest['critic_replay_active']}, "
+            f"actor={graph_manifest['actor_replay_active']}, "
+            f"inductor_critic={graph_manifest['inductor_critic_cudagraphs']}, "
+            f"inductor_actor={graph_manifest['inductor_actor_cudagraphs']}, "
+            f"critic_packed={graph_manifest['critic_packed_staging']}, "
+            f"actor_packed={graph_manifest['actor_packed_staging']}, "
+            f"target_update_captured={graph_manifest['critic_captures_target_update']}, "
+            f"device_finite_gate={graph_manifest['device_finite_optimizer_gating']}, "
+            f"fallback={graph_manifest['fallback_reasons']}"
+        )
         if self.replay_transfer_backend:
             logger.log_status(
                 "Replay transfer backend: "
@@ -1237,6 +1313,13 @@ class DoubleBufferOffPolicyRunner(OffPolicyRunner):
 
                     train_start = time.perf_counter()
                     train_phase_start_ns = time.perf_counter_ns()
+                    target_update_captured = bool(
+                        getattr(
+                            learner,
+                            "cuda_graph_critic_captures_target_update",
+                            False,
+                        )
+                    )
 
                     for update_idx in range(self.updates_per_step):
                         s = update_idx * self.batch_size
@@ -1253,7 +1336,13 @@ class DoubleBufferOffPolicyRunner(OffPolicyRunner):
                                 read_metrics=read_critic_graph_metrics,
                             )
                         else:
-                            critic_metrics = learner.update_critic(batch)
+                            if getattr(learner, "supports_deferred_update_metrics", False):
+                                critic_metrics = learner.update_critic(
+                                    batch,
+                                    read_metrics=read_critic_graph_metrics,
+                                )
+                            else:
+                                critic_metrics = learner.update_critic(batch)
                         if trace_recorder:
                             trace_recorder.add_slice(
                                 "learner/update_critic",
@@ -1267,7 +1356,13 @@ class DoubleBufferOffPolicyRunner(OffPolicyRunner):
 
                         if update_idx % self.policy_frequency == 0:
                             next_actor_update = update_idx + self.policy_frequency
-                            read_actor_graph_metrics = next_actor_update >= self.updates_per_step
+                            defer_actor_metrics = bool(
+                                getattr(learner, "supports_deferred_update_metrics", False)
+                            )
+                            read_actor_graph_metrics = (
+                                next_actor_update >= self.updates_per_step
+                                and not defer_actor_metrics
+                            )
                             _actor_ns = time.perf_counter_ns()
                             if getattr(learner, "use_cuda_graph_actor", False) and hasattr(
                                 learner, "update_actor_cuda_graph"
@@ -1277,7 +1372,13 @@ class DoubleBufferOffPolicyRunner(OffPolicyRunner):
                                     read_metrics=read_actor_graph_metrics,
                                 )
                             else:
-                                actor_metrics = learner.update_actor(batch)
+                                if getattr(learner, "supports_deferred_update_metrics", False):
+                                    actor_metrics = learner.update_actor(
+                                        batch,
+                                        read_metrics=read_actor_graph_metrics,
+                                    )
+                                else:
+                                    actor_metrics = learner.update_actor(batch)
                             if trace_recorder:
                                 trace_recorder.add_slice(
                                     "learner/update_actor",
@@ -1290,7 +1391,8 @@ class DoubleBufferOffPolicyRunner(OffPolicyRunner):
                                 iter_metrics[k].append(v)
 
                         _target_ns = time.perf_counter_ns()
-                        learner.soft_update_target()
+                        if not target_update_captured:
+                            learner.soft_update_target()
                         replay_pipeline.progress()
                         if trace_recorder:
                             trace_recorder.add_slice(
@@ -1298,8 +1400,20 @@ class DoubleBufferOffPolicyRunner(OffPolicyRunner):
                                 category="learner",
                                 start_ns=_target_ns,
                                 end_ns=time.perf_counter_ns(),
-                                args={"update_idx": update_idx},
+                                args={
+                                    "update_idx": update_idx,
+                                    "captured_by_critic_graph": target_update_captured,
+                                },
                             )
+
+                    deferred_actor_metrics = getattr(
+                        learner,
+                        "read_deferred_actor_metrics",
+                        None,
+                    )
+                    if callable(deferred_actor_metrics):
+                        for key, value in cast(dict[str, float], deferred_actor_metrics()).items():
+                            iter_metrics[key].append(value)
 
                     replay_pipeline.after_tick()
                     device = torch.device(self.device)

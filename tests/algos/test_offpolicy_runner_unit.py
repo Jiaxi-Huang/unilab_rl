@@ -525,9 +525,15 @@ def test_inference_response_freezes_next_replay_boundary_before_release(
     assert scheduler.pending_tick is None
 
 
+@pytest.mark.parametrize(
+    ("target_update_captured", "expects_external_target_update"),
+    [(False, True), (True, False)],
+)
 def test_runner_releases_action_before_replay_wait_and_sample(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path,
+    target_update_captured: bool,
+    expects_external_target_update: bool,
 ) -> None:
     events: list[str] = []
 
@@ -564,8 +570,16 @@ def test_runner_releases_action_before_replay_wait_and_sample(
             events.append("replay_after_tick")
 
     class LoopLearner(_Learner):
+        use_cuda_graph_critic = target_update_captured
+        cuda_graph_critic_captures_target_update = target_update_captured
+
         def update_critic(self, batch):
             del batch
+            events.append("update_critic")
+            return {}
+
+        def update_critic_cuda_graph(self, batch, *, read_metrics=True):
+            del batch, read_metrics
             events.append("update_critic")
             return {}
 
@@ -613,6 +627,40 @@ def test_runner_releases_action_before_replay_wait_and_sample(
     assert events.index("inference_response") < events.index("replay_batch_ready")
     assert events.index("inference_response") < events.index("replay_sample")
     assert events.index("inference_response") < events.index("update_critic")
+    assert ("soft_update_target" in events) is expects_external_target_update
+
+
+def test_runtime_manifest_reports_cuda_graph_path_and_fallbacks(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    learner = _Learner(critic_graph=True, actor_graph=True)
+    learner.use_cuda_graph_critic = True
+    learner.use_cuda_graph_actor = True
+    learner.scaler = None
+    learner.obs_normalizer = torch.nn.Identity()
+    learner.cuda_graph_critic_captures_target_update = True
+
+    runner = _make_device_runner(monkeypatch, learner)
+    graph_manifest = runner.runtime_manifest["cuda_graph"]
+    assert graph_manifest == {
+        "critic_enabled": True,
+        "actor_enabled": True,
+        "critic_replay_active": True,
+        "actor_replay_active": True,
+        "inductor_critic_cudagraphs": False,
+        "inductor_actor_cudagraphs": False,
+        "device_finite_optimizer_gating": False,
+        "critic_packed_staging": True,
+        "actor_packed_staging": True,
+        "critic_captures_target_update": True,
+        "fallback_reasons": [],
+    }
+
+    learner.scaler = object()
+    fallback_manifest = runner._cuda_graph_runtime_manifest()
+    assert fallback_manifest["critic_replay_active"] is False
+    assert fallback_manifest["actor_replay_active"] is False
+    assert fallback_manifest["fallback_reasons"] == ["fp16_grad_scaler"]
 
 
 def _wait_for_inference_request(runner, inference_queue, *, expected_tick: int) -> int:

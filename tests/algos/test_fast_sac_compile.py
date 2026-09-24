@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 from collections.abc import Callable
 from typing import Any
 
@@ -96,11 +97,11 @@ def test_fast_sac_compile_targets_training_hot_paths(monkeypatch) -> None:
     assert calls == [
         (
             "FastSACLearner._critic_loss_tensors",
-            {"options": {"triton.cudagraphs": False}},
+            {"options": {"triton.cudagraphs": True}},
         ),
         (
             "FastSACLearner._actor_loss_tensors",
-            {"options": {"triton.cudagraphs": False}},
+            {"options": {"triton.cudagraphs": True}},
         ),
     ]
 
@@ -134,7 +135,7 @@ def test_fast_sac_graph_critic_skips_compiling_critic_loss(monkeypatch) -> None:
     assert calls == [
         (
             "FastSACLearner._actor_loss_tensors",
-            {"options": {"triton.cudagraphs": False}},
+            {"options": {"triton.cudagraphs": True}},
         ),
     ]
 
@@ -168,7 +169,7 @@ def test_fast_sac_graph_actor_skips_compiling_actor_loss(monkeypatch) -> None:
     assert calls == [
         (
             "FastSACLearner._critic_loss_tensors",
-            {"options": {"triton.cudagraphs": False}},
+            {"options": {"triton.cudagraphs": True}},
         ),
     ]
 
@@ -185,21 +186,22 @@ def test_fast_sac_cuda_adamw_optimizers_are_capture_ready(monkeypatch) -> None:
 
     monkeypatch.setattr(torch.optim, "AdamW", _FakeAdamW)
 
-    FastSACLearner(
-        obs_dim=4,
-        action_dim=2,
-        critic_obs_dim=5,
-        device="cuda",
-        actor_hidden_dim=8,
-        critic_hidden_dim=8,
-        num_atoms=3,
-        num_q_networks=2,
-        use_layer_norm=False,
-        use_autotune=False,
-        use_compile=False,
-    )
+    for device in ("cuda", torch.device("cuda")):
+        FastSACLearner(
+            obs_dim=4,
+            action_dim=2,
+            critic_obs_dim=5,
+            device=device,
+            actor_hidden_dim=8,
+            critic_hidden_dim=8,
+            num_atoms=3,
+            num_q_networks=2,
+            use_layer_norm=False,
+            use_autotune=False,
+            use_compile=False,
+        )
 
-    assert len(calls) == 3
+    assert len(calls) == 6
     assert all(call["fused"] for call in calls)
     assert all(call["capturable"] for call in calls)
 
@@ -488,6 +490,60 @@ def test_fast_sac_capture_candidate_matches_public_critic_update_for_finite_loss
     torch.testing.assert_close(capture_learner.log_alpha, public_learner.log_alpha)
 
 
+def test_fast_sac_capture_candidate_only_updates_target_when_requested(monkeypatch) -> None:
+    import uni_rl.algos.fast_sac.learner as learner_module
+
+    learner = _small_fast_sac_learner()
+    batch = _small_offpolicy_batch()
+    calls: list[tuple[torch.nn.Module, torch.nn.Module, float]] = []
+    monkeypatch.setattr(
+        learner_module,
+        "polyak_update_target",
+        lambda target, source, tau: calls.append((target, source, tau)),
+    )
+
+    torch.manual_seed(2024)
+    learner._update_critic_capture_candidate(
+        batch["critic"],
+        batch["actions"],
+        batch["rewards"],
+        batch["next_obs"],
+        batch["next_critic"],
+        batch["dones"],
+        batch["truncated"],
+        update_target=False,
+    )
+    assert calls == []
+
+    torch.manual_seed(2024)
+    learner._update_critic_capture_candidate(
+        batch["critic"],
+        batch["actions"],
+        batch["rewards"],
+        batch["next_obs"],
+        batch["next_critic"],
+        batch["dones"],
+        batch["truncated"],
+        update_target=True,
+    )
+    assert calls == [(learner.qnet_target, learner.qnet, learner.tau)]
+
+
+def test_fast_sac_target_update_capture_reports_effective_fallbacks() -> None:
+    learner = _small_fast_sac_learner()
+    learner.use_cuda_graph_critic = True
+    learner._device_type = "cuda"
+
+    assert learner.cuda_graph_critic_captures_target_update is True
+
+    learner.scaler = object()
+    assert learner.cuda_graph_critic_captures_target_update is False
+
+    learner.scaler = None
+    learner.obs_normalizer = torch.nn.Linear(4, 4)
+    assert learner.cuda_graph_critic_captures_target_update is False
+
+
 def test_fast_sac_capture_candidate_matches_public_actor_update_for_finite_loss() -> None:
     public_learner = _small_fast_sac_learner()
     capture_learner = _small_fast_sac_learner()
@@ -521,6 +577,57 @@ def test_fast_sac_capture_candidate_matches_public_actor_update_for_finite_loss(
         strict=True,
     ):
         torch.testing.assert_close(capture_param, public_param)
+
+
+def test_fast_sac_actor_update_does_not_accumulate_critic_gradients() -> None:
+    learner = _small_fast_sac_learner()
+
+    learner.update_actor(_small_offpolicy_batch())
+
+    assert all(parameter.requires_grad for parameter in learner.qnet.parameters())
+    assert all(parameter.grad is None for parameter in learner.qnet.parameters())
+
+
+def test_fast_sac_public_updates_can_defer_metric_reads() -> None:
+    learner = _small_fast_sac_learner()
+    batch = _small_offpolicy_batch()
+
+    assert learner.update_critic(batch, read_metrics=False) == {}
+    assert learner.update_actor(batch, read_metrics=False) == {}
+
+
+@pytest.mark.parametrize(("loss_value", "grad_value"), [(float("nan"), 1.0), (1.0, float("nan"))])
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA-only fused optimizer gate")
+def test_fast_sac_device_finite_gate_skips_nonfinite_optimizer_step(
+    loss_value: float,
+    grad_value: float,
+) -> None:
+    learner = FastSACLearner(
+        obs_dim=4,
+        action_dim=2,
+        critic_obs_dim=5,
+        device="cuda:0",
+        actor_hidden_dim=8,
+        critic_hidden_dim=8,
+        num_atoms=3,
+        num_q_networks=2,
+        use_layer_norm=False,
+        use_compile=True,
+    )
+    parameter = next(learner.qnet.parameters())
+    parameter.grad = torch.full_like(parameter, grad_value)
+    if not math.isfinite(grad_value):
+        learner._gradient_sync = lambda _parameters: None
+    before = parameter.detach().clone()
+
+    with learner._optimizer_finite_gate(
+        learner.q_optimizer,
+        torch.full((), loss_value, device="cuda:0"),
+    ):
+        learner.q_optimizer.step()
+    torch.cuda.synchronize()
+
+    torch.testing.assert_close(parameter, before)
 
 
 def test_fast_sac_cuda_graph_state_materialization_preserves_cpu_rng_state() -> None:
