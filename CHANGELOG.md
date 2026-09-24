@@ -5,6 +5,31 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.3.4] - 2026-09-24
+
+### Added
+
+- New FlashSAC `compile_full_objectives` option (default `false`): extends
+  `torch.compile` from loss-only helpers to the complete critic and actor
+  objectives, forwarded through the FlashSAC double-buffer builder.
+
+### Changed
+
+- FlashSAC categorical TD projection is now CUDA Graph capture-safe: support
+  bounds and bin-width arithmetic stay on device instead of syncing through
+  host scalars.
+- FlashSAC learner cycles reduce host synchronization by deferring metric
+  D2H reads to the end of the cycle, gating finite-value checks on the
+  device-side optimizer path, and freezing critic parameters during actor
+  updates while preserving the required `dQ/da` gradient.
+
+### Fixed
+
+- FlashSAC manual CUDA Graph lifecycle: the first captured update is now
+  replayed instead of dropped, critic target-network updates are captured
+  inside the critic graph, and persistent metric buffers prevent output
+  overwrite across replays.
+
 ## [1.3.3] - 2026-09-24
 
 ### Changed
