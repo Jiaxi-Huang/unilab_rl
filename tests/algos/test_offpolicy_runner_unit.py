@@ -650,6 +650,7 @@ def test_runtime_manifest_reports_cuda_graph_path_and_fallbacks(
         "inductor_critic_cudagraphs": False,
         "inductor_actor_cudagraphs": False,
         "device_finite_optimizer_gating": False,
+        "compile_full_objectives": False,
         "critic_packed_staging": True,
         "actor_packed_staging": True,
         "critic_captures_target_update": True,

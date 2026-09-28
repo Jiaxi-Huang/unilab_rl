@@ -2,12 +2,14 @@
 
 from __future__ import annotations
 
+import warnings
 from dataclasses import asdict
 from typing import Any
 
 import torch
 from torch import nn, optim
 
+from uni_rl.algos.common.compile import get_torch_compile_for_cuda
 from uni_rl.algos.flash_sac.layers import (
     FlashSACBlock,
     FlashSACEmbedder,
@@ -319,10 +321,10 @@ class SonicFlashSACLearner(FlashSACLearner):
     """FlashSAC learner with a SONIC actor and unchanged distributional critics."""
 
     supports_reference_bc = True
-    # The SONIC update_actor override returns its auxiliary-loss metric dict
-    # eagerly and does not implement the deferred metric-staging protocol;
-    # opt out so the runner keeps the plain update_actor(batch) call.
-    supports_deferred_update_metrics = False
+    # The SONIC update_actor override stages its auxiliary-loss metrics on
+    # device (one stacked snapshot per cycle) and drains them through
+    # ``read_deferred_actor_metrics`` like the shared FlashSAC learner.
+    supports_deferred_update_metrics = True
     # Actor graph inputs gain the transition dones so reference-BC can mask
     # terminal rows; the packed-staging layout already reserves a dones offset.
     _ACTOR_GRAPH_INPUT_KEYS = ("obs", "next_obs", "actions", "critic", "dones")
@@ -408,6 +410,9 @@ class SonicFlashSACLearner(FlashSACLearner):
         )
         self.actor_scheduler = optim.lr_scheduler.LambdaLR(self.actor_optimizer, schedule)
         self._init_reference_bc(bc_joint_default, bc_action_scale)
+        self._pending_sonic_actor_metric_names: tuple[str, ...] | None = None
+        self._pending_sonic_actor_metric_values: torch.Tensor | None = None
+        self._pending_sonic_actor_scalar_extras: dict[str, float] | None = None
 
     def _init_reference_bc(
         self,
@@ -477,7 +482,58 @@ class SonicFlashSACLearner(FlashSACLearner):
             for parameter in module.parameters():
                 parameter.requires_grad_(False)
 
-    def update_actor(self, batch: dict[str, torch.Tensor]) -> dict[str, float]:
+    def _sonic_actor_objective_tensors(
+        self,
+        obs: torch.Tensor,
+        expert_actions: torch.Tensor,
+        critic_obs: torch.Tensor,
+        bc_mask: torch.Tensor | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor, dict[str, torch.Tensor]]:
+        """Full SONIC actor objective: policy + critic evaluation + auxiliary losses.
+
+        Mirrors the eager update path exactly so the compiled and eager
+        formulations stay numerically identical.  Optimizer steps, gradient
+        scaling, schedulers and parameter normalization stay outside this
+        region.  The critic is expected to be frozen by the caller (see
+        ``_critic_parameters_frozen``), matching the shared FlashSAC actor
+        objective contract.
+        """
+        with self._autocast():
+            actions, actor_info_all = self.actor(obs, training=True)
+            log_probs = actor_info_all["log_prob"]
+            q_values, _ = self.critic(critic_obs, actions, training=False)
+            policy_loss, entropy = self._actor_loss_tensors(
+                log_probs, q_values, actions, expert_actions, self.temperature(), bc_mask
+            )
+            auxiliary_loss = actor_info_all["auxiliary_loss"]
+            actor_loss = policy_loss + auxiliary_loss
+        actions_detached = actions.detach()
+        q_values_detached = q_values.detach()
+        metric_tensors: dict[str, torch.Tensor] = {
+            "actor_policy_loss": policy_loss.detach(),
+            "actor_auxiliary_loss": auxiliary_loss.detach(),
+            "actor_auxiliary_to_rl_ratio": (
+                auxiliary_loss.detach().abs() / policy_loss.detach().abs().clamp_min(1.0e-8)
+            ),
+            "actor_entropy": entropy,
+            "action_mean": actions_detached.mean(),
+            "action_std": actions_detached.std(unbiased=False),
+            "q_mean": q_values_detached.mean(),
+            "q_std": q_values_detached.std(unbiased=False),
+        }
+        for name, value in actor_info_all.items():
+            if name.startswith("sonic_") and value.numel() == 1:
+                metric_tensors[name] = value.detach()
+        if bc_mask is not None:
+            row_mse = ((actions_detached - expert_actions) ** 2).mean(dim=1)
+            metric_tensors["actor_bc_loss"] = (row_mse * bc_mask).sum() / bc_mask.sum().clamp_min(
+                1.0
+            )
+        return actor_loss, entropy, metric_tensors
+
+    def update_actor(
+        self, batch: dict[str, torch.Tensor], *, read_metrics: bool = True
+    ) -> dict[str, float]:
         """Run the standard FlashSAC actor update plus SONIC auxiliary losses."""
 
         obs = batch["obs"].to(self.device)
@@ -498,71 +554,144 @@ class SonicFlashSACLearner(FlashSACLearner):
         # running statistics before both policy evaluations.
         obs = self._maybe_normalize_obs(obs, update=False)
 
-        with self._autocast():
-            actions, actor_info_all = self.actor(obs, training=True)
-            log_probs = actor_info_all["log_prob"]
-            self._set_requires_grad(self.critic, False)
-            q_values, _ = self.critic(critic_obs, actions, training=False)
-            self._set_requires_grad(self.critic, True)
-            policy_loss, entropy = self._actor_loss_tensors(
-                log_probs, q_values, actions, expert_actions, self.temperature(), bc_mask
+        with self._critic_parameters_frozen():
+            actor_loss, entropy, metric_tensors = self._sonic_actor_objective_tensors(
+                obs, expert_actions, critic_obs, bc_mask
             )
-            auxiliary_loss = actor_info_all["auxiliary_loss"]
-            actor_loss = policy_loss + auxiliary_loss
 
         self.actor_optimizer.zero_grad(set_to_none=True)
-        if self.scaler is not None:
-            self.scaler.scale(actor_loss).backward()
-            self._sync_gradients(self.actor.parameters())
-            self.scaler.unscale_(self.actor_optimizer)
-            self.scaler.step(self.actor_optimizer)
-            self.scaler.update()
-        else:
-            actor_loss.backward()
-            self._sync_gradients(self.actor.parameters())
-            self.actor_optimizer.step()
+        if not self._host_finite_checks or bool(torch.isfinite(actor_loss)):
+            if self.scaler is not None:
+                self.scaler.scale(actor_loss).backward()
+                self._sync_gradients(self.actor.parameters())
+                self.scaler.unscale_(self.actor_optimizer)
+                self.scaler.step(self.actor_optimizer)
+                self.scaler.update()
+            else:
+                actor_loss.backward()
+                self._sync_gradients(self.actor.parameters())
+                with self._optimizer_finite_gate(self.actor_optimizer, actor_loss):
+                    self.actor_optimizer.step()
         self.actor_scheduler.step()
         self.actor.normalize_parameters()
 
         temp_value = self.temperature()
         temp_loss = temp_value * (entropy - self.target_entropy)
         self.temperature_optimizer.zero_grad(set_to_none=True)
-        temp_loss.backward()
-        self._sync_gradients(self.temperature.parameters())
-        self.temperature_optimizer.step()
+        if not self._host_finite_checks or bool(torch.isfinite(temp_loss)):
+            temp_loss.backward()
+            self._sync_gradients(self.temperature.parameters())
+            with self._optimizer_finite_gate(self.temperature_optimizer, temp_loss):
+                self.temperature_optimizer.step()
         self.temperature_scheduler.step()
 
-        metrics = {
-            "actor_loss": float(actor_loss.detach().cpu()),
-            "actor_policy_loss": float(policy_loss.detach().cpu()),
-            "actor_auxiliary_loss": float(auxiliary_loss.detach().cpu()),
-            "actor_auxiliary_to_rl_ratio": float(
-                (auxiliary_loss.detach().abs() / policy_loss.detach().abs().clamp_min(1.0e-8)).cpu()
-            ),
-            "actor_entropy": float(entropy.detach().cpu()),
-            "temperature": float(temp_value.detach().cpu()),
-            "temperature_loss": float(temp_loss.detach().cpu()),
-            "actor_lr": float(self.actor_optimizer.param_groups[0]["lr"]),
-            "action_mean": float(actions.detach().mean().cpu()),
-            "action_std": float(actions.detach().std(unbiased=False).cpu()),
-            "q_mean": float(q_values.detach().mean().cpu()),
-            "q_std": float(q_values.detach().std(unbiased=False).cpu()),
-        }
-        for name, value in actor_info_all.items():
-            if name.startswith("sonic_") and value.numel() == 1:
-                metrics[name] = float(value.detach().cpu())
-        if bc_mask is not None:
-            row_mse = ((actions.detach() - expert_actions) ** 2).mean(dim=1)
-            metrics["actor_bc_loss"] = float(
-                ((row_mse * bc_mask).sum() / bc_mask.sum().clamp_min(1.0)).cpu()
+        metric_tensors["actor_loss"] = actor_loss.detach()
+        metric_tensors["temperature"] = temp_value.detach()
+        metric_tensors["temperature_loss"] = temp_loss.detach()
+        if not read_metrics:
+            # Keep a private device-side snapshot.  The eager stack copies the
+            # values out of any CUDA-graph output pool, and the cycle-end drain
+            # performs the only D2H read, after all compiled replays finish.
+            self._pending_sonic_actor_metric_names = tuple(metric_tensors)
+            self._pending_sonic_actor_metric_values = torch.stack(
+                [tensor.detach().reshape(()) for tensor in metric_tensors.values()]
             )
+            self._pending_sonic_actor_scalar_extras = (
+                {"actor_bc_alpha": float(bc_alpha)} if bc_mask is not None else {}
+            )
+            return {}
+        metrics = self._read_sonic_actor_metric_tensors(metric_tensors)
+        metrics["actor_lr"] = float(self.actor_optimizer.param_groups[0]["lr"])
+        if bc_mask is not None:
             metrics["actor_bc_alpha"] = float(bc_alpha)
-        # ``_policy_parameters`` exposes decoder diagnostics through the
-        # auxiliary dictionary only during training; keep them under train/.
-        for name in ("decoder_action_overflow", "decoder_action_abs_max"):
-            if name in actor_info_all:
-                metrics[f"sonic_{name}"] = float(actor_info_all[name].detach().cpu())
         return metrics
+
+    @staticmethod
+    def _read_sonic_actor_metric_tensors(
+        metric_tensors: dict[str, torch.Tensor],
+    ) -> dict[str, float]:
+        names = tuple(metric_tensors)
+        values = (
+            torch.stack([metric_tensors[name].detach().reshape(()) for name in names])
+            .cpu()
+            .tolist()
+        )
+        return {name: float(value) for name, value in zip(names, values, strict=True)}
+
+    def read_deferred_actor_metrics(self) -> dict[str, float]:
+        names = self._pending_sonic_actor_metric_names
+        values = self._pending_sonic_actor_metric_values
+        extras = self._pending_sonic_actor_scalar_extras
+        self._pending_sonic_actor_metric_names = None
+        self._pending_sonic_actor_metric_values = None
+        self._pending_sonic_actor_scalar_extras = None
+        if values is None or names is None:
+            if self._cuda_graph_actor_outputs is None:
+                return {}
+            return self._actor_graph_output_metrics(read_items=True)
+        metrics = {
+            name: float(value) for name, value in zip(names, values.cpu().tolist(), strict=True)
+        }
+        metrics["actor_lr"] = float(self.actor_optimizer.param_groups[0]["lr"])
+        if extras:
+            metrics.update(extras)
+        return metrics
+
+    def _sonic_actor_objective_compile_supported(self) -> bool:
+        """Whether the SONIC actor objective can enter a compiled graph.
+
+        ``_actor_loss_tensors`` resolves the reference-BC weight as a Python
+        float anchored to the actor LR schedule; an annealed weight changes
+        every update and would force a recompilation per step.  Constant BC
+        weights (including the disabled default) compile fine.
+        """
+        return not (
+            self.actor_bc_alpha > 0.0
+            and self.actor_bc_alpha_end is not None
+            and self.actor_bc_alpha_end != self.actor_bc_alpha
+        )
+
+    def _compile_training_methods(self) -> None:
+        compile_fn = get_torch_compile_for_cuda(self.device, warn=True)
+        if compile_fn is None:
+            return
+
+        compile_kwargs = {"options": {"triton.cudagraphs": bool(self._compile_loss_cudagraphs)}}
+        if self.compile_full_objectives:
+            # The inherited critic objective serves SONIC's update_critic
+            # unchanged; the SONIC actor objective replaces the base actor
+            # variant (this update path evaluates the actor once on ``obs``
+            # and folds in the SONIC auxiliary losses).  The inference path
+            # keeps its own compilation in every mode: the collector calls it
+            # once per tick, and an eager heavy backbone would starve the CPU
+            # threads the MuJoCo collector needs.
+            self._critic_objective_tensors = compile_fn(  # type: ignore[method-assign]
+                self._critic_objective_tensors, **compile_kwargs
+            )
+            self.actor.get_mean_and_std = compile_fn(  # type: ignore[method-assign]
+                self.actor.get_mean_and_std, **compile_kwargs
+            )
+            if self._sonic_actor_objective_compile_supported():
+                self._sonic_actor_objective_tensors = compile_fn(  # type: ignore[method-assign]
+                    self._sonic_actor_objective_tensors, **compile_kwargs
+                )
+                return
+            warnings.warn(
+                "SONIC full-objective actor compilation is disabled: an annealed "
+                "reference-BC weight changes every update and would force constant "
+                "recompilation; the actor keeps the eager loss-only compile path.",
+                stacklevel=2,
+            )
+            # Loss-only actor fallback: the eager actor path calls
+            # ``_actor_loss_tensors`` directly and keeps its wrapper.  The
+            # compiled critic objective inlines the plain ``_critic_loss_tensors``
+            # at trace time, so it stays uncompiled to avoid a nested compile.
+            if not self.use_cuda_graph_actor:
+                self._actor_loss_tensors = compile_fn(  # type: ignore[method-assign]
+                    self._actor_loss_tensors, **compile_kwargs
+                )
+            return
+        super()._compile_training_methods()
 
     @staticmethod
     def _actor_graph_input_keys() -> tuple[str, ...]:

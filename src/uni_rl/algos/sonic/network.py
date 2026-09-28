@@ -167,14 +167,16 @@ class SonicBackbone(nn.Module):
         self._validate_inputs(actor_obs, g1_reference, smpl_reference, encoder_index)
         g1_active = encoder_index[:, 0].to(dtype=torch.bool)
         select_smpl = encoder_index[:, 1].to(dtype=torch.bool)
-        # The legacy module masks each encoder by its active samples.  Keep
-        # the batch-aligned tensors for selection while avoiding a full second
-        # encoder pass for rows whose token is not consumed.
-        g1_latent = self._encode_masked("g1", g1_reference, g1_active)
-        smpl_latent = self._encode_masked("smpl", smpl_reference, select_smpl)
-        if compute_auxiliary and torch.any(select_smpl & ~g1_active):
-            missing_g1 = select_smpl & ~g1_active
-            g1_latent[missing_g1] = self._encode("g1", g1_reference[missing_g1])
+        # Encode the full batch once and select rows by mask scaling (see
+        # ``_encode_masked``): boolean row compression has a data-dependent
+        # output shape that forces torch.compile to recompile for every
+        # distinct active-row count.  The auxiliary objectives consume the
+        # unmasked latents below, so the legacy second G1 encoder pass over
+        # SMPL-only rows disappears as well.
+        g1_full_latent = self._encode("g1", g1_reference)
+        smpl_full_latent = self._encode("smpl", smpl_reference)
+        g1_latent = g1_full_latent * g1_active[:, None, None].to(g1_full_latent.dtype)
+        smpl_latent = smpl_full_latent * select_smpl[:, None, None].to(smpl_full_latent.dtype)
         g1_tokens = self.quantize(g1_latent)
         smpl_tokens = self.quantize(smpl_latent)
         selected_tokens = torch.where(select_smpl[:, None, None], smpl_tokens, g1_tokens)
@@ -192,15 +194,21 @@ class SonicBackbone(nn.Module):
         reconstruction = None
         losses: dict[str, torch.Tensor] = {}
         if compute_auxiliary:
+            # The auxiliary objectives need paired G1/SMPL latents on
+            # SMPL-selected rows even when the G1 encoder is inactive there;
+            # the full-batch encode provides those values directly.  Row
+            # selection happens inside the loss via ``row_mask``, keeping
+            # every shape batch-aligned and compile-static.
             reconstruction = self.decode_motion(selected_tokens)
-            smpl_reconstruction = self.decode_motion(smpl_tokens[select_smpl])
+            smpl_reconstruction = self.decode_motion(smpl_tokens)
             reencoded_smpl_g1 = self.encode_g1(smpl_reconstruction)
             losses = sonic_auxiliary_losses(
                 g1_reference=g1_reference,
                 g1_reconstruction=reconstruction,
-                g1_latent=g1_latent[select_smpl],
-                smpl_latent=smpl_latent[select_smpl],
+                g1_latent=g1_full_latent,
+                smpl_latent=smpl_full_latent,
                 reencoded_smpl_g1_latent=reencoded_smpl_g1,
+                row_mask=select_smpl,
                 config=self.auxiliary_config,
             )
         return SonicForwardOutput(
@@ -233,7 +241,9 @@ class SonicBackbone(nn.Module):
         if g1_reference.shape[0] != batch_size or smpl_reference.shape[0] != batch_size:
             raise ValueError("SONIC actor and reference batch sizes must match")
         if encoder_index.shape != (batch_size, 2):
-            raise ValueError(f"encoder_index must have shape (B, 2), got {tuple(encoder_index.shape)}")
+            raise ValueError(
+                f"encoder_index must have shape (B, 2), got {tuple(encoder_index.shape)}"
+            )
         if not torch.compiler.is_compiling():
             # Value-dependent guards sync the tensor to the host, which CUDA
             # graph capture forbids; under torch.compile they fold away and the

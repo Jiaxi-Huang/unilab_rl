@@ -283,6 +283,9 @@ class DoubleBufferOffPolicyRunner(OffPolicyRunner):
             "device_finite_optimizer_gating": not bool(
                 getattr(self.learner, "_host_finite_checks", True)
             ),
+            "compile_full_objectives": bool(
+                getattr(self.learner, "compile_full_objectives", False)
+            ),
             "critic_packed_staging": bool(
                 getattr(self.learner, "use_cuda_graph_critic_packed_staging", False)
             ),
