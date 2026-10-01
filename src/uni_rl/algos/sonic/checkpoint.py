@@ -77,7 +77,7 @@ def classify_sonic_checkpoint(checkpoint: dict[str, Any]) -> str:
 
     from uni_rl.algos.sonic.flashsac import (
         SONIC_FLASHSAC_CHECKPOINT_KIND,
-        SONIC_FLASHSAC_CHECKPOINT_VERSION,
+        SONIC_FLASHSAC_COMPAT_CHECKPOINT_VERSIONS,
     )
 
     is_internal = checkpoint.get("checkpoint_kind") == SONIC_FLASHSAC_CHECKPOINT_KIND
@@ -86,7 +86,7 @@ def classify_sonic_checkpoint(checkpoint: dict[str, Any]) -> str:
         raise ValueError("Ambiguous SONIC checkpoint contains release and UniLab markers")
     if is_internal:
         version = checkpoint.get("format_version")
-        if version != SONIC_FLASHSAC_CHECKPOINT_VERSION:
+        if version not in SONIC_FLASHSAC_COMPAT_CHECKPOINT_VERSIONS:
             raise ValueError(f"Unsupported UniLab SONIC checkpoint version: {version!r}")
         required = {
             "actor",

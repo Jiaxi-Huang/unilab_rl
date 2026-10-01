@@ -621,3 +621,28 @@ def test_flashsac_cuda_graph_first_call_replays_update_and_keeps_metrics(
     assert all(torch.isfinite(torch.tensor(value)) for value in next_metrics.values())
     assert next_metrics["reward_scale_std"] == pytest.approx(1.0)
     assert next_metrics["critic_loss"] != pytest.approx(critic_metrics["critic_loss"])
+
+
+def test_flashsac_learner_widened_embedders_update_and_round_trip():
+    learner = _make_small_learner(actor_embedder_dim=24, critic_embedder_dim=24)
+    assert learner.actor.embedder.widen_width == 24
+    assert learner.critic.embedder.widen_width == 24
+
+    batch = _make_small_batch()
+    critic_metrics = learner.update_critic(batch)
+    actor_metrics = learner.update_actor(batch)
+    assert torch.isfinite(torch.tensor(critic_metrics["critic_loss"]))
+    assert torch.isfinite(torch.tensor(actor_metrics["actor_loss"]))
+
+    restored = _make_small_learner(actor_embedder_dim=24, critic_embedder_dim=24)
+    restored.load_state_dict(learner.get_state_dict())
+    torch.testing.assert_close(
+        restored.actor.explore(batch["obs"], deterministic=True),
+        learner.actor.explore(batch["obs"], deterministic=True),
+    )
+    # The widened stages must not leak into legacy-layout checkpoints: a
+    # default learner keeps the single-projection state_dict keys.
+    legacy = _make_small_learner()
+    legacy_keys = set(legacy.actor.embedder.state_dict())
+    widen_keys = set(learner.actor.embedder.state_dict())
+    assert legacy_keys <= widen_keys

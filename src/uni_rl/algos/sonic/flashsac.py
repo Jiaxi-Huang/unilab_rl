@@ -23,7 +23,12 @@ from uni_rl.algos.sonic.config import SonicAuxLossConfig, SonicModelConfig
 from uni_rl.algos.sonic.network import SonicBackbone
 
 SONIC_FLASHSAC_CHECKPOINT_KIND = "unilab.flashsac.sonic"
-SONIC_FLASHSAC_CHECKPOINT_VERSION = 8
+# v8: widened-embedder fields absent (single-projection entry).
+# v9: adds ``sonic_actor_embedder_dim`` (None keeps the v8 trunk layout).
+SONIC_FLASHSAC_CHECKPOINT_VERSION = 9
+# Checkpoint versions still accepted for playback; v8 lacks the embedder
+# field and therefore restores the single-projection trunk.
+SONIC_FLASHSAC_COMPAT_CHECKPOINT_VERSIONS = (8, SONIC_FLASHSAC_CHECKPOINT_VERSION)
 SONIC_ACTION_SCALE = 2.0
 SONIC_ACTOR_GROUP_NAMES = ("obs", "g1_reference", "smpl_reference", "encoder_index")
 _TERM_6D_DIM = 6
@@ -95,6 +100,7 @@ class SonicFlashSACActor(_SonicPackedInputMixin, nn.Module):
         noise_zeta_max: int = 16,
         actor_hidden_dim: int | None = None,
         actor_num_blocks: int = 2,
+        actor_embedder_dim: int | None = None,
         compute_action_decoder: bool | None = None,
         device: str | torch.device = "cpu",
     ) -> None:
@@ -127,7 +133,9 @@ class SonicFlashSACActor(_SonicPackedInputMixin, nn.Module):
             self.policy_post_norm = nn.Identity()
         else:
             policy_input_dim = model_config.actor_obs_dim + model_config.token_total_dim
-            self.policy_embedder = FlashSACEmbedder(policy_input_dim, actor_hidden_dim)
+            self.policy_embedder = FlashSACEmbedder(
+                policy_input_dim, actor_hidden_dim, widen_dim=actor_embedder_dim
+            )
             self.policy_encoder = nn.ModuleList(
                 [FlashSACBlock(actor_hidden_dim) for _ in range(actor_num_blocks)]
             )
@@ -361,6 +369,7 @@ class SonicFlashSACLearner(FlashSACLearner):
         bc_joint_default = kwargs.pop("bc_joint_default", None)
         bc_action_scale = kwargs.pop("bc_action_scale", None)
         self.model_config = model_config
+        raw_actor_embedder_dim = kwargs.get("actor_embedder_dim", None)
         actor = SonicFlashSACActor(
             model_config,
             auxiliary_config,
@@ -372,6 +381,9 @@ class SonicFlashSACLearner(FlashSACLearner):
             noise_zeta_max=int(kwargs.get("actor_noise_zeta_max", 16)),
             actor_hidden_dim=int(kwargs.get("actor_hidden_dim", model_config.actor_hidden_dim)),
             actor_num_blocks=int(kwargs.get("actor_num_blocks", 2)),
+            actor_embedder_dim=(
+                int(raw_actor_embedder_dim) if raw_actor_embedder_dim else None
+            ),
             device=kwargs.get("device", "cpu"),
         )
         super().__init__(actor_module=actor, **kwargs)
@@ -781,6 +793,12 @@ class SonicFlashSACLearner(FlashSACLearner):
                 "sonic_noise_zeta_max": actor.noise_zeta_max,
                 "sonic_actor_hidden_dim": actor.action_head.mean_w.w.weight.shape[1],
                 "sonic_actor_num_blocks": actor.actor_num_blocks,
+                # None for the legacy single-projection embedder and for the
+                # Identity decoder-head path; an int records the widened first
+                # stage so playback can rebuild the exact trunk shape.
+                "sonic_actor_embedder_dim": getattr(
+                    actor.policy_embedder, "widen_width", None
+                ),
                 "sonic_action_scale": SONIC_ACTION_SCALE,
             }
         )

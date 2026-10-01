@@ -44,10 +44,13 @@ class FlashSACActor(nn.Module):
         action_dim: int,
         noise_zeta_mu: float = 2.0,
         noise_zeta_max: int = 16,
+        embedder_dim: int | None = None,
         device: str | torch.device = "cpu",
     ):
         super().__init__()
-        self.embedder = FlashSACEmbedder(input_dim=input_dim, hidden_dim=hidden_dim)
+        self.embedder = FlashSACEmbedder(
+            input_dim=input_dim, hidden_dim=hidden_dim, widen_dim=embedder_dim
+        )
         self.encoder = nn.ModuleList([FlashSACBlock(hidden_dim) for _ in range(num_blocks)])
         self.post_norm = UnitRMSNorm(hidden_dim)
         self.predictor = NormalTanhPolicy(hidden_dim=hidden_dim, action_dim=action_dim)
@@ -163,10 +166,13 @@ class FlashSACDoubleCritic(nn.Module):
         min_v: float,
         max_v: float,
         num_qs: int = 2,
+        embedder_dim: int | None = None,
         device: str | torch.device = "cpu",
     ):
         super().__init__()
-        self.embedder = EnsembleFlashSACEmbedder(num_qs, input_dim, hidden_dim)
+        self.embedder = EnsembleFlashSACEmbedder(
+            num_qs, input_dim, hidden_dim, widen_dim=embedder_dim
+        )
         self.encoder = nn.ModuleList(
             [EnsembleFlashSACBlock(num_qs, hidden_dim) for _ in range(num_blocks)]
         )

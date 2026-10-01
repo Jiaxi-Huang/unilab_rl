@@ -105,13 +105,36 @@ class UnitRMSNorm(nn.Module):
 
 
 class FlashSACEmbedder(nn.Module):
-    def __init__(self, input_dim: int, hidden_dim: int):
+    """Input-normalized projection with an optional widened first stage.
+
+    ``widen_dim=None`` keeps the released single-projection layout (identical
+    state_dict keys and shapes). A positive ``widen_dim`` expands the entry to
+    ``input -> widen -> hidden`` so high-dimensional observations enter through
+    an expansion instead of an immediate rank cut, mirroring the wide first
+    layer of conventional MLP trunks.
+    """
+
+    def __init__(self, input_dim: int, hidden_dim: int, widen_dim: int | None = None):
         super().__init__()
         self.norm = UnitBatchNorm(input_dim)
-        self.w = UnitLinear(input_dim, hidden_dim)
+        if widen_dim is None or widen_dim <= 0:
+            self.w = UnitLinear(input_dim, hidden_dim)
+            self.widen_norm = None
+            self.widen_out = None
+        else:
+            self.w = UnitLinear(input_dim, int(widen_dim))
+            self.widen_norm = UnitBatchNorm(int(widen_dim))
+            self.widen_out = UnitLinear(int(widen_dim), hidden_dim)
+
+    @property
+    def widen_width(self) -> int | None:
+        return None if self.widen_out is None else int(self.w.w.weight.shape[0])
 
     def forward(self, x: torch.Tensor, training: bool) -> torch.Tensor:
-        return cast(torch.Tensor, self.w(self.norm(x, training=training)))
+        x = self.w(self.norm(x, training=training))
+        if self.widen_norm is not None:
+            x = self.widen_out(F.silu(self.widen_norm(x, training=training)))
+        return cast(torch.Tensor, x)
 
 
 class FlashSACBlock(nn.Module):
@@ -253,13 +276,35 @@ class EnsembleUnitRMSNorm(nn.Module):
 
 
 class EnsembleFlashSACEmbedder(nn.Module):
-    def __init__(self, num_ensemble: int, input_dim: int, hidden_dim: int):
+    """Ensemble twin of :class:`FlashSACEmbedder`, including widen support."""
+
+    def __init__(
+        self,
+        num_ensemble: int,
+        input_dim: int,
+        hidden_dim: int,
+        widen_dim: int | None = None,
+    ):
         super().__init__()
         self.norm = EnsembleUnitBatchNorm(num_ensemble, input_dim)
-        self.w = EnsembleUnitLinear(num_ensemble, input_dim, hidden_dim)
+        if widen_dim is None or widen_dim <= 0:
+            self.w = EnsembleUnitLinear(num_ensemble, input_dim, hidden_dim)
+            self.widen_norm = None
+            self.widen_out = None
+        else:
+            self.w = EnsembleUnitLinear(num_ensemble, input_dim, int(widen_dim))
+            self.widen_norm = EnsembleUnitBatchNorm(num_ensemble, int(widen_dim))
+            self.widen_out = EnsembleUnitLinear(num_ensemble, int(widen_dim), hidden_dim)
+
+    @property
+    def widen_width(self) -> int | None:
+        return None if self.widen_out is None else int(self.w.weight.shape[1])
 
     def forward(self, x: torch.Tensor, training: bool) -> torch.Tensor:
-        return cast(torch.Tensor, self.w(self.norm(x, training=training)))
+        x = self.w(self.norm(x, training=training))
+        if self.widen_norm is not None:
+            x = self.widen_out(F.silu(self.widen_norm(x, training=training)))
+        return cast(torch.Tensor, x)
 
 
 class EnsembleFlashSACBlock(nn.Module):

@@ -167,6 +167,8 @@ class FlashSACLearner(LearnerBoilerplateMixin):
         critic_hidden_dim: int = 256,
         actor_num_blocks: int = 2,
         critic_num_blocks: int = 2,
+        actor_embedder_dim: int | None = None,
+        critic_embedder_dim: int | None = None,
         num_atoms: int = 101,
         critic_min_v: float = -5.0,
         critic_max_v: float = 5.0,
@@ -267,6 +269,7 @@ class FlashSACLearner(LearnerBoilerplateMixin):
                 action_dim=action_dim,
                 noise_zeta_mu=actor_noise_zeta_mu,
                 noise_zeta_max=actor_noise_zeta_max,
+                embedder_dim=actor_embedder_dim,
                 device=self.device,
             )
         )
@@ -278,6 +281,7 @@ class FlashSACLearner(LearnerBoilerplateMixin):
             num_bins=num_atoms,
             min_v=critic_min_v,
             max_v=critic_max_v,
+            embedder_dim=critic_embedder_dim,
             device=self.device,
         )
         self.target_critic = copy.deepcopy(self.critic).to(self.device)
