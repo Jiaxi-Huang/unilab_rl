@@ -43,6 +43,7 @@ class OffPolicyLearnerPreparation(Protocol):
 class _TorchRngState:
     cpu: torch.Tensor
     cuda: torch.Tensor | None
+    mps: torch.Tensor | None
     python: object
     device: torch.device
 
@@ -54,9 +55,15 @@ def capture_rng_state(device: str | torch.device) -> _TorchRngState:
         if torch_device.type == "cuda" and torch.cuda.is_initialized()
         else None
     )
+    mps_state = (
+        torch.mps.get_rng_state()
+        if torch_device.type == "mps" and torch.backends.mps.is_available()
+        else None
+    )
     return _TorchRngState(
         cpu=torch.random.get_rng_state(),
         cuda=cuda_state,
+        mps=mps_state,
         python=random.getstate(),
         device=torch_device,
     )
@@ -66,6 +73,8 @@ def restore_rng_state(state: _TorchRngState) -> None:
     torch.random.set_rng_state(state.cpu)
     if state.cuda is not None:
         torch.cuda.set_rng_state(state.cuda, state.device)
+    if state.mps is not None:
+        torch.mps.set_rng_state(state.mps)
     random.setstate(state.python)  # type: ignore[arg-type]
 
 

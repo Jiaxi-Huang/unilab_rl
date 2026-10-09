@@ -53,6 +53,48 @@ def fused_adam_supported(device_type: str) -> bool:
     return device_type in _get_fused_kernels_supported_devices()
 
 
+_MPS_BF16_AUTOCAST_SUPPORTED: bool | None = None
+
+
+def mps_bf16_autocast_supported() -> bool:
+    """Probe whether this Torch/MPS runtime can execute BF16 autocast ops.
+
+    The result is cached for the process.  A failed probe is a compatibility
+    result, not an exception: callers decide whether to fail closed for an
+    explicit BF16 request.
+    """
+    global _MPS_BF16_AUTOCAST_SUPPORTED
+    if _MPS_BF16_AUTOCAST_SUPPORTED is not None:
+        return _MPS_BF16_AUTOCAST_SUPPORTED
+    supported = False
+    if torch.backends.mps.is_available():
+        try:
+            probe = torch.nn.Sequential(
+                torch.nn.Linear(8, 8, device="mps"),
+                torch.nn.LayerNorm(8, device="mps"),
+                torch.nn.Linear(8, 8, device="mps"),
+            )
+            values = torch.ones(8, 8, device="mps", requires_grad=True)
+            with torch.autocast(device_type="mps", dtype=torch.bfloat16, enabled=True):
+                outputs = probe(values)
+                loss = outputs.square().mean()
+            loss.backward()
+            torch.mps.synchronize()
+            supported = (
+                outputs.dtype == torch.bfloat16
+                and bool(torch.isfinite(outputs).all().item())
+                and all(
+                    bool(torch.isfinite(parameter.grad).all().item())
+                    for parameter in probe.parameters()
+                    if parameter.grad is not None
+                )
+            )
+        except (NotImplementedError, RuntimeError, TypeError, ValueError):
+            supported = False
+    _MPS_BF16_AUTOCAST_SUPPORTED = supported
+    return supported
+
+
 def resolve_finite_check_flags(device_type: str, device_gated: bool) -> tuple[bool, bool]:
     """Return ``(host_finite_checks, metrics_finite_checks)`` for a learner.
 

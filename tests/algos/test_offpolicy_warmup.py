@@ -13,7 +13,11 @@ import torch
 
 from uni_rl.algos.flash_sac.learner import FlashSACLearner
 from uni_rl.algos.sac.learner import SACLearner
-from uni_rl.offpolicy.warmup import OffPolicyWarmupContext
+from uni_rl.offpolicy.warmup import (
+    OffPolicyWarmupContext,
+    capture_rng_state,
+    restore_rng_state,
+)
 
 
 def _context(
@@ -49,6 +53,27 @@ def _assert_equivalent(left: Any, right: Any, path: str = "state") -> None:
             _assert_equivalent(values[0], values[1], f"{path}[{index}]")
         return
     assert left == right, path
+
+
+def test_rng_state_capture_restores_mps_generator(monkeypatch: pytest.MonkeyPatch) -> None:
+    current = torch.tensor([1, 2, 3])
+
+    class FakeMPS:
+        def get_rng_state(self) -> torch.Tensor:
+            return current.clone()
+
+        def set_rng_state(self, state: torch.Tensor) -> None:
+            nonlocal current
+            current = state.clone()
+
+    monkeypatch.setattr(torch.backends.mps, "is_available", lambda: True)
+    monkeypatch.setattr(torch, "mps", FakeMPS())
+    state = capture_rng_state("mps")
+    current = torch.tensor([9, 9, 9])
+
+    restore_rng_state(state)
+
+    torch.testing.assert_close(current, torch.tensor([1, 2, 3]))
 
 
 @pytest.mark.parametrize(
@@ -225,7 +250,12 @@ def test_compatibility_warmup_exercises_compiled_update_paths(
 
         return compiled
 
-    monkeypatch.setattr(module, "get_torch_compile_for_cuda", lambda *args, **kwargs: compile_fn)
+    compile_helper_name = (
+        "get_torch_compile_for_device"
+        if module_name == "uni_rl.algos.sac.learner"
+        else "get_torch_compile_for_cuda"
+    )
+    monkeypatch.setattr(module, compile_helper_name, lambda *args, **kwargs: compile_fn)
     learner_kwargs = (
         {"critic_obs_dim": 5, "num_atoms": 3, "use_layer_norm": False}
         if learner_cls is SACLearner

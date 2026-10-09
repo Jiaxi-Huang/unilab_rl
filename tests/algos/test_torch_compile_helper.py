@@ -68,3 +68,21 @@ def test_torch_compile_cuda_returns_available_compile_without_warning(monkeypatc
 
     assert compile_helper.get_torch_compile_for_cuda("cuda", warn=True) is fake_compile
     assert capsys.readouterr().err == ""
+
+
+def test_torch_compile_device_helper_supports_mps_without_triton(monkeypatch) -> None:
+    def fake_compile(fn: Callable[..., Any], **kwargs: Any) -> Callable[..., Any]:
+        return fn
+
+    fake_compile.__module__ = "torch"
+    monkeypatch.setattr(torch, "compile", fake_compile)
+    monkeypatch.setattr(importlib.util, "find_spec", _without_triton)
+
+    assert compile_helper.get_torch_compile_for_device("mps", warn=True) is fake_compile
+
+
+def test_torch_compile_device_helper_rejects_unsupported_devices(monkeypatch) -> None:
+    monkeypatch.setattr(torch, "compile", lambda fn: fn)
+
+    assert compile_helper.get_torch_compile_for_device("cpu", warn=True) is None
+    assert compile_helper.get_torch_compile_for_device("xpu", warn=True) is None

@@ -486,8 +486,15 @@ class DoubleBufferOffPolicyRunner(OffPolicyRunner):
     def _cuda_graph_runtime_manifest(self) -> dict[str, object]:
         """Describe the effective learner graph backend."""
         compile_enabled = bool(getattr(self.learner, "use_compile", False))
+        backend = str(
+            getattr(
+                self.learner,
+                "compile_backend",
+                "inductor" if compile_enabled else "eager",
+            )
+        )
         manifest: dict[str, object] = {
-            "backend": "inductor" if compile_enabled else "eager",
+            "backend": backend,
             "critic": compile_enabled,
             "actor": compile_enabled,
             "device_finite_optimizer_gating": not bool(
@@ -499,7 +506,9 @@ class DoubleBufferOffPolicyRunner(OffPolicyRunner):
             manifest["orchestration"] = "cuda_graph"
         elif compile_enabled:
             manifest["scope"] = "loss_tensors"
-            manifest["orchestration"] = "inductor_cuda_graph_trees"
+            manifest["orchestration"] = (
+                "torch_compile" if backend == "torch_compile" else "inductor_cuda_graph_trees"
+            )
         return manifest
 
     def _dp_initial_sync_tensors(self) -> dict[str, torch.Tensor]:
@@ -1710,6 +1719,9 @@ class DoubleBufferOffPolicyRunner(OffPolicyRunner):
                 inference_dones=inference_dones_actor,
                 replay_pipeline=replay_pipeline,
             )
+            graph_manifest = self._cuda_graph_runtime_manifest()
+            self.runtime_manifest["cuda_graph"] = graph_manifest
+            logger.update_runtime_manifest(dict(self.runtime_manifest))
             self._shutdown_recorder.set_phase(owner="learner", phase="startup/collector_start")
 
             # --- start collector ---
@@ -2003,6 +2015,19 @@ class DoubleBufferOffPolicyRunner(OffPolicyRunner):
 
                     train_start = time.perf_counter()
                     train_phase_start_ns = time.perf_counter_ns()
+                    phase_ordered_metrics = any(
+                        callable(
+                            getattr(
+                                learner,
+                                metric_reader,
+                                None,
+                            )
+                        )
+                        for metric_reader in (
+                            "read_deferred_update_metrics",
+                            "read_deferred_cycle_metrics",
+                        )
+                    )
 
                     update_cycle = cast(
                         Callable[..., object] | None,
@@ -2068,11 +2093,26 @@ class DoubleBufferOffPolicyRunner(OffPolicyRunner):
                             for k, v in actor_metrics.items():
                                 iter_metrics[k].append(v)
 
+                        deferred_update_metrics = getattr(
+                            learner,
+                            "read_deferred_update_metrics",
+                            None,
+                        )
+                        begin_deferred_update_metrics = getattr(
+                            learner,
+                            "begin_deferred_update_metrics",
+                            None,
+                        )
+                        if callable(begin_deferred_update_metrics):
+                            begin_deferred_update_metrics()
                         for update_idx in range(self.updates_per_step):
                             s = update_idx * self.batch_size
                             e = s + self.batch_size
                             batch = {k: v[s:e] for k, v in large_batch.items()}
-                            read_deferred_critic_metrics = update_idx == self.updates_per_step - 1
+                            read_deferred_critic_metrics = (
+                                update_idx == self.updates_per_step - 1
+                                and not callable(deferred_update_metrics)
+                            )
                             do_actor_update = update_idx % self.policy_frequency == 0
 
                             if self.policy_before_critic and do_actor_update:
@@ -2115,24 +2155,36 @@ class DoubleBufferOffPolicyRunner(OffPolicyRunner):
                                     },
                                 )
 
-                        deferred_actor_metrics = getattr(
-                            learner,
-                            "read_deferred_actor_metrics",
-                            None,
-                        )
-                        if callable(deferred_actor_metrics):
+                        if callable(deferred_update_metrics):
                             for key, value in cast(
                                 dict[str, float],
-                                deferred_actor_metrics(),
+                                deferred_update_metrics(),
                             ).items():
                                 iter_metrics[key].append(value)
+                        else:
+                            deferred_actor_metrics = getattr(
+                                learner,
+                                "read_deferred_actor_metrics",
+                                None,
+                            )
+                            if callable(deferred_actor_metrics):
+                                for key, value in cast(
+                                    dict[str, float],
+                                    deferred_actor_metrics(),
+                                ).items():
+                                    iter_metrics[key].append(value)
 
                     replay_pipeline.after_tick()
                     device = torch.device(self.device)
                     if device.type == "cuda":
                         torch.cuda.current_stream(device).synchronize()
-                    elif device.type == "mps":
+                    elif device.type == "mps" and not phase_ordered_metrics:
                         torch.mps.synchronize()
+                    # MPS preserves same-queue ordering: the next inference's
+                    # action D2H waits behind optimizer/target updates, while
+                    # replay events govern ingress visibility and slot reuse.
+                    # A global synchronize here would only drain unrelated
+                    # queued work and recreate a per-iteration GPU idle gap.
                     if trace_recorder:
                         trace_recorder.add_slice(
                             "learner/update_phase",

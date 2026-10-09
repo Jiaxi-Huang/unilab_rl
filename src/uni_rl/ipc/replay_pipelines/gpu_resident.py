@@ -398,7 +398,10 @@ class GPUResidentReplayPipeline:
                 done_event = cast(Any, torch.cuda.Event())
                 done_event.record(self._sync_stream)
         else:
-            copy_spans(non_blocking=False)
+            # A blocking MPS copy waits for every previously enqueued learner
+            # kernel, stalling the host and creating GPU gaps.  The event below
+            # remains the release boundary for host-slot reuse and visibility.
+            copy_spans(non_blocking=True)
             done_event = cast(Any, torch.mps.Event())
             done_event.record()
         self._span_events.append((end, done_event, ingress_slot, start, end - start))
