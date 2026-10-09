@@ -5,6 +5,8 @@ from __future__ import annotations
 import multiprocessing as mp
 import threading
 import time
+from collections import deque
+from threading import Condition, Lock
 
 import pytest
 import torch
@@ -21,6 +23,22 @@ _HAS_CUDA = torch.cuda.is_available()
 cuda_only = pytest.mark.skipif(not _HAS_CUDA, reason="CUDA required")
 _HAS_MPS = torch.backends.mps.is_available()
 mps_only = pytest.mark.skipif(not _HAS_MPS, reason="MPS required")
+
+
+class _FakeMPSEvent:
+    def __init__(self):
+        self.recorded = False
+        self.complete = False
+
+    def record(self):
+        self.recorded = True
+
+    def query(self):
+        return self.complete
+
+    def synchronize(self):
+        self.complete = True
+
 
 _OBS_DIM = 4
 _ACTION_DIM = 2
@@ -158,6 +176,123 @@ class TestRingSpans:
     def test_empty(self):
         assert _ring_spans(5, 5, 64) == []
         assert _ring_spans(5, 3, 64) == []
+
+
+class TestMPSIngressEventLifecycle:
+    def test_ring_wrap_span_copy_is_nonblocking_and_event_gated(self, monkeypatch):
+        pipeline = object.__new__(GPUResidentReplayPipeline)
+        pipeline._device = torch.device("mps")
+        pipeline._capacity = 8
+        pipeline._gpu_storage = torch.zeros(8, 2)
+        pipeline._submitted_ptr = 6
+        pipeline._visible_ptr = 6
+        pipeline._span_events = deque()
+        pipeline._trace_recorder = None
+        pipeline._trace_cuda_events = False
+        pipeline._submission_lock = Lock()
+        pipeline._prepare_condition = Condition()
+        commits: list[tuple[int, int, int]] = []
+
+        class Replay:
+            def commit_ingress(self, *, slot, start, count):
+                commits.append((slot, start, count))
+
+        pipeline._replay_buffer = Replay()
+        monkeypatch.setattr(torch, "mps", type("FakeMPS", (), {"Event": _FakeMPSEvent})())
+        original_copy = torch.Tensor.copy_
+        non_blocking_calls: list[bool] = []
+
+        def recording_copy(self, source, *, non_blocking: bool = False):
+            non_blocking_calls.append(non_blocking)
+            return original_copy(self, source, non_blocking=non_blocking)
+
+        monkeypatch.setattr(torch.Tensor, "copy_", recording_copy)
+        pipeline._submit_span_copy(
+            start=6,
+            end=10,
+            source=torch.ones(4, 2),
+            ingress_slot=0,
+        )
+        event = pipeline._span_events[0][1]
+
+        assert non_blocking_calls == [True, True]
+        assert event.recorded is True
+        assert pipeline._submitted_ptr == 10
+        assert pipeline._visible_ptr == 6
+        assert pipeline._drain_completed_spans() is False
+        assert commits == []
+
+        event.complete = True
+        assert pipeline._drain_completed_spans() is True
+        assert commits == [(0, 6, 4)]
+        assert pipeline._visible_ptr == 10
+
+    def test_multiple_pending_spans_commit_in_order_and_release_slots(self):
+        pipeline = object.__new__(GPUResidentReplayPipeline)
+        first_event = _FakeMPSEvent()
+        second_event = _FakeMPSEvent()
+        commits: list[tuple[int, int, int]] = []
+
+        class Replay:
+            def commit_ingress(self, *, slot, start, count):
+                commits.append((slot, start, count))
+
+        pipeline._span_events = deque(
+            [
+                (4, first_event, 0, 0, 4),
+                (8, second_event, 1, 4, 4),
+            ]
+        )
+        pipeline._trace_recorder = None
+        pipeline._visible_ptr = 0
+        pipeline._submission_lock = Lock()
+        pipeline._prepare_condition = Condition()
+        pipeline._replay_buffer = Replay()
+
+        first_event.complete = True
+        assert pipeline._drain_completed_spans() is True
+        assert commits == [(0, 0, 4)]
+        assert pipeline._visible_ptr == 4
+
+        second_event.complete = True
+        assert pipeline._drain_completed_spans() is True
+        assert commits == [(0, 0, 4), (1, 4, 4)]
+        assert pipeline._visible_ptr == 8
+
+    def test_close_drains_pending_span_before_transfer_backend_close(self, monkeypatch):
+        pipeline = object.__new__(GPUResidentReplayPipeline)
+        event = _FakeMPSEvent()
+        close_order: list[str] = []
+        commits: list[tuple[int, int, int]] = []
+
+        class Replay:
+            def commit_ingress(self, *, slot, start, count):
+                close_order.append("commit")
+                commits.append((slot, start, count))
+
+        class Transfer:
+            def close(self):
+                close_order.append("transfer_close")
+
+        pipeline._closed = False
+        pipeline._sync_thread = None
+        pipeline._submission_lock = Lock()
+        pipeline._prepare_condition = Condition()
+        pipeline._span_events = deque([(4, event, 1, 0, 4)])
+        pipeline._slot_events = [_FakeMPSEvent()]
+        pipeline._replay_buffer = Replay()
+        pipeline._transfer_backend = Transfer()
+        pipeline._gpu_packed = []
+        pipeline._gpu_storage = torch.zeros(4, 2)
+        pipeline._host_pinned = False
+        pipeline._submit_new_spans = lambda: False
+
+        pipeline.close()
+
+        assert event.complete is True
+        assert close_order == ["commit", "transfer_close"]
+        assert commits == [(1, 0, 4)]
+
         assert _ring_spans(0, 4, 0) == []
 
 
@@ -484,6 +619,73 @@ class TestMPSGPUResidentPipeline:
         expected = _expected_pattern(rb, rewards)
         for key, want in expected.items():
             torch.testing.assert_close(batch[key].cpu(), want)
+
+    def test_mps_ingress_copy_is_nonblocking_and_event_gated(self, pipeline_factory, monkeypatch):
+        rb = _make_bounded_replay(capacity=64, slot_rows=16, device="mps")
+        _pattern_add(rb, 0, 16)
+        pipeline = pipeline_factory(rb, sample_count=8)
+        original_copy = torch.Tensor.copy_
+        non_blocking_calls: list[bool] = []
+
+        def recording_copy(self, source, *, non_blocking: bool = False):
+            non_blocking_calls.append(non_blocking)
+            return original_copy(self, source, non_blocking=non_blocking)
+
+        monkeypatch.setattr(torch.Tensor, "copy_", recording_copy)
+        batch = pipeline.sample_large_batch(1, 8)
+        monkeypatch.undo()
+
+        assert non_blocking_calls == [True]
+        assert int(rb.ptr[0]) == 16
+        rewards = batch["rewards"].cpu()
+        expected = _expected_pattern(rb, rewards)
+        for key, want in expected.items():
+            torch.testing.assert_close(batch[key].cpu(), want)
+
+    def test_mps_ring_wrap_pending_spans_slot_reuse_and_snapshot(self, pipeline_factory):
+        rb = _make_bounded_replay(capacity=8, slot_rows=4, device="mps")
+        pipeline = pipeline_factory(rb, sample_count=4)
+        _pattern_add(rb, 0, 4)
+        _pattern_add(rb, 4, 4)
+
+        assert pipeline._submit_new_spans() is True
+        assert len(pipeline._span_events) == 2
+        assert pipeline._visible_ptr == 0
+        pipeline.progress(wait=True)
+        assert pipeline._visible_ptr == 8
+
+        _pattern_add(rb, 8, 4)
+        assert pipeline._submit_new_spans() is True
+        assert pipeline._submitted_ptr == 12
+        pipeline.progress(wait=True)
+
+        end_ptr, fields = pipeline.read_committed_fields(("rewards",), start_ptr=4)
+        assert end_ptr == 12
+        torch.testing.assert_close(fields["rewards"].cpu(), torch.arange(4.0, 12.0))
+
+    def test_mps_ingress_submission_overlaps_learner_work_and_close_drains(self, pipeline_factory):
+        rb = _make_bounded_replay(capacity=64, slot_rows=16, device="mps")
+        _pattern_add(rb, 0, 16)
+        pipeline = pipeline_factory(rb, sample_count=8)
+        heavy = torch.ones(4096, 4096, device="mps")
+
+        heavy_start = time.perf_counter()
+        _heavy_result = heavy @ heavy
+        submit_start = time.perf_counter()
+        assert pipeline._submit_new_spans() is True
+        submit_elapsed_ms = (time.perf_counter() - submit_start) * 1_000
+        torch.mps.synchronize()
+        heavy_elapsed_ms = (time.perf_counter() - heavy_start) * 1_000
+
+        assert submit_elapsed_ms < 5.0
+        assert submit_elapsed_ms < heavy_elapsed_ms / 2
+        assert pipeline._span_events[0][1].query() is True
+        assert pipeline._visible_ptr == 0
+
+        pipeline.close()
+        assert pipeline._visible_ptr == 16
+        with pytest.raises(RuntimeError, match="after pipeline.close()"):
+            pipeline.start_prepare(1, 8)
 
     def test_deterministic_seed_produces_same_mps_batch(self, pipeline_factory):
         rb = _make_replay(capacity=128, device="mps")

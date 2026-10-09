@@ -12,6 +12,8 @@ from __future__ import annotations
 
 import copy
 import math
+import sys
+import time
 from collections.abc import Callable, Iterable, Iterator
 from contextlib import contextmanager
 from typing import Any, Dict, Tuple, cast
@@ -21,10 +23,11 @@ import torch.nn as nn
 import torch.nn.functional as F
 import torch.optim as optim
 
-from uni_rl.algos.common.compile import get_torch_compile_for_cuda, is_hip_runtime
+from uni_rl.algos.common.compile import get_torch_compile_for_device, is_hip_runtime
 from uni_rl.algos.common.learner_boilerplate import (
     LearnerBoilerplateMixin,
     fused_adam_supported,
+    mps_bf16_autocast_supported,
     polyak_update_target,
     resolve_finite_check_flags,
 )
@@ -402,6 +405,30 @@ class SACLearner(LearnerBoilerplateMixin):
 
     supports_deferred_update_metrics = True
 
+    @staticmethod
+    def _resolve_use_amp(use_amp: bool, amp_dtype: str, device_type: str) -> bool:
+        """Resolve device-specific AMP enablement without runtime probing."""
+        if device_type == "mps" and use_amp:
+            normalized_amp_dtype = amp_dtype.strip().lower()
+            if normalized_amp_dtype == "auto":
+                return False
+            if normalized_amp_dtype != "bf16":
+                raise ValueError(
+                    "SAC MPS AMP requires the explicitly validated amp_dtype='bf16'; "
+                    f"got {amp_dtype!r}"
+                )
+            return True
+        return bool(use_amp) and device_type in ("cuda", "xpu")
+
+    @staticmethod
+    def _validate_performance_paths(device_type: str, use_compile: bool, use_amp: bool) -> None:
+        """Reject initially unsupported MPS compile/AMP combinations."""
+        if device_type == "mps" and use_compile and use_amp:
+            raise ValueError(
+                "SAC MPS torch.compile and BF16 AMP are initially mutually exclusive; "
+                "enable exactly one path"
+            )
+
     def __init__(
         self,
         obs_dim: int,
@@ -441,14 +468,23 @@ class SACLearner(LearnerBoilerplateMixin):
         self.tau = tau
         self.max_grad_norm = max_grad_norm
         self.use_autotune = use_autotune
-        self.use_amp = bool(use_amp) and self._device_type in ("cuda", "xpu")
         self._nvidia_cuda = self._device_type == "cuda" and not is_hip_runtime()
-        compile_fn = get_torch_compile_for_cuda(self.device, warn=not self._nvidia_cuda)
+        self.use_amp = self._resolve_use_amp(use_amp, amp_dtype, self._device_type)
+        if self._device_type == "mps" and self.use_amp and not mps_bf16_autocast_supported():
+            raise RuntimeError(
+                "SAC MPS BF16 AMP was requested, but this Torch/MPS runtime "
+                "cannot execute BF16 autocast"
+            )
+        compile_fn = get_torch_compile_for_device(self.device, warn=not self._nvidia_cuda)
         if self._nvidia_cuda and compile_fn is None:
             raise RuntimeError("SAC requires CUDA Inductor/Triton on NVIDIA CUDA")
         # NVIDIA CUDA always uses the performance path; the legacy opt-out is
         # retained only for ROCm/HIP, MPS, CPU, and other compatibility devices.
         self.use_compile = self._nvidia_cuda or (bool(use_compile) and compile_fn is not None)
+        self._validate_performance_paths(self._device_type, self.use_compile, self.use_amp)
+        self.compile_backend = (
+            ("inductor" if self._nvidia_cuda else "torch_compile") if self.use_compile else "eager"
+        )
         # The compiled CUDA Graph hot path cannot branch on host-visible finite
         # checks and relies on the existing NaN guard/metrics boundary.  MPS
         # has no device-side skip mechanism (its fused AdamW kernel ignores
@@ -570,6 +606,12 @@ class SACLearner(LearnerBoilerplateMixin):
         self._pending_actor_metric_values: torch.Tensor | None = None
         self._pending_cycle_critic_metric_values: torch.Tensor | None = None
         self._pending_cycle_metric_values: torch.Tensor | None = None
+        self._pending_update_finite_values: torch.Tensor | None = None
+        self._eager_critic_loss_tensors: Callable[..., Any] | None = None
+        self._eager_actor_loss_tensors: Callable[..., Any] | None = None
+        self._compiled_critic_loss_tensors: Callable[..., Any] | None = None
+        self._compiled_actor_loss_tensors: Callable[..., Any] | None = None
+        self._mps_selection_batch: Dict[str, torch.Tensor] | None = None
         self._q_update_finite = torch.ones((), device=device)
         self._target_tau = torch.full((), tau, device=device)
         self._update_cycle_graph: torch.cuda.CUDAGraph | None = None
@@ -612,6 +654,10 @@ class SACLearner(LearnerBoilerplateMixin):
             action_dim=self.action_dim,
             device=self.device,
         )
+        self._select_mps_training_methods(
+            large_batch,
+            batch_size=max(1, int(warmup_context.batch_size)),
+        )
         if self.use_update_cycle:
             self._ensure_update_cycle_graph(
                 large_batch,
@@ -651,12 +697,15 @@ class SACLearner(LearnerBoilerplateMixin):
             self._pending_actor_metric_values = None
             self._pending_cycle_critic_metric_values = None
             self._pending_cycle_metric_values = None
+            self._pending_update_finite_values = None
             restore_rng_state(rng_state)
             self._zero_optimizer_gradients(self.q_optimizer)
             self._zero_optimizer_gradients(self.actor_optimizer)
             self._zero_optimizer_gradients(self.alpha_optimizer)
             if self._device_type == "cuda":
                 torch.cuda.synchronize(self.device)
+            elif self._device_type == "mps":
+                torch.mps.synchronize()
 
     def set_gradient_sync(self, sync: Callable[[Iterable[torch.Tensor]], None] | None) -> None:
         """Attach DP reduction and leave the unsupported whole-cycle graph.
@@ -761,9 +810,12 @@ class SACLearner(LearnerBoilerplateMixin):
 
     def _compile_training_methods(self) -> None:
         """Compile loss kernels for the selected SAC orchestration scope."""
-        compile_fn = get_torch_compile_for_cuda(self.device, warn=True)
+        compile_fn = get_torch_compile_for_device(self.device, warn=True)
         if compile_fn is None:
             return
+        if self._device_type == "mps":
+            self._eager_critic_loss_tensors = self._critic_loss_tensors
+            self._eager_actor_loss_tensors = self._actor_loss_tensors
         if self._compile_full_update_cycle:
             # The owner-managed CUDA Graph must not nest Inductor Graph Trees.
             # Portable max-autotune lets Triton select kernels for the installed
@@ -771,6 +823,10 @@ class SACLearner(LearnerBoilerplateMixin):
             compile_kwargs = {
                 "dynamic": False,
                 "mode": "max-autotune-no-cudagraphs",
+            }
+        elif self._device_type == "mps":
+            compile_kwargs = {
+                "dynamic": False,
             }
         else:
             compile_kwargs = {
@@ -787,6 +843,107 @@ class SACLearner(LearnerBoilerplateMixin):
             self._actor_loss_tensors,
             **compile_kwargs,
         )
+        if self._device_type == "mps":
+            self._compiled_critic_loss_tensors = self._critic_loss_tensors
+            self._compiled_actor_loss_tensors = self._actor_loss_tensors
+
+    def _synchronize_compile_selection(self) -> None:
+        if self._device_type == "cuda":
+            torch.cuda.synchronize(self.device)
+        elif self._device_type == "mps":
+            torch.mps.synchronize()
+
+    def _benchmark_critic_loss_tensors(self) -> float:
+        assert self._mps_selection_batch is not None
+        start = time.perf_counter()
+        qf_loss, _target_q_max, _target_q_min, _next_log_probs = self._critic_loss_tensors(
+            self._mps_selection_batch["critic"],
+            self._mps_selection_batch["actions"],
+            self._mps_selection_batch["rewards"],
+            self._mps_selection_batch["next_obs"],
+            self._mps_selection_batch["next_critic"],
+            self._mps_selection_batch["dones"],
+            self._mps_selection_batch["truncated"],
+        )
+        qf_loss.backward(inputs=list(self.qnet.parameters()))
+        self._zero_optimizer_gradients(self.q_optimizer)
+        self._synchronize_compile_selection()
+        return time.perf_counter() - start
+
+    def _benchmark_actor_loss_tensors(self) -> float:
+        assert self._mps_selection_batch is not None
+        start = time.perf_counter()
+        actor_loss, _policy_entropy = self._actor_loss_tensors(
+            self._mps_selection_batch["obs"],
+            self._mps_selection_batch["critic"],
+        )
+        actor_loss.backward(inputs=list(self.actor.parameters()))
+        self._zero_optimizer_gradients(self.actor_optimizer)
+        self._synchronize_compile_selection()
+        return time.perf_counter() - start
+
+    def _select_mps_training_methods(
+        self,
+        large_batch: Dict[str, torch.Tensor],
+        *,
+        batch_size: int,
+    ) -> None:
+        """Keep MPS compilation only when its representative benchmark wins."""
+        if self._device_type != "mps" or not self.use_compile:
+            return
+        assert self._eager_critic_loss_tensors is not None
+        assert self._eager_actor_loss_tensors is not None
+        assert self._compiled_critic_loss_tensors is not None
+        assert self._compiled_actor_loss_tensors is not None
+        self._mps_selection_batch = {key: value[:batch_size] for key, value in large_batch.items()}
+        rng_state = capture_rng_state(self.device)
+        timings: dict[str, float] = {}
+        selection_failed = False
+        candidates = (
+            (
+                "eager",
+                self._eager_critic_loss_tensors,
+                self._eager_actor_loss_tensors,
+            ),
+            (
+                "compiled",
+                self._compiled_critic_loss_tensors,
+                self._compiled_actor_loss_tensors,
+            ),
+        )
+        try:
+            for label, critic_fn, actor_fn in candidates:
+                self.__dict__["_critic_loss_tensors"] = critic_fn
+                self.__dict__["_actor_loss_tensors"] = actor_fn
+                self._benchmark_critic_loss_tensors()
+                self._benchmark_actor_loss_tensors()
+                timings[label] = min(
+                    self._benchmark_critic_loss_tensors() + self._benchmark_actor_loss_tensors()
+                    for _ in range(3)
+                )
+        except Exception as exc:
+            selection_failed = True
+            print(
+                f"[SACLearner] MPS torch.compile warmup failed ({exc}); using eager mode.",
+                file=sys.stderr,
+                flush=True,
+            )
+            timings.setdefault("eager", float("inf"))
+            timings["compiled"] = float("inf")
+        finally:
+            restore_rng_state(rng_state)
+            self._zero_optimizer_gradients(self.q_optimizer)
+            self._zero_optimizer_gradients(self.actor_optimizer)
+            self._zero_optimizer_gradients(self.alpha_optimizer)
+            self._mps_selection_batch = None
+        if not selection_failed and timings["compiled"] < timings["eager"] * 0.95:
+            self.__dict__["_critic_loss_tensors"] = self._compiled_critic_loss_tensors
+            self.__dict__["_actor_loss_tensors"] = self._compiled_actor_loss_tensors
+            return
+        self.__dict__["_critic_loss_tensors"] = self._eager_critic_loss_tensors
+        self.__dict__["_actor_loss_tensors"] = self._eager_actor_loss_tensors
+        self.use_compile = False
+        self.compile_backend = "eager"
 
     def _materialize_capturable_optimizer_state(self) -> None:
         """Create fused AdamW state before the whole-cycle graph is captured."""
@@ -953,12 +1110,79 @@ class SACLearner(LearnerBoilerplateMixin):
             }
         return {}
 
+    def begin_deferred_update_metrics(self) -> None:
+        """Start one update phase and reset its deferred metric ownership."""
+        self._pending_actor_metric_values = None
+        self._pending_cycle_critic_metric_values = None
+        self._pending_cycle_metric_values = None
+        if self._metrics_finite_checks:
+            self._pending_update_finite_values = torch.ones(3, dtype=torch.bool, device=self.device)
+
+    def _stage_deferred_finite_value(self, slot: int, loss: torch.Tensor) -> None:
+        if not self._metrics_finite_checks:
+            return
+        finite_values = self._pending_update_finite_values
+        if finite_values is None:
+            self.begin_deferred_update_metrics()
+            finite_values = self._pending_update_finite_values
+        assert finite_values is not None
+        finite_values[slot].logical_and_(torch.isfinite(loss.detach()).all())
+
+    def read_deferred_update_metrics(self) -> Dict[str, float]:
+        """Read phase metrics and finite guards with one device transfer."""
+        critic_values = self._pending_cycle_critic_metric_values
+        actor_values = self._pending_actor_metric_values
+        finite_values = self._pending_update_finite_values
+        if critic_values is None:
+            return self.read_deferred_actor_metrics()
+        values = (
+            torch.cat((critic_values, actor_values)) if actor_values is not None else critic_values
+        )
+        if finite_values is not None:
+            values = torch.cat((values, finite_values.to(values.dtype)))
+        host_values = values.cpu().tolist()
+        self._pending_actor_metric_values = None
+        self._pending_cycle_critic_metric_values = None
+        self._pending_cycle_metric_values = None
+        self._pending_update_finite_values = None
+
+        metric_names: tuple[str, ...] = (
+            "Loss/critic",
+            "Train/critic_gradient_norm",
+            "Train/target_q_max",
+            "Train/target_q_min",
+            "Loss/temperature",
+            "Policy/temperature",
+        )
+        if actor_values is not None:
+            metric_names = metric_names + (
+                "Loss/actor",
+                "Train/actor_gradient_norm",
+                "Loss/entropy",
+            )
+        metrics = {
+            name: float(value)
+            for name, value in zip(
+                metric_names,
+                host_values[: len(metric_names)],
+                strict=True,
+            )
+        }
+        if finite_values is not None and not all(
+            bool(value) for value in host_values[len(metric_names) :]
+        ):
+            raise FloatingPointError(
+                "SAC deferred update contained a non-finite critic, alpha, or actor loss"
+            )
+        return metrics
+
     def read_deferred_cycle_metrics(self) -> Dict[str, float]:
         values = self._pending_cycle_metric_values
         has_actor = values is not None and values.numel() == 9
         self._pending_cycle_critic_metric_values = None
         self._pending_actor_metric_values = None
         self._pending_cycle_metric_values = None
+        self._pending_update_finite_values = None
         if values is None:
             return {}
         metric_names: tuple[str, ...] = (
@@ -989,9 +1213,7 @@ class SACLearner(LearnerBoilerplateMixin):
         target_frequency: int,
         policy_before_critic: bool,
     ) -> None:
-        self._pending_actor_metric_values = None
-        self._pending_cycle_critic_metric_values = None
-        self._pending_cycle_metric_values = None
+        self.begin_deferred_update_metrics()
         batch_size = int(next(iter(large_batch.values())).shape[0]) // updates_per_step
         for update_idx in range(updates_per_step):
             start = update_idx * batch_size
@@ -1254,6 +1476,8 @@ class SACLearner(LearnerBoilerplateMixin):
                     self.alpha_optimizer.step()
 
         if not read_metrics:
+            self._stage_deferred_finite_value(0, qf_loss)
+            self._stage_deferred_finite_value(1, alpha_loss)
             self._pending_cycle_critic_metric_values = torch.stack(
                 [
                     tensor.detach().reshape(())
@@ -1343,6 +1567,7 @@ class SACLearner(LearnerBoilerplateMixin):
             policy_entropy,
         )
         if not read_metrics:
+            self._stage_deferred_finite_value(2, actor_loss)
             # Inductor CUDA Graph Trees overwrite their output storage on a
             # later compiled call.  Stage the three scalars now so they remain
             # valid until the single cycle-end D2H read.
@@ -1383,6 +1608,7 @@ class SACLearner(LearnerBoilerplateMixin):
         self._pending_actor_metric_values = None
         self._pending_cycle_critic_metric_values = None
         self._pending_cycle_metric_values = None
+        self._pending_update_finite_values = None
 
     def dp_initial_sync_tensors(self) -> Dict[str, torch.Tensor]:
         """Model state broadcast once from rank 0 before collection starts.

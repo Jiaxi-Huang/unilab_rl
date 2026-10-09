@@ -1773,6 +1773,183 @@ def test_runner_releases_action_before_replay_wait_and_sample(
     assert deferred_metrics["Loss/actor"] == pytest.approx(3.0)
 
 
+def test_runner_reads_deferred_update_metrics_once(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path,
+) -> None:
+    critic_read_flags: list[bool] = []
+    deferred_reads: list[str] = []
+
+    class ConsolidatedReplayBuffer(_FakeReplayBuffer):
+        def __init__(self, **kwargs):
+            super().__init__(**kwargs)
+            self.ptr[0] = 4
+            self.size[0] = 4
+            self.published_ptr = 4
+
+    class ConsolidatedPipeline(_FakePipeline):
+        last_incremental_h2d_time_s = 0.0
+
+        def progress(self, *, wait=False):
+            return wait
+
+        def start_prepare(self, tick_id, sample_count, min_snapshot_ptr=None):
+            del tick_id, sample_count, min_snapshot_ptr
+            return True
+
+        def batch_ready(self, tick_id, sample_count):
+            del tick_id, sample_count
+            return True
+
+        def sample_large_batch(self, tick_id, sample_count):
+            del tick_id, sample_count
+            return {}
+
+        def after_tick(self):
+            return None
+
+    class ConsolidatedLearner(_Learner):
+        supports_deferred_update_metrics = True
+
+        def update_critic(self, batch, *, read_metrics: bool = True):
+            del batch
+            critic_read_flags.append(read_metrics)
+            return {}
+
+        def update_actor(self, batch, *, read_metrics: bool = True):
+            del batch, read_metrics
+            return {}
+
+        def read_deferred_update_metrics(self):
+            deferred_reads.append("combined")
+            return {"Loss/critic": 7.0, "Loss/actor": 3.0}
+
+        def read_deferred_actor_metrics(self):
+            raise AssertionError("combined metric read must replace the actor-only read")
+
+        def soft_update_target(self):
+            return None
+
+    monkeypatch.setattr(device_runner_module, "ReplayBuffer", ConsolidatedReplayBuffer)
+    monkeypatch.setattr(device_runner_module, "GPUResidentReplayPipeline", ConsolidatedPipeline)
+    monkeypatch.setattr(device_runner_module, "OffPolicyLogger", _FakeLogger)
+    monkeypatch.setattr(device_runner_module.torch, "save", lambda *args, **kwargs: None)
+    monkeypatch.setattr(device_runner_module.time, "sleep", lambda seconds: None)
+
+    runner = _make_device_runner(monkeypatch, ConsolidatedLearner(), device="cpu")
+    monkeypatch.setattr(runner, "_start_collector", lambda **kwargs: None)
+    monkeypatch.setattr(runner, "_check_collector_alive", lambda: True)
+    monkeypatch.setattr(runner, "_wait_for_inference_request", lambda *args, **kwargs: 0)
+    monkeypatch.setattr(
+        runner,
+        "_serve_learner_inference",
+        lambda *args, **kwargs: {
+            "inference_h2d_time": 0.0,
+            "inference_forward_time": 0.0,
+            "inference_d2h_time": 0.0,
+            "inference_time": 0.0,
+        },
+    )
+    monkeypatch.setattr(runner, "_publish_inference_response", lambda *args, **kwargs: None)
+
+    runner.learn(max_iterations=1, save_interval=0, log_dir=str(tmp_path))
+
+    assert critic_read_flags == [False, False]
+    assert deferred_reads == ["combined"]
+    logger = _FakeLogger.last_instance
+    assert logger is not None
+    metrics = logger.step_calls[0]["metrics"]
+    normalize_metric_map(metrics)
+    assert metrics["Loss/critic"] == pytest.approx(7.0)
+    assert metrics["Loss/actor"] == pytest.approx(3.0)
+
+
+def test_runner_deferred_finite_failure_precedes_update_count(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path,
+) -> None:
+    save_calls: list[object] = []
+
+    class FiniteReplayBuffer(_FakeReplayBuffer):
+        def __init__(self, **kwargs):
+            super().__init__(**kwargs)
+            self.ptr[0] = 4
+            self.size[0] = 4
+            self.published_ptr = 4
+
+    class FinitePipeline(_FakePipeline):
+        last_incremental_h2d_time_s = 0.0
+
+        def progress(self, *, wait=False):
+            return wait
+
+        def start_prepare(self, tick_id, sample_count, min_snapshot_ptr=None):
+            del tick_id, sample_count, min_snapshot_ptr
+            return True
+
+        def batch_ready(self, tick_id, sample_count):
+            del tick_id, sample_count
+            return True
+
+        def sample_large_batch(self, tick_id, sample_count):
+            del tick_id, sample_count
+            return {}
+
+        def after_tick(self):
+            return None
+
+    class FiniteLearner(_Learner):
+        supports_deferred_update_metrics = True
+
+        def update_critic(self, batch, *, read_metrics: bool = True):
+            del batch
+            assert read_metrics is False
+            return {}
+
+        def update_actor(self, batch, *, read_metrics: bool = True):
+            del batch, read_metrics
+            return {}
+
+        def begin_deferred_update_metrics(self):
+            return None
+
+        def read_deferred_update_metrics(self):
+            raise FloatingPointError("non-finite critic, alpha, or actor loss")
+
+        def soft_update_target(self):
+            return None
+
+    monkeypatch.setattr(device_runner_module, "ReplayBuffer", FiniteReplayBuffer)
+    monkeypatch.setattr(device_runner_module, "GPUResidentReplayPipeline", FinitePipeline)
+    monkeypatch.setattr(device_runner_module, "OffPolicyLogger", _FakeLogger)
+    monkeypatch.setattr(
+        device_runner_module.torch, "save", lambda *args, **kwargs: save_calls.append(args)
+    )
+    monkeypatch.setattr(device_runner_module.time, "sleep", lambda seconds: None)
+
+    runner = _make_device_runner(monkeypatch, FiniteLearner(), device="cpu")
+    monkeypatch.setattr(runner, "_start_collector", lambda **kwargs: None)
+    monkeypatch.setattr(runner, "_check_collector_alive", lambda: True)
+    monkeypatch.setattr(runner, "_wait_for_inference_request", lambda *args, **kwargs: 0)
+    monkeypatch.setattr(
+        runner,
+        "_serve_learner_inference",
+        lambda *args, **kwargs: {
+            "inference_h2d_time": 0.0,
+            "inference_forward_time": 0.0,
+            "inference_d2h_time": 0.0,
+            "inference_time": 0.0,
+        },
+    )
+    monkeypatch.setattr(runner, "_publish_inference_response", lambda *args, **kwargs: None)
+
+    with pytest.raises(FloatingPointError, match="non-finite critic"):
+        runner.learn(max_iterations=1, save_interval=1, log_dir=str(tmp_path))
+
+    assert runner.learner.update_count == 0
+    assert save_calls == []
+
+
 def test_runner_uses_learner_update_cycle_when_available(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path,
@@ -1919,6 +2096,26 @@ def test_runtime_manifest_reports_inductor_cuda_graph_path(
         "critic": False,
         "actor": False,
         "device_finite_optimizer_gating": False,
+    }
+
+
+def test_runtime_manifest_reports_mps_torch_compile_path(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    learner = _Learner()
+    learner.use_compile = True
+    learner.compile_backend = "torch_compile"
+    learner._host_finite_checks = True
+
+    runner = _make_device_runner(monkeypatch, learner)
+
+    assert runner.runtime_manifest["cuda_graph"] == {
+        "backend": "torch_compile",
+        "critic": True,
+        "actor": True,
+        "device_finite_optimizer_gating": False,
+        "scope": "loss_tensors",
+        "orchestration": "torch_compile",
     }
 
 

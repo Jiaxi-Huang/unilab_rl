@@ -2,12 +2,15 @@ from __future__ import annotations
 
 import math
 from collections.abc import Callable
+from contextlib import contextmanager
 from typing import Any
 
 import pytest
 import torch
 
+import uni_rl.algos.common.learner_boilerplate as learner_boilerplate
 import uni_rl.algos.sac.learner as sac_module
+from uni_rl.algos.common.learner_boilerplate import mps_bf16_autocast_supported
 from uni_rl.algos.sac.learner import (
     DistributionalQNetwork,
     SACActor,
@@ -104,6 +107,208 @@ def test_sac_compile_targets_training_hot_paths(monkeypatch) -> None:
     ]
 
 
+def test_sac_mps_compile_targets_training_hot_paths(monkeypatch) -> None:
+    calls: list[tuple[str, dict[str, Any]]] = []
+
+    def fake_compile(fn: Callable, **kwargs):
+        calls.append((fn.__qualname__, kwargs))
+        return fn
+
+    learner = _small_sac_learner()
+    learner.device = torch.device("mps")
+    learner._device_type = "mps"
+    monkeypatch.setattr(
+        sac_module,
+        "get_torch_compile_for_device",
+        lambda *_args, **_kwargs: fake_compile,
+    )
+
+    learner._compile_training_methods()
+
+    assert calls == [
+        ("SACLearner._critic_loss_tensors", {"dynamic": False}),
+        ("SACLearner._actor_loss_tensors", {"dynamic": False}),
+    ]
+
+
+def test_sac_mps_amp_and_compile_gates_are_explicit_and_mutually_exclusive() -> None:
+    assert SACLearner._resolve_use_amp(False, "auto", "mps") is False
+    assert SACLearner._resolve_use_amp(False, "bf16", "mps") is False
+    assert SACLearner._resolve_use_amp(True, "auto", "mps") is False
+    assert SACLearner._resolve_use_amp(True, "bf16", "mps") is True
+    assert SACLearner._resolve_use_amp(True, "bf16", "cuda") is True
+
+    with pytest.raises(ValueError, match="amp_dtype='bf16'"):
+        SACLearner._resolve_use_amp(True, "fp16", "mps")
+
+    with pytest.raises(ValueError, match="mutually exclusive"):
+        SACLearner._validate_performance_paths("mps", use_compile=True, use_amp=True)
+    SACLearner._validate_performance_paths("mps", use_compile=True, use_amp=False)
+    SACLearner._validate_performance_paths("mps", use_compile=False, use_amp=True)
+    SACLearner._validate_performance_paths("cuda", use_compile=True, use_amp=True)
+
+
+@pytest.mark.skipif(not torch.backends.mps.is_available(), reason="MPS runtime required")
+def test_sac_mps_compile_initialization_reports_torch_compile(monkeypatch) -> None:
+    monkeypatch.setattr(
+        sac_module,
+        "get_torch_compile_for_device",
+        lambda *_args, **_kwargs: lambda fn, **_kwargs: fn,
+    )
+    learner = SACLearner(
+        obs_dim=4,
+        action_dim=2,
+        critic_obs_dim=5,
+        device="mps",
+        actor_hidden_dim=8,
+        critic_hidden_dim=8,
+        num_atoms=3,
+        num_q_networks=2,
+        use_layer_norm=False,
+        use_autotune=False,
+        use_compile=True,
+    )
+
+    assert learner.use_compile is True
+    assert learner.use_amp is False
+    assert learner.compile_backend == "torch_compile"
+
+
+@pytest.mark.skipif(not torch.backends.mps.is_available(), reason="MPS runtime required")
+def test_sac_mps_bf16_fails_closed_without_runtime_support(monkeypatch) -> None:
+    monkeypatch.setattr(sac_module, "mps_bf16_autocast_supported", lambda: False)
+
+    with pytest.raises(RuntimeError, match="cannot execute BF16 autocast"):
+        SACLearner(
+            obs_dim=4,
+            action_dim=2,
+            critic_obs_dim=5,
+            device="mps",
+            actor_hidden_dim=8,
+            critic_hidden_dim=8,
+            num_atoms=3,
+            num_q_networks=2,
+            use_layer_norm=False,
+            use_autotune=False,
+            use_amp=True,
+            amp_dtype="bf16",
+        )
+
+
+@pytest.mark.skipif(not torch.backends.mps.is_available(), reason="MPS runtime required")
+def test_sac_mps_bf16_capability_requires_autocast_linear_output(
+    monkeypatch,
+) -> None:
+    learner_boilerplate._MPS_BF16_AUTOCAST_SUPPORTED = None
+
+    @contextmanager
+    def no_op_autocast(*_args, **_kwargs):
+        yield
+
+    monkeypatch.setattr(torch, "autocast", no_op_autocast)
+
+    assert mps_bf16_autocast_supported() is False
+
+
+@pytest.mark.parametrize(
+    ("compiled_time", "expected_compile"),
+    [(0.5, True), (1.0, False), (2.0, False)],
+)
+def test_sac_mps_compile_selection_requires_runtime_win(
+    monkeypatch, compiled_time: float, expected_compile: bool
+) -> None:
+    learner = _small_sac_learner()
+    learner._device_type = "mps"
+    learner.use_compile = True
+    learner.compile_backend = "torch_compile"
+    learner._eager_critic_loss_tensors = SACLearner._critic_loss_tensors.__get__(learner)
+    learner._eager_actor_loss_tensors = SACLearner._actor_loss_tensors.__get__(learner)
+
+    def compiled_critic(*_args, **_kwargs):
+        raise AssertionError("benchmark helper should intercept compiled loss calls")
+
+    learner._compiled_critic_loss_tensors = compiled_critic
+    learner._compiled_actor_loss_tensors = learner._eager_actor_loss_tensors
+    learner.__dict__["_critic_loss_tensors"] = compiled_critic
+    learner.__dict__["_actor_loss_tensors"] = learner._compiled_actor_loss_tensors
+
+    def benchmark(self):
+        return compiled_time if self._critic_loss_tensors is compiled_critic else 1.0
+
+    monkeypatch.setattr(SACLearner, "_benchmark_critic_loss_tensors", benchmark)
+    monkeypatch.setattr(
+        SACLearner,
+        "_benchmark_actor_loss_tensors",
+        lambda self: 0.5,
+    )
+    batch = _small_offpolicy_batch()
+    learner._select_mps_training_methods(batch, batch_size=4)
+
+    assert learner.use_compile is expected_compile
+    assert learner.compile_backend == ("torch_compile" if expected_compile else "eager")
+    if expected_compile:
+        assert learner._critic_loss_tensors is compiled_critic
+    else:
+        assert learner._critic_loss_tensors is learner._eager_critic_loss_tensors
+
+
+def test_sac_mps_compile_selection_failure_falls_back_to_eager(monkeypatch, capsys) -> None:
+    learner = _small_sac_learner()
+    learner._device_type = "mps"
+    learner.use_compile = True
+    learner.compile_backend = "torch_compile"
+    learner._eager_critic_loss_tensors = SACLearner._critic_loss_tensors.__get__(learner)
+    learner._eager_actor_loss_tensors = SACLearner._actor_loss_tensors.__get__(learner)
+
+    def compiled_critic(*_args, **_kwargs):
+        raise RuntimeError("metal backend unavailable")
+
+    learner._compiled_critic_loss_tensors = compiled_critic
+    learner._compiled_actor_loss_tensors = lambda *_args, **_kwargs: None
+    learner.__dict__["_critic_loss_tensors"] = compiled_critic
+    learner.__dict__["_actor_loss_tensors"] = learner._compiled_actor_loss_tensors
+
+    def benchmark(self):
+        if self._critic_loss_tensors is compiled_critic:
+            raise RuntimeError("metal backend unavailable")
+        return 1.0
+
+    monkeypatch.setattr(SACLearner, "_benchmark_critic_loss_tensors", benchmark)
+    learner._select_mps_training_methods(_small_offpolicy_batch(), batch_size=4)
+
+    assert learner.use_compile is False
+    assert learner.compile_backend == "eager"
+    assert learner._critic_loss_tensors is learner._eager_critic_loss_tensors
+    assert "MPS torch.compile warmup failed" in capsys.readouterr().err
+
+
+@pytest.mark.skipif(not torch.backends.mps.is_available(), reason="MPS runtime required")
+def test_sac_mps_compile_selection_restores_mps_rng(monkeypatch) -> None:
+    learner = _small_sac_learner()
+    learner.device = torch.device("mps")
+    learner._device_type = "mps"
+    learner.use_compile = True
+    learner.compile_backend = "torch_compile"
+    learner._eager_critic_loss_tensors = SACLearner._critic_loss_tensors.__get__(learner)
+    learner._eager_actor_loss_tensors = SACLearner._actor_loss_tensors.__get__(learner)
+    learner._compiled_critic_loss_tensors = learner._eager_critic_loss_tensors
+    learner._compiled_actor_loss_tensors = learner._eager_actor_loss_tensors
+    learner.__dict__["_critic_loss_tensors"] = learner._eager_critic_loss_tensors
+    learner.__dict__["_actor_loss_tensors"] = learner._eager_actor_loss_tensors
+
+    def benchmark(self):
+        torch.rand(1, device="mps")
+        return 0.5
+
+    monkeypatch.setattr(SACLearner, "_benchmark_critic_loss_tensors", benchmark)
+    monkeypatch.setattr(SACLearner, "_benchmark_actor_loss_tensors", benchmark)
+    before = torch.mps.get_rng_state()
+
+    learner._select_mps_training_methods(_small_offpolicy_batch(), batch_size=4)
+
+    torch.testing.assert_close(torch.mps.get_rng_state(), before)
+
+
 def test_sac_whole_cycle_uses_max_autotune_without_nested_graphs(monkeypatch) -> None:
     calls: list[tuple[str, Any]] = []
 
@@ -116,7 +321,7 @@ def test_sac_whole_cycle_uses_max_autotune_without_nested_graphs(monkeypatch) ->
     learner._compile_full_update_cycle = True
     monkeypatch.setattr(
         sac_module,
-        "get_torch_compile_for_cuda",
+        "get_torch_compile_for_device",
         lambda *_args, **_kwargs: fake_compile,
     )
 
@@ -224,7 +429,7 @@ def test_sac_update_cycle_rejects_compatibility_fallback() -> None:
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="NVIDIA CUDA runtime required")
 def test_sac_nvidia_cuda_fails_closed_without_inductor(monkeypatch) -> None:
-    monkeypatch.setattr(sac_module, "get_torch_compile_for_cuda", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(sac_module, "get_torch_compile_for_device", lambda *_args, **_kwargs: None)
 
     with pytest.raises(RuntimeError, match="requires CUDA Inductor/Triton"):
         SACLearner(
@@ -263,7 +468,7 @@ def test_sac_hip_cuda_keeps_compatible_compile_opt_out(monkeypatch) -> None:
 def test_sac_nvidia_cuda_fails_closed_for_graph_incompatible_options(monkeypatch) -> None:
     monkeypatch.setattr(
         sac_module,
-        "get_torch_compile_for_cuda",
+        "get_torch_compile_for_device",
         lambda *_args, **_kwargs: lambda fn: fn,
     )
     common = {
@@ -347,7 +552,7 @@ def test_sac_cuda_adamw_optimizers_are_capturable(monkeypatch) -> None:
     monkeypatch.setattr(torch.optim, "AdamW", _FakeAdamW)
     monkeypatch.setattr(
         sac_module,
-        "get_torch_compile_for_cuda",
+        "get_torch_compile_for_device",
         lambda *_args, **_kwargs: lambda fn: fn,
     )
     monkeypatch.setattr(SACLearner, "_materialize_capturable_optimizer_state", lambda _self: None)
@@ -643,6 +848,51 @@ def test_sac_update_cycle_defers_metrics_until_one_read() -> None:
     }
     assert all(math.isfinite(value) for value in metrics.values())
     assert learner.read_deferred_cycle_metrics() == {}
+
+
+def test_sac_compatibility_updates_defer_metrics_until_one_read() -> None:
+    learner = _small_sac_learner()
+    batch = _small_offpolicy_batch()
+
+    learner.update_critic(batch, read_metrics=False)
+    learner.update_actor(batch, read_metrics=False)
+    metrics = learner.read_deferred_update_metrics()
+
+    assert set(metrics) == {
+        "Loss/critic",
+        "Train/critic_gradient_norm",
+        "Train/target_q_max",
+        "Train/target_q_min",
+        "Loss/temperature",
+        "Policy/temperature",
+        "Loss/actor",
+        "Train/actor_gradient_norm",
+        "Loss/entropy",
+    }
+    assert all(math.isfinite(value) for value in metrics.values())
+    assert learner._pending_cycle_critic_metric_values is None
+    assert learner._pending_actor_metric_values is None
+    assert learner.read_deferred_update_metrics() == {}
+
+
+def test_sac_deferred_finite_guard_fails_at_consolidated_read() -> None:
+    learner = _small_sac_learner()
+    learner._metrics_finite_checks = True
+    learner._host_finite_checks = True
+    batch = _small_offpolicy_batch()
+
+    learner.begin_deferred_update_metrics()
+    learner.update_critic(batch, read_metrics=False)
+    learner.update_actor(batch, read_metrics=False)
+    assert learner._pending_update_finite_values is not None
+    learner._pending_update_finite_values[0] = False
+
+    with pytest.raises(FloatingPointError, match="non-finite critic, alpha, or actor loss"):
+        learner.read_deferred_update_metrics()
+
+    assert learner._pending_cycle_critic_metric_values is None
+    assert learner._pending_actor_metric_values is None
+    assert learner._pending_update_finite_values is None
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA-only whole-cycle graph")
