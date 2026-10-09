@@ -875,6 +875,41 @@ def test_offpolicy_log_step_return_feeds_terminal_reward_table() -> None:
     assert any("Reward" in cell for cell in reward_cells)
 
 
+def test_offpolicy_reward_table_waits_for_first_data_without_source_marker() -> None:
+    logger = OffPolicyLogger(log_backend="none")
+
+    table = logger._build_reward_table()
+
+    assert table.columns[0].header == "Rewards"
+    reward_cells = list(table.columns[0].cells)
+    assert any("Waiting for data..." in cell for cell in reward_cells)
+
+
+def test_offpolicy_reward_table_keeps_last_data_after_window_expires(monkeypatch) -> None:
+    now = 100.0
+    monkeypatch.setattr(offpolicy_logger_module.time, "monotonic", lambda: now)
+    logger = OffPolicyLogger(log_backend="none")
+
+    logger.log_step(iteration=1, return_mean_ep100=2.5, reward_components={"alive": 0.5})
+    assert "(iter 1)" in logger._build_reward_table().columns[0].header
+
+    now = 103.1
+    logger.log_step(iteration=2, metrics={"Loss/critic": 1.0})
+
+    snapshot = logger._terminal_snapshot
+    assert snapshot is not None
+    assert not snapshot.reward_components
+    table = logger._build_reward_table()
+    reward_cells = list(table.columns[0].cells)
+    assert "Waiting for data..." not in reward_cells
+    assert any("Reward" in cell for cell in reward_cells)
+    assert any("alive" in cell for cell in reward_cells)
+    assert "(iter 1)" in table.columns[0].header
+
+    logger.log_step(iteration=5, return_mean_ep100=3.0, reward_components={"alive": 0.7})
+    assert "(iter 5)" in logger._build_reward_table().columns[0].header
+
+
 def test_offpolicy_backend_step_axis_falls_back_to_iteration() -> None:
     logger = OffPolicyLogger(log_backend="none")
     writer = _BatchedWriter()

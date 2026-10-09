@@ -307,6 +307,8 @@ class OffPolicyLogger(BaseTrainingLogger):
         self._training_timer_started: bool = False
         self._terminal_samples: deque[_TerminalSample] = deque(maxlen=_TERMINAL_AVERAGE_MAX_SAMPLES)
         self._terminal_snapshot: _TerminalSnapshot | None = None
+        self._last_reward_iter: int | None = None
+        self._last_reward_components_iter: int | None = None
 
     def _format_tensorboard_message(self, tb_dir: str) -> str:
         return f"[dim]TensorBoard logging to: {tb_dir}[/]"
@@ -670,8 +672,10 @@ class OffPolicyLogger(BaseTrainingLogger):
             self._latest_metrics.update(metrics)
         if return_mean_ep100 is not None:
             self._reward_history.append(float(return_mean_ep100))
+            self._last_reward_iter = iteration
         if reward_components:
             self._latest_reward_components = reward_components
+            self._last_reward_components_iter = iteration
         self._status = "Training"
         scalars = self._build_backend_scalars(
             iteration, metrics, return_mean_ep100, reward_components
@@ -850,13 +854,22 @@ class OffPolicyLogger(BaseTrainingLogger):
 
     def _build_reward_table(self, snapshot: _TerminalSnapshot | None = None) -> Table:
         snapshot = snapshot or self._terminal_snapshot
+        reward_components = None
+        if snapshot is not None and snapshot.reward_components:
+            reward_components = snapshot.reward_components
+        source_iterations = [
+            iteration
+            for iteration in (self._last_reward_iter, self._last_reward_components_iter)
+            if iteration is not None
+        ]
         return self._build_reward_table_common(
             wait_message="[dim]Waiting for data...[/]",
             include_ep_length=False,
             reward_history=(snapshot.reward_history if snapshot is not None else None),
-            reward_components=(snapshot.reward_components if snapshot is not None else None),
+            reward_components=reward_components,
             mean_reward=(snapshot.scalars.get("reward") if snapshot is not None else None),
             compact=self._console.width < 96,
+            source_iteration=max(source_iterations) if source_iterations else None,
         )
 
     def _build_timing_table(self, snapshot: _TerminalSnapshot | None = None) -> Table:
