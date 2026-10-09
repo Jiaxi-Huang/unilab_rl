@@ -440,6 +440,7 @@ class BaseTrainingLogger:
         reward_components: dict[str, float] | None = None,
         mean_reward: float | None = None,
         compact: bool = False,
+        source_iteration: int | None = None,
     ) -> Table:
         table = Table(
             box=box.SIMPLE_HEAVY,
@@ -449,7 +450,10 @@ class BaseTrainingLogger:
             expand=True,
             pad_edge=False,
         )
-        table.add_column("Rewards", style="white", width=24 if compact else 31, no_wrap=True)
+        header = "Rewards"
+        if source_iteration is not None:
+            header = f"Rewards [dim](iter {source_iteration})[/]"
+        table.add_column(header, style="white", width=24 if compact else 31, no_wrap=True)
         table.add_column("Value", justify="right", width=23 if compact else None, no_wrap=True)
 
         recent = list(self._reward_history if reward_history is None else reward_history)
