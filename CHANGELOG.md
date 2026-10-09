@@ -7,6 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.4.11] - 2026-10-09
+
+### Added
+
+- FlashSAC now exposes `use_whole_cycle_cuda_graph` independently from
+  `use_compile` and `compile_full_objectives`.
+- SAC learners support accelerated MPS update paths using either explicitly
+  validated BF16 AMP or device-supported `torch.compile` (#98).
+
 ### Changed
 
 - Clarified the `Perf/collector_env_step_ms` and `Perf/collection_time`
@@ -33,16 +42,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   relying on `daemon=True` or `prctl(PR_SET_PDEATHSIG)`. Entry points
   running inline in the spawner's own process (test doubles) install no
   watchdog.
-### Added
-
-- FlashSAC now exposes `use_whole_cycle_cuda_graph` independently from
-  `use_compile` and `compile_full_objectives`.
 
 ### Fixed
 
 - FlashSAC honors an explicit `use_compile=false` on NVIDIA CUDA instead of
   silently forcing Inductor compilation and whole-cycle CUDA Graph replay
   (#94).
+- Off-policy terminal logs retain the last terminal reward data and tag the
+  `Rewards` header with its source iteration (#99).
 
 ## [1.4.10] - 2026-10-09
 
