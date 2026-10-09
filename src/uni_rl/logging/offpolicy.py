@@ -214,6 +214,17 @@ def _set_backend_scalar(scalars: dict[str, Any], tag: str, value: Any) -> None:
     scalars[tag] = value
 
 
+def _backend_metric_tag(tag: str) -> str:
+    """Namespace bare learner diagnostics under the ``train/`` family.
+
+    Namespaced canonical tags (``Loss/...``, ``reward/...``, ``sampling/...``,
+    ...) pass through unchanged; ad-hoc learner diagnostics emitted by
+    algorithm code (e.g. SONIC aux losses) land under ``train/``.
+    """
+
+    return tag if "/" in tag else f"train/{tag}"
+
+
 class OffPolicyLogger(BaseTrainingLogger):
     """Rich logger for off-policy RL algorithms (SAC, etc)."""
 
@@ -309,6 +320,10 @@ class OffPolicyLogger(BaseTrainingLogger):
         self._terminal_snapshot: _TerminalSnapshot | None = None
         self._last_reward_iter: int | None = None
         self._last_reward_components_iter: int | None = None
+        self._pending_metrics: dict[str, float] = {}
+        self._pending_histograms: dict[str, Any] = {}
+        self._latest_histograms: dict[str, Any] = {}
+        self._last_histogram_step: int = -1
 
     def _format_tensorboard_message(self, tb_dir: str) -> str:
         return f"[dim]TensorBoard logging to: {tb_dir}[/]"
@@ -559,6 +574,21 @@ class OffPolicyLogger(BaseTrainingLogger):
     def update_timeout_rate(self, timeout_rate: float):
         self._timeout_rate = float(timeout_rate)
 
+    def update_metrics(self, metrics: dict[str, float]) -> None:
+        """Merge asynchronous collector diagnostics into the next log step."""
+        if not isinstance(metrics, dict):
+            raise TypeError("metrics must be a mapping")
+        normalized = {str(key): float(value) for key, value in metrics.items()}
+        self._latest_metrics.update(normalized)
+        self._pending_metrics.update(normalized)
+
+    def update_histograms(self, histograms: dict[str, Any]) -> None:
+        """Merge low-frequency collector histogram diagnostics."""
+        if not isinstance(histograms, dict):
+            raise TypeError("histograms must be a mapping")
+        for key, value in histograms.items():
+            self._pending_histograms[str(key)] = value
+
     def update_buffer_utilization(self, utilization: float):
         self._buffer_utilization = float(utilization)
 
@@ -668,8 +698,15 @@ class OffPolicyLogger(BaseTrainingLogger):
                 self._tail_throughput_env_steps -= self._throughput_env_steps
             self._tail_iteration_times.append(float(iteration_time))
             self._tail_throughput_env_steps += self._throughput_env_steps
-        if metrics:
-            self._latest_metrics.update(metrics)
+        merged_metrics = dict(self._pending_metrics)
+        merged_metrics.update(metrics or {})
+        self._pending_metrics.clear()
+        merged_histograms = dict(self._pending_histograms)
+        self._pending_histograms.clear()
+        if merged_histograms:
+            self._latest_histograms.update(merged_histograms)
+        if merged_metrics:
+            self._latest_metrics.update(merged_metrics)
         if return_mean_ep100 is not None:
             self._reward_history.append(float(return_mean_ep100))
             self._last_reward_iter = iteration
@@ -678,12 +715,12 @@ class OffPolicyLogger(BaseTrainingLogger):
             self._last_reward_components_iter = iteration
         self._status = "Training"
         scalars = self._build_backend_scalars(
-            iteration, metrics, return_mean_ep100, reward_components
+            iteration, merged_metrics, return_mean_ep100, reward_components
         )
         if self._should_log_backend(iteration):
             self._write_backend_scalars(scalars, iteration)
         self._record_terminal_sample(
-            metrics=metrics,
+            metrics=merged_metrics,
             reward=self._reward_history[-1] if self._reward_history else None,
             reward_components=reward_components,
         )
@@ -709,7 +746,7 @@ class OffPolicyLogger(BaseTrainingLogger):
             _set_backend_scalar(scalars, "Train/iteration", float(iteration))
         if metrics:
             for tag, value in metrics.items():
-                _set_backend_scalar(scalars, tag, value)
+                _set_backend_scalar(scalars, _backend_metric_tag(tag), value)
         if return_mean_ep100 is not None:
             _set_backend_scalar(scalars, "Train/mean_reward", float(return_mean_ep100))
         if reward_components:
@@ -742,6 +779,18 @@ class OffPolicyLogger(BaseTrainingLogger):
         global_step = self._total_steps if self._total_steps > 0 else iteration
         if self._tb_writer:
             self._write_tb_scalars(list(scalars.items()), global_step)
+            # Histogram logging is throttled to one snapshot per million
+            # environment steps to avoid oversized event files.
+            if self._latest_histograms and (
+                self._last_histogram_step < 0
+                or global_step - self._last_histogram_step >= 1_000_000
+            ):
+                for key, values in self._latest_histograms.items():
+                    try:
+                        self._tb_writer.add_histogram(_backend_metric_tag(key), values, global_step)
+                    except (AttributeError, TypeError, ValueError):
+                        continue
+                self._last_histogram_step = global_step
 
         if self._wandb_run:
             wandb = _load_wandb()

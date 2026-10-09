@@ -40,6 +40,31 @@ def select_min_q_log_probs(
     return torch.gather(next_q_log_probs, dim=0, index=gather_index)[0]
 
 
+def select_mean_q_log_probs(
+    next_q_values: torch.Tensor,
+    next_q_log_probs: torch.Tensor,
+) -> torch.Tensor:
+    """Mixture-of-critics TD target: average the per-critic bin distributions.
+
+    Averaging removes the pessimistic min-of-critics bias that lets a
+    dying-data replay pull both critics into a degenerate zero-value
+    solution; it trades a mild overestimation risk for collapse resistance.
+    """
+    return next_q_log_probs.exp().mean(dim=0).log()
+
+
+def select_q_log_probs(
+    next_q_values: torch.Tensor,
+    next_q_log_probs: torch.Tensor,
+    reduction: str = "min",
+) -> torch.Tensor:
+    if reduction == "min":
+        return select_min_q_log_probs(next_q_values, next_q_log_probs)
+    if reduction == "mean":
+        return select_mean_q_log_probs(next_q_values, next_q_log_probs)
+    raise ValueError(f"Unknown critic Q reduction: {reduction!r}")
+
+
 def compute_categorical_td_target(
     support: torch.Tensor,
     target_log_probs: torch.Tensor,

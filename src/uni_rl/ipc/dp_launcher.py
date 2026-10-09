@@ -33,6 +33,50 @@ _TERMINATE_TIMEOUT_S = 10.0
 _NORMAL_EXIT_GRACE_S = 600.0
 
 
+def validate_dp_launchable(devices: tuple[int, ...]) -> None:
+    """Fail fast at launch time when the host lacks any requested CUDA device.
+
+    Kept as a downstream compat helper for explicit legacy device lists; the
+    rank-local CUDA_VISIBLE_DEVICES path needs no validation.
+    """
+    import torch
+
+    device_count = torch.cuda.device_count()
+    missing = [index for index in devices if index >= device_count]
+    if missing:
+        raise ValueError(
+            f"training.devices={list(devices)} requires CUDA device index(es) {missing}, "
+            f"but torch.cuda.device_count()={device_count}"
+        )
+
+
+def resolve_dp_topology(devices_cfg: Any) -> tuple[int, ...] | None:
+    """Compat: normalize a legacy ``training.devices`` list into CUDA indices.
+
+    The off-policy stack now controls GPU topology exclusively through
+    rank-local ``CUDA_VISIBLE_DEVICES`` (see ``reject_removed_device_config``).
+    This helper remains for downstream consumers (UniLab SONIC) that still
+    resolve an explicit device list from configuration.
+    """
+    if devices_cfg is None:
+        return None
+    devices = list(devices_cfg)
+    if len(devices) == 0:
+        return None
+    normalized: list[int] = []
+    for entry in devices:
+        if isinstance(entry, bool) or not isinstance(entry, int):
+            raise ValueError(
+                f"training.devices entries must be integer CUDA indices, got {entry!r}"
+            )
+        if entry < 0:
+            raise ValueError(f"training.devices entries must be non-negative, got {entry}")
+        normalized.append(int(entry))
+    if len(set(normalized)) != len(normalized):
+        raise ValueError(f"training.devices must not contain duplicates, got {normalized}")
+    return tuple(normalized)
+
+
 def reject_removed_device_config(devices_cfg: Any) -> None:
     """Fail closed if a removed CUDA-index device list is still supplied.
 

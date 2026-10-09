@@ -2074,6 +2074,7 @@ def test_runtime_manifest_reports_inductor_cuda_graph_path(
         "critic": True,
         "actor": True,
         "device_finite_optimizer_gating": True,
+        "compile_full_objectives": False,
         "scope": "loss_tensors",
         "orchestration": "inductor_cuda_graph_trees",
     }
@@ -2084,6 +2085,7 @@ def test_runtime_manifest_reports_inductor_cuda_graph_path(
         "critic": True,
         "actor": True,
         "device_finite_optimizer_gating": True,
+        "compile_full_objectives": False,
         "scope": "update_cycle",
         "orchestration": "cuda_graph",
     }
@@ -2096,6 +2098,7 @@ def test_runtime_manifest_reports_inductor_cuda_graph_path(
         "critic": False,
         "actor": False,
         "device_finite_optimizer_gating": False,
+        "compile_full_objectives": False,
     }
 
 
@@ -2114,6 +2117,7 @@ def test_runtime_manifest_reports_mps_torch_compile_path(
         "critic": True,
         "actor": True,
         "device_finite_optimizer_gating": False,
+        "compile_full_objectives": False,
         "scope": "loss_tensors",
         "orchestration": "torch_compile",
     }

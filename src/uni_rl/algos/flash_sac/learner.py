@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import copy
+import math
 import os
 import warnings
 from collections.abc import Callable, Iterable
@@ -32,6 +33,7 @@ from uni_rl.algos.flash_sac.update import (
     compute_categorical_td_target,
     resolve_target_entropy,
     select_min_q_log_probs,
+    select_q_log_probs,
 )
 from uni_rl.offpolicy.warmup import (
     OffPolicyWarmupContext,
@@ -174,6 +176,10 @@ def _noop_normalize_parameters() -> None:
 
 class FlashSACLearner(LearnerBoilerplateMixin):
     supports_deferred_update_metrics = True
+    # Only learners that own the packed observation layout can translate the
+    # reference terms into expert actions; the generic learner must stay on
+    # replay-action BC.
+    supports_reference_bc = False
 
     def inference_startup_memory_categories(self, batch_size: int) -> dict[str, int]:
         """Expose exact inference-owned persistent scratch before collection."""
@@ -193,13 +199,18 @@ class FlashSACLearner(LearnerBoilerplateMixin):
         critic_hidden_dim: int = 256,
         actor_num_blocks: int = 2,
         critic_num_blocks: int = 2,
+        actor_embedder_dim: int | None = None,
+        critic_embedder_dim: int | None = None,
         num_atoms: int = 101,
         critic_min_v: float = -5.0,
         critic_max_v: float = 5.0,
         temp_initial_value: float = 0.01,
         temp_target_sigma: float = 0.15,
+        critic_q_reduction: str = "min",
         temp_target_entropy: float | None = None,
         actor_bc_alpha: float = 0.0,
+        actor_bc_alpha_end: float | None = None,
+        actor_bc_target: str = "replay",
         actor_noise_zeta_mu: float = 2.0,
         actor_noise_zeta_max: int = 16,
         learning_rate_init: float = 3e-4,
@@ -218,6 +229,7 @@ class FlashSACLearner(LearnerBoilerplateMixin):
         use_whole_cycle_cuda_graph: bool | None = None,
         actor_normalize_parameters: bool = True,
         critic_normalize_parameters: bool = True,
+        actor_module: nn.Module | None = None,
     ):
         self.actor_normalize_parameters = bool(actor_normalize_parameters)
         self.critic_normalize_parameters = bool(critic_normalize_parameters)
@@ -225,10 +237,33 @@ class FlashSACLearner(LearnerBoilerplateMixin):
         self.gamma = gamma
         self.tau = tau
         self.n_step = n_step
+        if actor_bc_target not in ("replay", "reference"):
+            raise ValueError(
+                f"actor_bc_target must be 'replay' or 'reference', got {actor_bc_target!r}"
+            )
+        if actor_bc_alpha < 0.0 or not math.isfinite(actor_bc_alpha):
+            raise ValueError("actor_bc_alpha must be a finite non-negative value")
+        if actor_bc_alpha_end is not None and (
+            not math.isfinite(actor_bc_alpha_end) or actor_bc_alpha_end < 0.0
+        ):
+            raise ValueError("actor_bc_alpha_end must be None or a finite non-negative value")
+        if actor_bc_target == "reference" and not self.supports_reference_bc:
+            raise ValueError(
+                "actor_bc_target='reference' requires a learner that owns the packed "
+                "reference layout (e.g. SonicFlashSACLearner)"
+            )
         self.actor_bc_alpha = actor_bc_alpha
+        self.actor_bc_alpha_end = actor_bc_alpha_end
+        self.actor_bc_target = actor_bc_target
+        self._actor_bc_anneal_steps = max(float(learning_rate_decay_steps), 1.0)
         self.obs_dim = obs_dim
         self.critic_obs_dim = critic_obs_dim
         self.action_dim = action_dim
+        if critic_q_reduction not in ("min", "mean"):
+            raise ValueError(
+                f"critic_q_reduction must be 'min' or 'mean', got {critic_q_reduction!r}"
+            )
+        self.critic_q_reduction = critic_q_reduction
         self.update_count = 0
         self._device_type = self.device.type
         self._nvidia_cuda = self._device_type == "cuda" and not is_hip_runtime()
@@ -261,15 +296,21 @@ class FlashSACLearner(LearnerBoilerplateMixin):
             device_gated=self._device_type == "cuda" and self.use_compile,
         )
         self._gradient_sync: Callable[[Iterable[torch.Tensor]], None] | None = None
-        self.actor = FlashSACActor(
-            num_blocks=actor_num_blocks,
-            input_dim=obs_dim,
-            hidden_dim=actor_hidden_dim,
-            action_dim=action_dim,
-            noise_zeta_mu=actor_noise_zeta_mu,
-            noise_zeta_max=actor_noise_zeta_max,
-            device=self.device,
+        self.actor = (
+            actor_module.to(self.device)
+            if actor_module is not None
+            else FlashSACActor(
+                num_blocks=actor_num_blocks,
+                input_dim=obs_dim,
+                hidden_dim=actor_hidden_dim,
+                action_dim=action_dim,
+                noise_zeta_mu=actor_noise_zeta_mu,
+                noise_zeta_max=actor_noise_zeta_max,
+                embedder_dim=actor_embedder_dim,
+                device=self.device,
+            )
         )
+        self.actor.to(self.device)
         self.critic = FlashSACDoubleCritic(
             num_blocks=critic_num_blocks,
             input_dim=self.critic_obs_dim + action_dim,
@@ -277,6 +318,7 @@ class FlashSACLearner(LearnerBoilerplateMixin):
             num_bins=num_atoms,
             min_v=critic_min_v,
             max_v=critic_max_v,
+            embedder_dim=critic_embedder_dim,
             device=self.device,
         )
         self.target_critic = copy.deepcopy(self.critic).to(self.device)
@@ -316,7 +358,14 @@ class FlashSACLearner(LearnerBoilerplateMixin):
             if self._should_use_grad_scaler(self.use_amp, self.device.type, self._amp_dtype)
             else None
         )
-        lr_peak = learning_rate_peak if learning_rate_peak > 0 else actor_lr
+        # Keep all public learning-rate knobs effective.  Per-optimizer rates
+        # define the peaks; the legacy learning_rate_peak acts as an optional
+        # shared cap (and fallback), rather than silently replacing both rates.
+        shared_cap = learning_rate_peak if learning_rate_peak > 0 else float("inf")
+        actor_peak = min(actor_lr if actor_lr > 0 else shared_cap, shared_cap)
+        critic_peak = min(critic_lr if critic_lr > 0 else shared_cap, shared_cap)
+        if actor_peak <= 0.0 or critic_peak <= 0.0:
+            raise ValueError("FlashSAC actor/critic learning rates must be positive")
         # Fused Adam collapses the per-parameter host loop (and its per-param
         # blocking `.item()` syncs on MPS) into one kernel; `capturable`
         # stays CUDA-only.
@@ -324,28 +373,46 @@ class FlashSACLearner(LearnerBoilerplateMixin):
         optimizer_kwargs: dict[str, Any] = {"fused": _fused}
         if _fused and self.device.type == "cuda":
             optimizer_kwargs["capturable"] = True
-        self.actor_optimizer = optim.Adam(self.actor.parameters(), lr=lr_peak, **optimizer_kwargs)
-        self.critic_optimizer = optim.Adam(self.critic.parameters(), lr=lr_peak, **optimizer_kwargs)
+        self.actor_optimizer = optim.Adam(
+            self.actor.parameters(), lr=actor_peak, **optimizer_kwargs
+        )
+        self.critic_optimizer = optim.Adam(
+            self.critic.parameters(), lr=critic_peak, **optimizer_kwargs
+        )
         self.temperature_optimizer = optim.Adam(
-            self.temperature.parameters(), lr=lr_peak, **optimizer_kwargs
+            self.temperature.parameters(), lr=actor_peak, **optimizer_kwargs
         )
         self._pending_actor_metric_values: torch.Tensor | None = None
 
         scheduler_fn = build_lr_lambda(
             init_lr=learning_rate_init,
-            peak_lr=lr_peak,
+            peak_lr=actor_peak,
             end_lr=learning_rate_end,
             warmup_steps=learning_rate_warmup_steps,
             decay_steps=learning_rate_decay_steps,
         )
         self.actor_scheduler = optim.lr_scheduler.LambdaLR(self.actor_optimizer, scheduler_fn)
-        self.critic_scheduler = optim.lr_scheduler.LambdaLR(self.critic_optimizer, scheduler_fn)
+        critic_schedule_fn = build_lr_lambda(
+            init_lr=learning_rate_init,
+            peak_lr=critic_peak,
+            end_lr=learning_rate_end,
+            warmup_steps=learning_rate_warmup_steps,
+            decay_steps=learning_rate_decay_steps,
+        )
+        self.critic_scheduler = optim.lr_scheduler.LambdaLR(
+            self.critic_optimizer, critic_schedule_fn
+        )
         self.temperature_scheduler = optim.lr_scheduler.LambdaLR(
             self.temperature_optimizer, scheduler_fn
         )
 
-        self._lr_schedule_fn = scheduler_fn
-        self._lr_peak = lr_peak
+        # Per-optimizer peak rates (actor/critic may differ); the update-cycle
+        # LR staging below reads the owning optimizer's peak and schedule.
+        self._lr_peaks: dict[int, float] = {
+            id(self.actor_optimizer): actor_peak,
+            id(self.critic_optimizer): critic_peak,
+            id(self.temperature_optimizer): actor_peak,
+        }
         self._pending_cycle_critic_metric_values: torch.Tensor | None = None
         self._pending_cycle_metric_values: torch.Tensor | None = None
         self._critic_update_finite = torch.ones((), device=self.device)
@@ -589,6 +656,10 @@ class FlashSACLearner(LearnerBoilerplateMixin):
             return cast(torch.Tensor, normalizer(obs, update=False))
         return cast(torch.Tensor, normalizer(obs, update=False))
 
+    def normalize_observations(self, obs: torch.Tensor, *, update: bool = False) -> torch.Tensor:
+        """Apply the learner's observation normalization contract."""
+        return self._maybe_normalize_obs(obs, update=update)
+
     def update_reward_stats(
         self,
         rewards: torch.Tensor,
@@ -610,7 +681,9 @@ class FlashSACLearner(LearnerBoilerplateMixin):
         pred_log_probs: torch.Tensor,
         gamma: float,
     ) -> torch.Tensor:
-        next_q_log_probs = select_min_q_log_probs(next_q_values, next_q_log_probs_full)
+        next_q_log_probs = select_q_log_probs(
+            next_q_values, next_q_log_probs_full, self.critic_q_reduction
+        )
         target_probs = compute_categorical_td_target(
             support=support,
             target_log_probs=next_q_log_probs,
@@ -622,6 +695,20 @@ class FlashSACLearner(LearnerBoilerplateMixin):
         )
         return cast(torch.Tensor, -(target_probs.unsqueeze(0) * pred_log_probs).sum(dim=-1).mean())
 
+    def _effective_actor_bc_alpha(self) -> float:
+        """Return the current BC weight, linearly annealed to ``actor_bc_alpha_end``.
+
+        The schedule is anchored to ``actor_scheduler.last_epoch`` so eager and
+        CUDA-graph update paths stay in lockstep without extra state.
+        """
+        if self.actor_bc_alpha <= 0.0:
+            return 0.0
+        if self.actor_bc_alpha_end is None or self.actor_bc_alpha_end == self.actor_bc_alpha:
+            return self.actor_bc_alpha
+        last_epoch = float(getattr(self.actor_scheduler, "last_epoch", 0.0))
+        progress = min(max(last_epoch, 0.0) / self._actor_bc_anneal_steps, 1.0)
+        return self.actor_bc_alpha + progress * (self.actor_bc_alpha_end - self.actor_bc_alpha)
+
     def _actor_loss_tensors(
         self,
         log_probs: torch.Tensor,
@@ -629,14 +716,43 @@ class FlashSACLearner(LearnerBoilerplateMixin):
         actions: torch.Tensor,
         expert_actions: torch.Tensor,
         temp_value: torch.Tensor,
+        bc_mask: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        min_q = torch.min(q_values[0], q_values[1])
+        if self.critic_q_reduction == "mean":
+            min_q = q_values.mean(dim=0)
+        else:
+            min_q = torch.min(q_values[0], q_values[1])
         actor_loss = (temp_value.detach() * log_probs - min_q).mean()
-        if self.actor_bc_alpha > 0:
-            bc_loss = torch.mean((actions - expert_actions) ** 2)
-            actor_loss = actor_loss + self.actor_bc_alpha * min_q.abs().mean().detach() * bc_loss
+        alpha = self._effective_actor_bc_alpha()
+        if alpha > 0.0:
+            squared = (actions - expert_actions) ** 2
+            if bc_mask is not None:
+                weighted = squared.flatten(1).mean(dim=1) * bc_mask.reshape(-1)
+                bc_loss = weighted.sum() / bc_mask.sum().clamp_min(1.0)
+            else:
+                bc_loss = squared.mean()
+            actor_loss = actor_loss + alpha * min_q.abs().mean().detach() * bc_loss
         entropy = -log_probs.detach().mean()
         return actor_loss, entropy
+
+    @staticmethod
+    def _actor_diagnostic_metrics(
+        *, actions: torch.Tensor, actor_info: dict[str, torch.Tensor], q_values: torch.Tensor
+    ) -> dict[str, float]:
+        """Return compact scalar diagnostics for TensorBoard ``train/`` metrics."""
+        metrics: dict[str, float] = {
+            "action_mean": float(actions.detach().mean().cpu()),
+            "action_std": float(actions.detach().std(unbiased=False).cpu()),
+            "q_mean": float(q_values.detach().mean().cpu()),
+            "q_std": float(q_values.detach().std(unbiased=False).cpu()),
+        }
+        mean = actor_info.get("mean")
+        std = actor_info.get("std")
+        if mean is not None:
+            metrics["policy_mean"] = float(mean.detach().mean().cpu())
+        if std is not None:
+            metrics["policy_std"] = float(std.detach().mean().cpu())
+        return metrics
 
     def _critic_objective_tensors(
         self,
@@ -754,14 +870,16 @@ class FlashSACLearner(LearnerBoilerplateMixin):
             )
             return {}
         metric_names: tuple[str, ...] = ("Loss/critic",)
-        metric_tensors: tuple[torch.Tensor, ...] = (critic_loss,)
+        metric_tensors: tuple[str, ...] = (critic_loss,)
         if self.reward_normalizer is not None:
             metric_names = (*metric_names, "Train/reward_scale_std")
             metric_tensors = (*metric_tensors, reward_scale_std)
-        return self._read_metric_tensors(
+        metrics = self._read_metric_tensors(
             metric_names,
             metric_tensors,
         )
+        metrics["critic_lr"] = float(self.critic_optimizer.param_groups[0]["lr"])
+        return metrics
 
     def update_actor(
         self,
@@ -824,7 +942,7 @@ class FlashSACLearner(LearnerBoilerplateMixin):
                 [tensor.detach().reshape(()) for tensor in actor_metric_tensors]
             )
             return {}
-        return self._read_metric_tensors(
+        metrics = self._read_metric_tensors(
             (
                 "Loss/actor",
                 "Loss/entropy",
@@ -833,6 +951,8 @@ class FlashSACLearner(LearnerBoilerplateMixin):
             ),
             actor_metric_tensors,
         )
+        metrics["actor_lr"] = float(self.actor_optimizer.param_groups[0]["lr"])
+        return metrics
 
     @staticmethod
     def _read_metric_tensors(
@@ -847,7 +967,7 @@ class FlashSACLearner(LearnerBoilerplateMixin):
         self._pending_actor_metric_values = None
         if values is None:
             return {}
-        return {
+        metrics = {
             name: float(value)
             for name, value in zip(
                 (
@@ -860,6 +980,8 @@ class FlashSACLearner(LearnerBoilerplateMixin):
                 strict=True,
             )
         }
+        metrics["actor_lr"] = float(self.actor_optimizer.param_groups[0]["lr"])
+        return metrics
 
     def read_deferred_cycle_metrics(self) -> dict[str, float]:
         values = self._pending_cycle_metric_values
@@ -964,7 +1086,9 @@ class FlashSACLearner(LearnerBoilerplateMixin):
             if zero:
                 tensor.zero_()
                 continue
-            lr = self._lr_peak * self._lr_schedule_fn(scheduler.last_epoch + offset)
+            lr = self._lr_peaks[id(_optimizer)] * scheduler.lr_lambdas[0](
+                scheduler.last_epoch + offset
+            )
             tensor.fill_(float(lr))
 
     def _advance_update_cycle_schedulers(self) -> None:

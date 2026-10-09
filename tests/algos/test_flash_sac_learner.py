@@ -82,6 +82,18 @@ def test_flashsac_learner_declares_inference_startup_scratch():
     }
 
 
+def test_flashsac_learner_honors_distinct_actor_and_critic_learning_rates() -> None:
+    learner = _make_small_learner(
+        actor_lr=1.0e-4,
+        critic_lr=2.0e-4,
+        learning_rate_init=3.0e-4,
+        learning_rate_peak=3.0e-4,
+        learning_rate_end=5.0e-5,
+    )
+    assert learner.actor_optimizer.param_groups[0]["lr"] == pytest.approx(1.0e-4)
+    assert learner.critic_optimizer.param_groups[0]["lr"] == pytest.approx(2.0e-4)
+
+
 def test_flashsac_cuda_adam_optimizers_are_capturable(monkeypatch) -> None:
     if not torch.cuda.is_available():
         pytest.skip("CUDA-only optimizer kwargs require a CUDA-enabled torch build")
@@ -555,6 +567,7 @@ def test_flashsac_deferred_actor_metrics_read_once_at_cycle_end() -> None:
         "Loss/entropy",
         "Policy/temperature",
         "Loss/temperature",
+        "actor_lr",
     }
 
 
@@ -822,3 +835,28 @@ def test_flashsac_update_cycle_raw_graph_replays_with_stable_inputs_and_metrics(
     assert set(first_metrics) == set(second_metrics)
     assert first_metrics
     assert all(math.isfinite(value) for value in second_metrics.values())
+
+
+def test_flashsac_learner_widened_embedders_update_and_round_trip():
+    learner = _make_small_learner(actor_embedder_dim=24, critic_embedder_dim=24)
+    assert learner.actor.embedder.widen_width == 24
+    assert learner.critic.embedder.widen_width == 24
+
+    batch = _make_small_batch()
+    critic_metrics = learner.update_critic(batch)
+    actor_metrics = learner.update_actor(batch)
+    assert torch.isfinite(torch.tensor(critic_metrics["Loss/critic"]))
+    assert torch.isfinite(torch.tensor(actor_metrics["Loss/actor"]))
+
+    restored = _make_small_learner(actor_embedder_dim=24, critic_embedder_dim=24)
+    restored.load_state_dict(learner.get_state_dict())
+    torch.testing.assert_close(
+        restored.actor.explore(batch["obs"], deterministic=True),
+        learner.actor.explore(batch["obs"], deterministic=True),
+    )
+    # The widened stages must not leak into legacy-layout checkpoints: a
+    # default learner keeps the single-projection state_dict keys.
+    legacy = _make_small_learner()
+    legacy_keys = set(legacy.actor.embedder.state_dict())
+    widen_keys = set(learner.actor.embedder.state_dict())
+    assert legacy_keys <= widen_keys

@@ -185,6 +185,8 @@ class DoubleBufferOffPolicyRunner(OffPolicyRunner):
         dp_sync: DpParameterSync | None = None,
         inference_request_timeout_sec: float | None = None,
         learner_prepare_hook: Callable[[Any, OffPolicyWarmupContext], None] | None = None,
+        short_episode_threshold: int = 0,
+        short_episode_quota: float = 0.2,
         backend_device_binder: Callable[[str], str | None] | None = None,
         replay_pipeline_factory: Callable[..., GPUResidentReplayPipeline] | None = None,
         target_frequency: int = 1,
@@ -357,6 +359,16 @@ class DoubleBufferOffPolicyRunner(OffPolicyRunner):
         self.collector_metrics_interval = tensor_runtime_settings.collector_metrics_interval
         self.replay_ingress_depth = tensor_runtime_settings.replay_ingress_depth
         self.replay_ingress_slot_rows = tensor_runtime_settings.replay_ingress_slot_rows
+        # Short-episode replay throttling: episodes that die before
+        # ``short_episode_threshold`` steps are capped at a per-cycle write
+        # quota, so a collapsed policy cannot flood the replay with
+        # two-step terminal transitions. threshold <= 0 disables it.
+        if isinstance(short_episode_threshold, bool) or short_episode_threshold < 0:
+            raise ValueError("short_episode_threshold must be a non-negative int")
+        if not 0.0 < short_episode_quota <= 1.0:
+            raise ValueError("short_episode_quota must be within (0, 1]")
+        self.short_episode_threshold = int(short_episode_threshold)
+        self.short_episode_quota = float(short_episode_quota)
         # Backend-owned process-device binder forwarded to the collector
         # subprocess (e.g. mjwarp); None for backends that need no binding.
         self.backend_device_binder = backend_device_binder
@@ -499,6 +511,9 @@ class DoubleBufferOffPolicyRunner(OffPolicyRunner):
             "actor": compile_enabled,
             "device_finite_optimizer_gating": not bool(
                 getattr(self.learner, "_host_finite_checks", True)
+            ),
+            "compile_full_objectives": bool(
+                getattr(self.learner, "compile_full_objectives", False)
             ),
         }
         if bool(getattr(self.learner, "use_update_cycle", False)):
@@ -1146,7 +1161,7 @@ class DoubleBufferOffPolicyRunner(OffPolicyRunner):
         if actor_adapter is not None and actor_adapter.actor_context_from_obs is not None:
             actor_context = actor_adapter.actor_context_from_obs(actor_obs_device, self.obs_dim)
         if self.obs_normalization:
-            actor_obs = self.learner.obs_normalizer(actor_obs, update=False)
+            actor_obs = self.learner.normalize_observations(actor_obs, update=False)
         forward_start_ns = time.perf_counter_ns()
         cuda_forward_events: tuple[torch.cuda.Event, torch.cuda.Event] | None = None
         if device.type == "cuda":
@@ -1750,6 +1765,8 @@ class DoubleBufferOffPolicyRunner(OffPolicyRunner):
                 "backend_device_binder": self.backend_device_binder,
                 "learner_coordination": self._learner_coordination,
                 "learner_pid": os.getpid(),
+                "short_episode_threshold": self.short_episode_threshold,
+                "short_episode_quota": self.short_episode_quota,
             }
             # The collector may finish env construction quickly while the
             # learner is still in its startup sleep. It must observe a healthy

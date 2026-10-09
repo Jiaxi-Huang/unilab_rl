@@ -119,6 +119,9 @@ def build_flashsac_double_buffer_runner(
         "critic_hidden_dim": cfg.algo.critic_hidden_dim,
         "actor_num_blocks": cfg.algo.algo_params.actor_num_blocks,
         "critic_num_blocks": cfg.algo.algo_params.critic_num_blocks,
+        "actor_embedder_dim": getattr(cfg.algo.algo_params, "actor_embedder_dim", None),
+        "critic_q_reduction": str(getattr(cfg.algo.algo_params, "critic_q_reduction", "min")),
+        "critic_embedder_dim": getattr(cfg.algo.algo_params, "critic_embedder_dim", None),
         "num_atoms": cfg.algo.num_atoms,
         "critic_min_v": cfg.algo.algo_params.critic_min_v,
         "critic_max_v": cfg.algo.algo_params.critic_max_v,
@@ -190,4 +193,7 @@ def build_flashsac_double_buffer_runner(
             min_weight=float(_algo_param(cfg.algo, "replay_min_weight", 0.1)),
             num_buckets=int(_algo_param(cfg.algo, "replay_num_buckets", 2000)),
         ),
+        inference_request_timeout_sec=cfg.training.inference_request_timeout_sec,
+        short_episode_threshold=int(getattr(cfg.algo.algo_params, "short_episode_threshold", 0)),
+        short_episode_quota=float(getattr(cfg.algo.algo_params, "short_episode_quota", 0.2)),
     )

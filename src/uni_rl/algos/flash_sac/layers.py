@@ -15,6 +15,20 @@ def safe_tanh_log_det_jacobian(x: torch.Tensor) -> torch.Tensor:
     return cast(torch.Tensor, 2.0 * (math.log(2.0) - x - F.softplus(-2.0 * x)))
 
 
+def sample_normal_tanh(
+    mean: torch.Tensor, std: torch.Tensor
+) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
+        # ``std`` is positive by construction (exp of bounded log_std). The
+        # distribution's generic validation performs a GPU-to-host truth check,
+        # which CUDA forbids while this actor is captured into an optimizer graph.
+        dist = torch.distributions.Normal(mean, std, validate_args=False)
+        raw_action = dist.rsample()
+        tanh_action = torch.tanh(raw_action)
+        log_prob = dist.log_prob(raw_action)
+        log_prob = log_prob - safe_tanh_log_det_jacobian(raw_action)
+        log_prob = log_prob.sum(dim=-1)
+        return tanh_action, {"log_prob": log_prob, "mean": mean, "std": std}
+
 class UnitLinear(nn.Module):
     """Linear layer with post-step weight normalization."""
 
@@ -25,6 +39,11 @@ class UnitLinear(nn.Module):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return cast(torch.Tensor, self.w(x))
+
+    @property
+    def weight(self) -> torch.Tensor:
+        """Compatibility view matching ``nn.Linear.weight``."""
+        return self.w.weight
 
     def normalize_parameters(self) -> None:
         with torch.no_grad():
@@ -86,13 +105,36 @@ class UnitRMSNorm(nn.Module):
 
 
 class FlashSACEmbedder(nn.Module):
-    def __init__(self, input_dim: int, hidden_dim: int):
+    """Input-normalized projection with an optional widened first stage.
+
+    ``widen_dim=None`` keeps the released single-projection layout (identical
+    state_dict keys and shapes). A positive ``widen_dim`` expands the entry to
+    ``input -> widen -> hidden`` so high-dimensional observations enter through
+    an expansion instead of an immediate rank cut, mirroring the wide first
+    layer of conventional MLP trunks.
+    """
+
+    def __init__(self, input_dim: int, hidden_dim: int, widen_dim: int | None = None):
         super().__init__()
         self.norm = UnitBatchNorm(input_dim)
-        self.w = UnitLinear(input_dim, hidden_dim)
+        if widen_dim is None or widen_dim <= 0:
+            self.w = UnitLinear(input_dim, hidden_dim)
+            self.widen_norm = None
+            self.widen_out = None
+        else:
+            self.w = UnitLinear(input_dim, int(widen_dim))
+            self.widen_norm = UnitBatchNorm(int(widen_dim))
+            self.widen_out = UnitLinear(int(widen_dim), hidden_dim)
+
+    @property
+    def widen_width(self) -> int | None:
+        return None if self.widen_out is None else int(self.w.w.weight.shape[0])
 
     def forward(self, x: torch.Tensor, training: bool) -> torch.Tensor:
-        return cast(torch.Tensor, self.w(self.norm(x, training=training)))
+        x = self.w(self.norm(x, training=training))
+        if self.widen_norm is not None:
+            x = self.widen_out(F.silu(self.widen_norm(x, training=training)))
+        return cast(torch.Tensor, x)
 
 
 class FlashSACBlock(nn.Module):
@@ -139,19 +181,26 @@ class NormalTanhPolicy(nn.Module):
         std = torch.exp(log_std)
         return mean, std
 
+    @staticmethod
+    def sample_from_mean_std(
+        mean: torch.Tensor,
+        std: torch.Tensor,
+        *,
+        action_scale: torch.Tensor | None = None,
+        action_bias: torch.Tensor | None = None,
+    ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
+        """Shared normalized-tanh Gaussian semantics for custom backbones."""
+        action, info = sample_normal_tanh(mean, std)
+        if action_scale is not None or action_bias is not None:
+            scale = torch.ones(mean.shape[-1], device=mean.device, dtype=mean.dtype) if action_scale is None else action_scale
+            bias = torch.zeros(mean.shape[-1], device=mean.device, dtype=mean.dtype) if action_bias is None else action_bias
+            action = action * scale + bias
+            info["log_prob"] = info["log_prob"] - torch.log(scale.abs() + 1e-6).sum()
+        return action, info
+
     def forward(self, x: torch.Tensor) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
         mean, std = self.get_mean_and_std(x)
-        # ``std`` is positive by construction (exp of bounded log_std). The
-        # distribution's generic validation performs a GPU-to-host truth check,
-        # which CUDA forbids while this actor is captured into an optimizer graph.
-        dist = torch.distributions.Normal(mean, std, validate_args=False)
-        raw_action = dist.rsample()
-        tanh_action = torch.tanh(raw_action)
-        log_prob = dist.log_prob(raw_action)
-        log_prob = log_prob - safe_tanh_log_det_jacobian(raw_action)
-        log_prob = log_prob.sum(dim=-1)
-        return tanh_action, {"log_prob": log_prob, "mean": mean, "std": std}
-
+        return self.sample_from_mean_std(mean, std)
 
 class EnsembleUnitLinear(nn.Module):
     def __init__(self, num_ensemble: int, input_dim: int, output_dim: int):
@@ -227,13 +276,35 @@ class EnsembleUnitRMSNorm(nn.Module):
 
 
 class EnsembleFlashSACEmbedder(nn.Module):
-    def __init__(self, num_ensemble: int, input_dim: int, hidden_dim: int):
+    """Ensemble twin of :class:`FlashSACEmbedder`, including widen support."""
+
+    def __init__(
+        self,
+        num_ensemble: int,
+        input_dim: int,
+        hidden_dim: int,
+        widen_dim: int | None = None,
+    ):
         super().__init__()
         self.norm = EnsembleUnitBatchNorm(num_ensemble, input_dim)
-        self.w = EnsembleUnitLinear(num_ensemble, input_dim, hidden_dim)
+        if widen_dim is None or widen_dim <= 0:
+            self.w = EnsembleUnitLinear(num_ensemble, input_dim, hidden_dim)
+            self.widen_norm = None
+            self.widen_out = None
+        else:
+            self.w = EnsembleUnitLinear(num_ensemble, input_dim, int(widen_dim))
+            self.widen_norm = EnsembleUnitBatchNorm(num_ensemble, int(widen_dim))
+            self.widen_out = EnsembleUnitLinear(num_ensemble, int(widen_dim), hidden_dim)
+
+    @property
+    def widen_width(self) -> int | None:
+        return None if self.widen_out is None else int(self.w.weight.shape[1])
 
     def forward(self, x: torch.Tensor, training: bool) -> torch.Tensor:
-        return cast(torch.Tensor, self.w(self.norm(x, training=training)))
+        x = self.w(self.norm(x, training=training))
+        if self.widen_norm is not None:
+            x = self.widen_out(F.silu(self.widen_norm(x, training=training)))
+        return cast(torch.Tensor, x)
 
 
 class EnsembleFlashSACBlock(nn.Module):

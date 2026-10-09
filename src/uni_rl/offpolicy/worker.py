@@ -189,7 +189,10 @@ def _wait_for_inference_tick(
                 return False
             if learner_coordination is None:
                 if time.monotonic() - last_progress_change >= timeout:
-                    raise TimeoutError(f"Timed out waiting for off-policy inference tick {tick_id}")
+                    raise TimeoutError(
+                        f"Timed out waiting for off-policy inference tick {tick_id}"
+                        f" (timeout={timeout}s)"
+                    )
                 continue
             phase, progress = learner_coordination.snapshot()
             if not learner_pid_is_alive(learner_pid):
@@ -211,7 +214,8 @@ def _wait_for_inference_tick(
             ):
                 raise TimeoutError(
                     "Off-policy learner request coordination stalled while waiting "
-                    f"for inference tick {tick_id} (learner process is alive)"
+                    f"for inference tick {tick_id} (learner process is alive, "
+                    f"timeout={timeout}s)"
                 )
             continue
         if received_tick != int(tick_id):
@@ -255,6 +259,10 @@ def off_policy_collector_fn(
     backend_device_binder=None,
     learner_coordination: LearnerCoordinationState | None = None,
     learner_pid: int | None = None,
+    adaptive_histogram_interval: int = 0,
+    short_episode_threshold: int = 0,
+    short_episode_quota: float = 0.2,
+    inference_tick_timeout: float = 30.0,
 ):
     """Entry point for the off-policy collector subprocess.
 
@@ -287,6 +295,10 @@ def off_policy_collector_fn(
         backend_device_binder=backend_device_binder,
         learner_coordination=learner_coordination,
         learner_pid=learner_pid,
+        adaptive_histogram_interval=adaptive_histogram_interval,
+        short_episode_threshold=short_episode_threshold,
+        short_episode_quota=short_episode_quota,
+        inference_tick_timeout=inference_tick_timeout,
     )
 
 
@@ -316,6 +328,10 @@ def _run_collector(
     backend_device_binder=None,
     learner_coordination=None,
     learner_pid=None,
+    adaptive_histogram_interval: int = 0,
+    short_episode_threshold: int = 0,
+    short_episode_quota: float = 0.2,
+    inference_tick_timeout: float = 30.0,
 ):
     # Spawn subprocesses do not inherit the parent's adapter registrations;
     # import the configured modules so registration side effects run here too.
@@ -434,6 +450,7 @@ def _run_collector(
     max_publication_lag_since_metric = 0
     final_tensor_metrics_flushed = False
     pending_tensor_metric_flush: TensorMetricFlush | None = None
+    termination_reason_counts: defaultdict[str, int] = defaultdict(int)
 
     def enqueue_collector_metrics(
         *,
@@ -467,6 +484,27 @@ def _run_collector(
         }
         if components_mean:
             msg["reward_components"] = components_mean
+        if termination_reason_counts:
+            denominator = max(done_count_window, 1)
+            msg["termination_reason_rates"] = {
+                name: count / denominator for name, count in termination_reason_counts.items()
+            }
+            msg["termination_reason_counts"] = dict(termination_reason_counts)
+            termination_reason_counts.clear()
+        if isinstance(adaptive_sampling, dict):
+            sampling_scalars = adaptive_sampling.get("scalars")
+            if isinstance(sampling_scalars, dict):
+                msg["adaptive_sampling"] = {
+                    "scalars": {
+                        str(name): float(value) for name, value in sampling_scalars.items()
+                    }
+                }
+            sampling_histograms = adaptive_sampling.get("histograms")
+            if isinstance(sampling_histograms, dict):
+                msg.setdefault("adaptive_sampling", {})["histograms"] = {
+                    str(name): np.asarray(value, dtype=np.float32)
+                    for name, value in sampling_histograms.items()
+                }
         if timing_counts:
             msg["collector_timing_ms"] = {
                 key: total / timing_counts[key]
@@ -592,6 +630,7 @@ def _run_collector(
     info_dict = state.info
     prev_dones_np = np.zeros(num_envs, dtype=np.float32)
     prev_dones_t = torch.zeros(num_envs, dtype=torch.float32, device=state.obs["obs"].device)
+    episode_step_count = np.zeros(num_envs, dtype=np.int64)
     import time as _time
 
     runtime_manifest = {
@@ -722,6 +761,7 @@ def _run_collector(
                 stop_event,
                 learner_coordination=learner_coordination,
                 learner_pid=learner_pid,
+                timeout=inference_tick_timeout,
             ):
                 break
             actions, policy_version = inference_slot.consume_action(
@@ -777,6 +817,7 @@ def _run_collector(
             cycle_timing_ms.update(extract_env_step_breakdown_timing_ms(state.info))
 
             # Extract data as numpy
+            adaptive_sampling = state.info.get("adaptive_sampling")
             if tensor_collector:
                 assert obs_t is not None
                 assert critic_t is not None
@@ -821,6 +862,52 @@ def _run_collector(
                 timeout_mask_np = truncated_np > 0.5
                 done_count_window += int(np.count_nonzero(done_mask_np))
                 timeout_count_window += int(np.count_nonzero(timeout_mask_np))
+
+                # SONIC environments expose a stable reason mask. Keep this
+                # diagnostic path optional so generic tasks retain their
+                # existing metrics contract.
+                reason_mask = state.info.get("termination_reason_mask")
+                reason_names = state.info.get("termination_reason_names")
+                if reason_mask is not None and reason_names is not None:
+                    mask = np.asarray(reason_mask, dtype=bool)
+                    if (
+                        mask.ndim == 2
+                        and mask.shape[0] == num_envs
+                        and mask.shape[1] == len(reason_names)
+                    ):
+                        mask &= done_mask_np[:, None]
+                        for index, name in enumerate(reason_names):
+                            termination_reason_counts[str(name)] += int(
+                                np.count_nonzero(mask[:, index])
+                            )
+
+                episode_step_count += 1
+                # Short-episode replay throttle: cap how many sub-threshold
+                # terminal rows enter the replay per cycle so a collapsed
+                # policy cannot flood the buffer with two-step deaths.
+                write_keep_mask = np.ones(num_envs, dtype=bool)
+                if short_episode_threshold > 0:
+                    short_done = done_mask_np & (episode_step_count <= short_episode_threshold)
+                    n_short = int(np.count_nonzero(short_done))
+                    quota_n = max(1, int(round(num_envs * short_episode_quota)))
+                    if n_short > quota_n:
+                        keep_ids = np.random.choice(np.flatnonzero(short_done), quota_n, replace=False)
+                        write_keep_mask &= ~short_done
+                        write_keep_mask[keep_ids] = True
+                episode_step_count[done_mask_np] = 0
+
+                if (
+                    adaptive_sampling is not None
+                    and adaptive_histogram_interval > 0
+                    and inference_tick % adaptive_histogram_interval == 0
+                ):
+                    _, sampling_histograms = env.command_manager.get_diagnostics(
+                        include_histograms=True
+                    )
+                    if sampling_histograms:
+                        adaptive_sampling = dict(adaptive_sampling)
+                        adaptive_sampling["histograms"] = sampling_histograms
+
                 terminal_contract = resolve_terminal_observation_contract(
                     next_obs_batch_size=next_obs_np.shape[0],
                     final_observation=state.final_observation,
@@ -887,24 +974,54 @@ def _run_collector(
                 assert combined_dones is not None
                 assert truncated_np is not None
                 assert terminal_contract is not None
-                published = replay_add(
-                    torch.from_numpy(obs_np),
-                    torch.from_numpy(actions_np),
-                    torch.from_numpy(rewards_np),
-                    torch.from_numpy(next_obs_np),
-                    torch.from_numpy(combined_dones),
-                    torch.from_numpy(truncated_np),
-                    terminal_mask=torch.from_numpy(terminal_contract.terminal_mask),
-                    terminal_next_obs=(
-                        torch.from_numpy(terminal_contract.terminal_obs)
+                # The throttle only selects rows for this replay write; the
+                # loop's per-env arrays keep their full width for the next
+                # cycle.
+                if write_keep_mask.all():
+                    add_obs, add_actions = obs_np, actions_np
+                    add_rewards, add_next_obs = rewards_np, next_obs_np
+                    add_dones, add_truncated = combined_dones, truncated_np
+                    add_critic, add_next_critic = critic_np, next_critic_np
+                    add_mask = terminal_contract.terminal_mask
+                    add_term_obs = terminal_contract.terminal_obs
+                    add_term_critic = terminal_contract.terminal_critic
+                else:
+                    add_obs, add_actions = obs_np[write_keep_mask], actions_np[write_keep_mask]
+                    add_rewards = rewards_np[write_keep_mask]
+                    add_next_obs = next_obs_np[write_keep_mask]
+                    add_dones = combined_dones[write_keep_mask]
+                    add_truncated = truncated_np[write_keep_mask]
+                    add_critic = critic_np[write_keep_mask]
+                    add_next_critic = next_critic_np[write_keep_mask]
+                    add_mask = terminal_contract.terminal_mask[write_keep_mask]
+                    add_term_obs = (
+                        terminal_contract.terminal_obs[write_keep_mask]
                         if terminal_contract.terminal_obs is not None
                         else None
-                    ),
-                    critic=torch.from_numpy(critic_np),
-                    next_critic=torch.from_numpy(next_critic_np),
-                    terminal_next_critic=(
-                        torch.from_numpy(terminal_contract.terminal_critic)
+                    )
+                    add_term_critic = (
+                        terminal_contract.terminal_critic[write_keep_mask]
                         if terminal_contract.terminal_critic is not None
+                        else None
+                    )
+                published = replay_add(
+                    torch.from_numpy(add_obs),
+                    torch.from_numpy(add_actions),
+                    torch.from_numpy(add_rewards),
+                    torch.from_numpy(add_next_obs),
+                    torch.from_numpy(add_dones),
+                    torch.from_numpy(add_truncated),
+                    terminal_mask=torch.from_numpy(add_mask),
+                    terminal_next_obs=(
+                        torch.from_numpy(add_term_obs)
+                        if add_term_obs is not None
+                        else None
+                    ),
+                    critic=torch.from_numpy(add_critic),
+                    next_critic=torch.from_numpy(add_next_critic),
+                    terminal_next_critic=(
+                        torch.from_numpy(add_term_critic)
+                        if add_term_critic is not None
                         else None
                     ),
                 )
