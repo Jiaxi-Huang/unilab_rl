@@ -218,20 +218,90 @@ def test_flashsac_capture_failure_warns_and_falls_back(monkeypatch) -> None:
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA runtime selection required")
-def test_flashsac_nvidia_cuda_ignores_legacy_compile_opt_out(monkeypatch) -> None:
+def test_flashsac_nvidia_cuda_honors_compile_opt_out(monkeypatch) -> None:
     monkeypatch.setattr(
         flash_sac_module,
         "get_torch_compile_for_cuda",
-        lambda *_args, **_kwargs: lambda fn: fn,
+        lambda *_args, **_kwargs: pytest.fail("explicit opt-out queried torch.compile"),
     )
     monkeypatch.setattr(
         FlashSACLearner, "_materialize_capturable_optimizer_state", lambda _self: None
     )
     monkeypatch.setattr(FlashSACLearner, "_compile_training_methods", lambda _self: None)
 
-    learner = _make_small_learner(device="cuda:0", use_compile=False)
+    learner = _make_small_learner(
+        device="cuda:0",
+        use_compile=False,
+        compile_full_objectives=True,
+        use_whole_cycle_cuda_graph=True,
+    )
+
+    assert learner.use_compile is False
+    assert learner.compile_full_objectives is False
+    assert learner.use_update_cycle is False
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA runtime selection required")
+def test_flashsac_nvidia_cuda_keeps_accelerated_default(monkeypatch) -> None:
+    monkeypatch.setattr(
+        flash_sac_module,
+        "get_torch_compile_for_cuda",
+        lambda *_args, **_kwargs: lambda fn, **_compile_kwargs: fn,
+    )
+    monkeypatch.setattr(
+        FlashSACLearner, "_materialize_capturable_optimizer_state", lambda _self: None
+    )
+    monkeypatch.setattr(FlashSACLearner, "_compile_training_methods", lambda _self: None)
+
+    learner = _make_small_learner(device="cuda:0", use_compile=None)
 
     assert learner.use_compile is True
+    assert learner.compile_full_objectives is True
+    assert learner.use_update_cycle is True
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA runtime selection required")
+def test_flashsac_nvidia_cuda_graph_opt_out_keeps_objective_compile(monkeypatch) -> None:
+    monkeypatch.setattr(
+        flash_sac_module,
+        "get_torch_compile_for_cuda",
+        lambda *_args, **_kwargs: lambda fn, **_compile_kwargs: fn,
+    )
+    monkeypatch.setattr(FlashSACLearner, "_compile_training_methods", lambda _self: None)
+
+    learner = _make_small_learner(
+        device="cuda:0",
+        use_compile=True,
+        compile_full_objectives=True,
+        use_whole_cycle_cuda_graph=False,
+    )
+
+    assert learner.use_compile is True
+    assert learner.compile_full_objectives is True
+    assert learner.use_update_cycle is False
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA runtime selection required")
+def test_flashsac_whole_cycle_does_not_override_compile_scope(monkeypatch) -> None:
+    monkeypatch.setattr(
+        flash_sac_module,
+        "get_torch_compile_for_cuda",
+        lambda *_args, **_kwargs: lambda fn, **_compile_kwargs: fn,
+    )
+    monkeypatch.setattr(
+        FlashSACLearner, "_materialize_capturable_optimizer_state", lambda _self: None
+    )
+    monkeypatch.setattr(FlashSACLearner, "_compile_training_methods", lambda _self: None)
+
+    learner = _make_small_learner(
+        device="cuda:0",
+        use_compile=True,
+        compile_full_objectives=False,
+        use_whole_cycle_cuda_graph=True,
+    )
+
+    assert learner.use_compile is True
+    assert learner.compile_full_objectives is False
     assert learner.use_update_cycle is True
 
 
@@ -259,7 +329,7 @@ def test_flashsac_nvidia_cuda_fails_closed_without_inductor(monkeypatch) -> None
             action_dim=2,
             critic_obs_dim=6,
             device="cuda:0",
-            use_compile=False,
+            use_compile=True,
         )
 
 
@@ -272,10 +342,10 @@ def test_flashsac_nvidia_cuda_fails_closed_for_graph_incompatible_options(monkey
     )
 
     with pytest.raises(ValueError, match="fp16 GradScaler"):
-        _make_small_learner(device="cuda:0", use_amp=True, amp_dtype="fp16")
+        _make_small_learner(device="cuda:0", use_compile=True, use_amp=True, amp_dtype="fp16")
 
     with pytest.raises(ValueError, match="obs normalization"):
-        _make_small_learner(device="cuda:0", obs_normalization=True)
+        _make_small_learner(device="cuda:0", use_compile=True, obs_normalization=True)
 
 
 def test_flashsac_obs_normalizer_uses_local_batch_moments() -> None:

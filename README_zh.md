@@ -91,6 +91,20 @@ docstring；如何不 fork 本仓库、通过 `runtime_resolver` 接入自定义
 破坏性变更后的 TensorBoard/W&B canonical 字段契约与历史新旧 tag 迁移表见
 [`docs/metrics.md`](docs/metrics.md)。
 
+## FlashSAC learner 加速开关
+
+FlashSAC 分别提供三个 learner 开关：
+
+- `use_compile` 控制是否启用 CUDA Inductor。省略时保留 NVIDIA CUDA
+  默认开启的行为；显式设为 `false` 时走 eager 的逐 update 路径。
+- `compile_full_objectives` 只选择 Inductor 编译完整 critic/actor objective，
+  还是较小的 loss-tensor 区域。省略时保留 NVIDIA 默认的完整 objective 编译；
+  关闭编译时它不生效。
+- `use_whole_cycle_cuda_graph` 控制 learner 是否捕获并回放整轮 CUDA Graph。
+  省略时保留单 NVIDIA learner 默认开启的行为。whole-cycle graph 依赖编译，
+  因此 `use_compile=false` 也会关闭它；只把该开关设为 `false`，则仍保留
+  所选择的 Inductor objective 编译范围。
+
 ## 设计契约
 
 `uni_rl` **不**依赖任何仿真器或环境库。算法行为归属 `uni_rl.algos.*`

@@ -117,6 +117,22 @@ Coordination failures use learner phase/progress and process liveness rather
 than a wall-clock performance SLA. `training.inference_request_timeout_sec` is
 deprecated and ignored; remove it from owner YAML during migration.
 
+## FlashSAC learner acceleration controls
+
+FlashSAC exposes three separate learner controls:
+
+- `use_compile` enables or disables CUDA Inductor compilation. Omitting it
+  preserves the auto-enabled NVIDIA CUDA default; an explicit `false` selects
+  the eager per-update path.
+- `compile_full_objectives` chooses whether Inductor compiles the complete
+  critic/actor objectives or the smaller loss-tensor regions. Omitting it
+  preserves the full-objective NVIDIA default; it has no effect when
+  compilation is disabled.
+- `use_whole_cycle_cuda_graph` enables or disables learner-owned whole-cycle
+  CUDA Graph capture. Omitting it preserves the single-NVIDIA default. This
+  layer requires compilation, so `use_compile=false` also disables it; setting
+  it to `false` leaves the selected Inductor objective scope enabled.
+
 ## Design contract
 
 `uni_rl` does **not** depend on any simulator or environment library.

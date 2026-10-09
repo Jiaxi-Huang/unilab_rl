@@ -213,8 +213,9 @@ class FlashSACLearner(LearnerBoilerplateMixin):
         obs_normalization: bool = False,
         use_amp: bool = False,
         amp_dtype: str = "auto",
-        use_compile: bool = False,
-        compile_full_objectives: bool = False,
+        use_compile: bool | None = None,
+        compile_full_objectives: bool | None = None,
+        use_whole_cycle_cuda_graph: bool | None = None,
         actor_normalize_parameters: bool = True,
         critic_normalize_parameters: bool = True,
     ):
@@ -234,13 +235,21 @@ class FlashSACLearner(LearnerBoilerplateMixin):
         self.use_amp = bool(use_amp and self.device.type in ("cuda", "xpu"))
         self.amp_dtype = amp_dtype
         self._amp_dtype = self._resolve_amp_dtype(amp_dtype, self.device.type)
-        compile_fn = get_torch_compile_for_cuda(self.device, warn=not self._nvidia_cuda)
-        if self._nvidia_cuda and compile_fn is None:
+        compile_requested = self._nvidia_cuda if use_compile is None else bool(use_compile)
+        compile_fn = (
+            get_torch_compile_for_cuda(self.device, warn=not self._nvidia_cuda)
+            if compile_requested
+            else None
+        )
+        if compile_requested and self._nvidia_cuda and compile_fn is None:
             raise RuntimeError("FlashSAC requires CUDA Inductor/Triton on NVIDIA CUDA")
-        # NVIDIA CUDA always uses the performance path; the legacy opt-out is
-        # retained only for ROCm/HIP, MPS, CPU, and other compatibility devices.
-        self.use_compile = self._nvidia_cuda or bool(use_compile and compile_fn is not None)
-        self.compile_full_objectives = bool(compile_full_objectives and self.use_compile)
+        # ``None`` preserves the historical auto-enabled NVIDIA default, while
+        # an explicit ``False`` is a real debugging/compatibility opt-out.
+        self.use_compile = bool(compile_requested and compile_fn is not None)
+        full_objectives_requested = (
+            self._nvidia_cuda if compile_full_objectives is None else bool(compile_full_objectives)
+        )
+        self.compile_full_objectives = bool(full_objectives_requested and self.use_compile)
         # Host-side ``Tensor.item``/truth checks synchronize the device.  The
         # compiled CUDA path uses the fused optimizer's device gate; MPS has no
         # device-side skip (its fused Adam kernel ignores ``found_inf``), so
@@ -351,7 +360,17 @@ class FlashSACLearner(LearnerBoilerplateMixin):
         self._update_cycle_lr_cursors: dict[int, int] = {}
         self._capture_update_cycle = False
         self._update_cycle_capture_failed = False
-        self._compile_full_update_cycle = bool(self.use_compile and self._nvidia_cuda)
+        graph_requested = (
+            self._nvidia_cuda
+            if use_whole_cycle_cuda_graph is None
+            else bool(use_whole_cycle_cuda_graph)
+        )
+        # Whole-cycle capture wraps compiled objectives, so disabling compile
+        # also disables this dependent layer.  The graph switch otherwise does
+        # not change which objective boundary Inductor compiles.
+        self._compile_full_update_cycle = bool(
+            graph_requested and self.use_compile and self._nvidia_cuda
+        )
         if self._compile_full_update_cycle and self.scaler is not None:
             raise ValueError(
                 "FlashSAC CUDA compile mode requires bf16 (or fp32); "
@@ -362,7 +381,6 @@ class FlashSACLearner(LearnerBoilerplateMixin):
                 raise ValueError(
                     "FlashSAC whole-cycle CUDA graphs do not yet support obs normalization"
                 )
-            self.compile_full_objectives = True
         if self.use_compile:
             if self._compile_full_update_cycle:
                 self._materialize_capturable_optimizer_state()
