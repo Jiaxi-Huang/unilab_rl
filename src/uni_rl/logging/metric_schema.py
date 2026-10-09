@@ -170,6 +170,20 @@ METRIC_SPECS: dict[str, MetricSpec] = {
             "SAC actor objective; RSL-RL has no SAC actor-loss name.",
         ),
         _spec(
+            "Loss/actor_policy",
+            "learner",
+            "dimensionless objective",
+            "final emitted actor update in the logged iteration",
+            "SONIC actor policy (SAC) component of the actor objective.",
+        ),
+        _spec(
+            "Loss/actor_auxiliary",
+            "learner",
+            "dimensionless objective",
+            "final emitted actor update in the logged iteration",
+            "SONIC tokenizer auxiliary component of the actor objective.",
+        ),
+        _spec(
             "Loss/critic",
             "learner",
             "dimensionless objective",
@@ -205,6 +219,13 @@ METRIC_SPECS: dict[str, MetricSpec] = {
             "SAC alpha/temperature state; RSL-RL has no SAC equivalent.",
         ),
         _spec(
+            "Policy/entropy",
+            "learner",
+            "nats",
+            "final emitted actor update in the logged iteration",
+            "SONIC actor Gaussian entropy estimate.",
+        ),
+        _spec(
             "Train/global_gradient_norm",
             "learner",
             "parameter norm",
@@ -217,6 +238,20 @@ METRIC_SPECS: dict[str, MetricSpec] = {
             "parameter norm",
             "final emitted actor update for deferred learners; otherwise mean over emitted updates",
             "Actor pre-clip gradient norm.",
+        ),
+        _spec(
+            "Train/actor_lr",
+            "learner",
+            "learning rate",
+            "final emitted actor update in the logged iteration",
+            "SONIC actor optimizer learning rate after schedule step.",
+        ),
+        _spec(
+            "Train/actor_auxiliary_ratio",
+            "learner",
+            "ratio",
+            "final emitted actor update in the logged iteration",
+            "SONIC auxiliary-to-policy loss magnitude ratio.",
         ),
         _spec(
             "Train/critic_gradient_norm",
@@ -531,6 +566,47 @@ METRIC_SPECS: dict[str, MetricSpec] = {
 METRIC_FAMILIES: dict[str, MetricFamilySpec] = {
     family.prefix: family
     for family in (
+        MetricFamilySpec(
+            prefix="Loss/sonic_",
+            owner="learner",
+            unit="loss units",
+            aggregation="final emitted actor update in the logged iteration",
+            step_axis=_STEP_AXIS,
+            description=(
+                "SONIC tokenizer auxiliary losses (reconstruction, latent "
+                "alignments, decoder overflow diagnostics)."
+            ),
+        ),
+        MetricFamilySpec(
+            prefix="Policy/action_",
+            owner="learner",
+            unit="normalized action units",
+            aggregation="final emitted actor update in the logged iteration",
+            step_axis=_STEP_AXIS,
+            description=(
+                "Batch statistics of the sampled actor actions (SONIC actor diagnostics)."
+            ),
+        ),
+        MetricFamilySpec(
+            prefix="Train/q_",
+            owner="learner",
+            unit="value units",
+            aggregation="final emitted critic evaluation in the logged iteration",
+            step_axis=_STEP_AXIS,
+            description="Batch statistics of the distributional critic values.",
+        ),
+        MetricFamilySpec(
+            prefix="Episode/termination/",
+            owner="collector",
+            unit="fraction of done episodes in the window",
+            aggregation="mean over collector reports since the previous learner iteration",
+            step_axis=_STEP_AXIS,
+            description=(
+                "Per-reason termination share of done episodes (anchor/ee/feet "
+                "failures, time_out, clip_end) from the environment's "
+                "termination-reason mask."
+            ),
+        ),
         MetricFamilySpec(
             prefix="reward/",
             owner="environment/reward",

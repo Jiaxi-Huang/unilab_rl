@@ -96,15 +96,22 @@ class FlashSACEmbedder(nn.Module):
 
 
 class FlashSACBlock(nn.Module):
-    def __init__(self, hidden_dim: int, expansion: int = 4):
+    def __init__(self, hidden_dim: int, expansion: int = 4, in_dim: int | None = None):
         super().__init__()
         self.w1 = UnitLinear(hidden_dim, hidden_dim * expansion)
         self.norm1 = UnitBatchNorm(hidden_dim * expansion)
         self.w2 = UnitLinear(hidden_dim * expansion, hidden_dim)
         self.norm2 = UnitBatchNorm(hidden_dim)
+        # Variable-width stacks project the residual onto the block's output
+        # width; matching widths keep the released identity residual layout.
+        self._residual_proj = (
+            UnitLinear(int(in_dim), hidden_dim)
+            if in_dim is not None and int(in_dim) != hidden_dim
+            else None
+        )
 
     def forward(self, x: torch.Tensor, training: bool) -> torch.Tensor:
-        residual = x
+        residual = x if self._residual_proj is None else self._residual_proj(x)
         x = self.w1(x)
         x = self.norm1(x, training=training)
         x = F.relu(x)
@@ -237,15 +244,26 @@ class EnsembleFlashSACEmbedder(nn.Module):
 
 
 class EnsembleFlashSACBlock(nn.Module):
-    def __init__(self, num_ensemble: int, hidden_dim: int, expansion: int = 4):
+    def __init__(
+        self,
+        num_ensemble: int,
+        hidden_dim: int,
+        expansion: int = 4,
+        in_dim: int | None = None,
+    ):
         super().__init__()
         self.w1 = EnsembleUnitLinear(num_ensemble, hidden_dim, hidden_dim * expansion)
         self.norm1 = EnsembleUnitBatchNorm(num_ensemble, hidden_dim * expansion)
         self.w2 = EnsembleUnitLinear(num_ensemble, hidden_dim * expansion, hidden_dim)
         self.norm2 = EnsembleUnitBatchNorm(num_ensemble, hidden_dim)
+        self._residual_proj = (
+            EnsembleUnitLinear(num_ensemble, int(in_dim), hidden_dim)
+            if in_dim is not None and int(in_dim) != hidden_dim
+            else None
+        )
 
     def forward(self, x: torch.Tensor, training: bool) -> torch.Tensor:
-        residual = x
+        residual = x if self._residual_proj is None else self._residual_proj(x)
         x = self.w1(x)
         x = self.norm1(x, training=training)
         x = F.relu(x)

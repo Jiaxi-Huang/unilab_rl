@@ -65,7 +65,7 @@ def test_source_metrics_must_already_be_canonical() -> None:
     }
     assert normalize_metric_map(metrics) == {key: float(value) for key, value in metrics.items()}
 
-    for retired in ("actor_loss", "train/actor_loss", "losses/policy_loss", "Loss/policy_loss"):
+    for retired in ("train/actor_loss", "losses/policy_loss", "Loss/policy_loss"):
         with pytest.raises(ValueError, match="unregistered canonical training metric"):
             normalize_metric_map({retired: 1.0})
 
@@ -91,7 +91,15 @@ def test_schema_is_closed_except_reward_terms() -> None:
         ["Loss/surrogate", "reward/term", "Train/rollouts_read", "Perf/learner_inference_ms"]
     )
 
-    assert set(METRIC_FAMILIES) == {"reward/"}
+    # The SONIC fork registers its tokenizer/action/critic diagnostics as
+    # prefix families inside the canonical Loss/, Policy/, and Train/ groups.
+    assert set(METRIC_FAMILIES) == {
+        "reward/",
+        "Loss/sonic_",
+        "Policy/action_",
+        "Train/q_",
+        "Episode/termination/",
+    }
     assert "Perf/learner_other_ms" not in METRIC_SPECS
     assert "Train/staging_pool_capacity" not in METRIC_SPECS
     assert "Train/updates" not in METRIC_SPECS

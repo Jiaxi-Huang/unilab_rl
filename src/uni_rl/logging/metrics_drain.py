@@ -89,6 +89,14 @@ def drain_collector_metrics(
                 logger.update_collector_inference(metrics["collector_inference"])
             if "timeout_rate" in metrics:
                 logger.update_timeout_rate(float(metrics["timeout_rate"]))
+            update_termination_reason_rates = getattr(
+                logger, "update_termination_reason_rates", None
+            )
+            if (
+                callable(update_termination_reason_rates)
+                and "termination_reason_rates" in metrics
+            ):
+                update_termination_reason_rates(metrics["termination_reason_rates"])
             if "total_steps" in metrics and (not require_buffer_size or "buffer_size" in metrics):
                 logger.log_collector(
                     metrics["total_steps"],

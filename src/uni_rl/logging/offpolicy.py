@@ -108,6 +108,11 @@ _METRIC_DISPLAY_LABELS = {
     "Policy/temperature": "Temperature",
     "Train/global_gradient_norm": "Global Grad Norm",
     "Train/actor_gradient_norm": "Actor Grad Norm",
+    "Loss/actor_policy": "Actor Policy",
+    "Loss/actor_auxiliary": "Actor Aux",
+    "Train/actor_auxiliary_ratio": "Actor Aux Ratio",
+    "Train/actor_lr": "Actor LR",
+    "Policy/entropy": "Policy Entropy",
     "Train/critic_gradient_norm": "Critic Grad Norm",
     "Train/target_q_max": "Target Q Max",
     "Train/target_q_min": "Target Q Min",
@@ -304,6 +309,7 @@ class OffPolicyLogger(BaseTrainingLogger):
             raise ValueError("timing_profile must be 'sac_family' or 'appo'")
         self._timing_profile = timing_profile
         self._timeout_rate: float | None = None
+        self._termination_reason_rates: dict[str, float] | None = None
         self._buffer_utilization: float = 0.0
         self._runtime_manifest: dict[str, Any] = {}
         self._status: str = "Initializing..."
@@ -562,6 +568,10 @@ class OffPolicyLogger(BaseTrainingLogger):
     def update_timeout_rate(self, timeout_rate: float):
         self._timeout_rate = float(timeout_rate)
 
+    def update_termination_reason_rates(self, rates: dict[str, float]) -> None:
+        """Store the latest per-reason termination shares of done episodes."""
+        self._termination_reason_rates = {str(name): float(rate) for name, rate in rates.items()}
+
     def update_buffer_utilization(self, utilization: float):
         self._buffer_utilization = float(utilization)
 
@@ -722,6 +732,9 @@ class OffPolicyLogger(BaseTrainingLogger):
             _set_backend_scalar(scalars, "Train/mean_episode_length", self._mean_ep_length)
         if self._timeout_rate is not None:
             _set_backend_scalar(scalars, "Episode/timeout_rate", self._timeout_rate)
+        if self._termination_reason_rates:
+            for name, rate in self._termination_reason_rates.items():
+                _set_backend_scalar(scalars, f"Episode/termination/{name}_rate", rate)
         for key, value in self._collector_timing.items():
             if key == "rollout_ms":
                 _set_backend_scalar(scalars, "Perf/collection_time", value / 1000.0)

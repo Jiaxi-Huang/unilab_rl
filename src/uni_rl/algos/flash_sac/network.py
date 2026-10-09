@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import math
+from collections.abc import Sequence
 from typing import cast
 
 import torch
@@ -44,14 +45,27 @@ class FlashSACActor(nn.Module):
         action_dim: int,
         noise_zeta_mu: float = 2.0,
         noise_zeta_max: int = 16,
+        hidden_dims: Sequence[int] | None = None,
         device: str | torch.device = "cpu",
     ):
         super().__init__()
         self.action_dim = int(action_dim)
-        self.embedder = FlashSACEmbedder(input_dim=input_dim, hidden_dim=hidden_dim)
-        self.encoder = nn.ModuleList([FlashSACBlock(hidden_dim) for _ in range(num_blocks)])
-        self.post_norm = UnitRMSNorm(hidden_dim)
-        self.predictor = NormalTanhPolicy(hidden_dim=hidden_dim, action_dim=action_dim)
+        if hidden_dims is not None:
+            widths = [int(width) for width in hidden_dims]
+            if not widths or min(widths) <= 0:
+                raise ValueError("hidden_dims must contain positive widths")
+            out_dim = widths[-1]
+            self.embedder = FlashSACEmbedder(input_dim=input_dim, hidden_dim=widths[0])
+            self.encoder = nn.ModuleList(
+                FlashSACBlock(width, in_dim=widths[index - 1] if index else widths[0])
+                for index, width in enumerate(widths)
+            )
+        else:
+            out_dim = hidden_dim
+            self.embedder = FlashSACEmbedder(input_dim=input_dim, hidden_dim=hidden_dim)
+            self.encoder = nn.ModuleList([FlashSACBlock(hidden_dim) for _ in range(num_blocks)])
+        self.post_norm = UnitRMSNorm(out_dim)
+        self.predictor = NormalTanhPolicy(hidden_dim=out_dim, action_dim=action_dim)
         self.noise_zeta_mu = noise_zeta_mu
         self.noise_zeta_max = noise_zeta_max
         ns = torch.arange(1, noise_zeta_max + 1, dtype=torch.float32)
@@ -174,17 +188,32 @@ class FlashSACDoubleCritic(nn.Module):
         min_v: float,
         max_v: float,
         num_qs: int = 2,
+        hidden_dims: Sequence[int] | None = None,
         device: str | torch.device = "cpu",
     ):
         super().__init__()
-        self.embedder = EnsembleFlashSACEmbedder(num_qs, input_dim, hidden_dim)
-        self.encoder = nn.ModuleList(
-            [EnsembleFlashSACBlock(num_qs, hidden_dim) for _ in range(num_blocks)]
-        )
-        self.post_norm = EnsembleUnitRMSNorm(num_qs, hidden_dim)
+        if hidden_dims is not None:
+            widths = [int(width) for width in hidden_dims]
+            if not widths or min(widths) <= 0:
+                raise ValueError("hidden_dims must contain positive widths")
+            self.embedder = EnsembleFlashSACEmbedder(num_qs, input_dim, widths[0])
+            self.encoder = nn.ModuleList(
+                EnsembleFlashSACBlock(
+                    num_qs, width, in_dim=widths[index - 1] if index else widths[0]
+                )
+                for index, width in enumerate(widths)
+            )
+            out_dim = widths[-1]
+        else:
+            self.embedder = EnsembleFlashSACEmbedder(num_qs, input_dim, hidden_dim)
+            self.encoder = nn.ModuleList(
+                [EnsembleFlashSACBlock(num_qs, hidden_dim) for _ in range(num_blocks)]
+            )
+            out_dim = hidden_dim
+        self.post_norm = EnsembleUnitRMSNorm(num_qs, out_dim)
         self.predictor = EnsembleCategoricalValue(
             num_ensemble=num_qs,
-            hidden_dim=hidden_dim,
+            hidden_dim=out_dim,
             num_bins=num_bins,
             min_v=min_v,
             max_v=max_v,

@@ -441,6 +441,10 @@ def _run_collector(
     timing_counts: defaultdict[str, int] = defaultdict(int)
     done_count_window = 0
     timeout_count_window = 0
+    # Termination-reason shares over the same done window as ``timeout_rate``;
+    # counts stay on device and drain once per published window.
+    termination_reason_names: tuple[str, ...] = ()
+    termination_reason_counts_t: torch.Tensor | None = None
     inference_queue_depth = 0
     inference_action_backlog = 0
     inference_in_flight = 0
@@ -459,7 +463,9 @@ def _run_collector(
     ) -> bool:
         """Publish one collector metric snapshot without losing window state."""
 
-        nonlocal done_count_window, timeout_count_window, max_action_backlog_since_metric
+        nonlocal done_count_window, timeout_count_window
+        nonlocal termination_reason_names, termination_reason_counts_t
+        nonlocal max_action_backlog_since_metric
         nonlocal max_in_flight_since_metric, max_publication_lag_since_metric
         assert metrics_queue is not None
         assert replay_buffer is not None
@@ -511,6 +517,16 @@ def _run_collector(
         timeout_rate = timeout_count_window / done_count_window if done_count_window > 0 else None
         if timeout_rate is not None:
             msg["timeout_rate"] = timeout_rate
+        if (
+            done_count_window > 0
+            and termination_reason_counts_t is not None
+            and termination_reason_names
+        ):
+            counts = termination_reason_counts_t.detach().cpu().tolist()
+            msg["termination_reason_rates"] = {
+                name: count / done_count_window
+                for name, count in zip(termination_reason_names, counts, strict=True)
+            }
         if trace_recorder:
             msg["trace_events"] = trace_recorder.drain_events()
 
@@ -532,6 +548,8 @@ def _run_collector(
         if timeout_rate is not None:
             done_count_window = 0
             timeout_count_window = 0
+            if termination_reason_counts_t is not None:
+                termination_reason_counts_t.zero_()
         max_action_backlog_since_metric = 0
         max_in_flight_since_metric = 0
         max_publication_lag_since_metric = 0
@@ -779,6 +797,19 @@ def _run_collector(
             assert combined_dones_t is not None
             prev_dones_t = combined_dones_t
             done_mask_t = combined_dones_t > 0.5
+            reason_mask = state.info.get("termination_reason_mask")
+            if reason_mask is not None:
+                names = tuple(state.info.get("termination_reason_names") or ())
+                if names and names != termination_reason_names:
+                    termination_reason_names = names
+                    termination_reason_counts_t = torch.zeros(
+                        len(names), dtype=torch.int64, device=done_mask_t.device
+                    )
+                if termination_reason_counts_t is not None:
+                    mask_t = torch.as_tensor(
+                        reason_mask, dtype=torch.bool, device=done_mask_t.device
+                    )
+                    termination_reason_counts_t += (mask_t & done_mask_t.unsqueeze(1)).sum(dim=0)
             assert tensor_metrics is not None
             reward_components_t = state.info.get("reward_components")
             tensor_metrics.update(

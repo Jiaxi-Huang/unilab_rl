@@ -929,6 +929,25 @@ def test_offpolicy_backend_step_axis_falls_back_to_iteration() -> None:
     assert _batched_scalar_map(writer)["Episode/timeout_rate"] == pytest.approx(0.25)
 
 
+def test_offpolicy_termination_reason_rates_publish_under_episode_section() -> None:
+    logger = OffPolicyLogger(log_backend="none")
+    writer = _BatchedWriter()
+    logger._tb_writer = writer
+
+    logger.log_step(iteration=3, metrics={"Loss/critic": 1.0}, train_time=0.1)
+    assert not any(
+        tag.startswith("Episode/termination/") for tag in _batched_scalar_map(writer)
+    )
+
+    logger.update_termination_reason_rates({"time_out": 0.4, "clip_end": 0.5, "feet_pos": 0.1})
+    logger.log_step(iteration=4, metrics={"Loss/critic": 1.5}, train_time=0.1)
+
+    backend_scalars = _batched_scalar_map(writer)
+    assert backend_scalars["Episode/termination/clip_end_rate"] == pytest.approx(0.5)
+    assert backend_scalars["Episode/termination/time_out_rate"] == pytest.approx(0.4)
+    assert backend_scalars["Episode/termination/feet_pos_rate"] == pytest.approx(0.1)
+
+
 def test_offpolicy_collection_time_waits_for_complete_rollout_measurement() -> None:
     logger = OffPolicyLogger(log_backend="none")
     writer = _BatchedWriter()

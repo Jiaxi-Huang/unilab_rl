@@ -5,7 +5,7 @@ from __future__ import annotations
 import copy
 import os
 import warnings
-from collections.abc import Callable, Iterable
+from collections.abc import Callable, Iterable, Sequence
 from dataclasses import dataclass
 from typing import Any, cast
 
@@ -191,6 +191,8 @@ class FlashSACLearner(LearnerBoilerplateMixin):
         critic_lr: float = 3e-4,
         actor_hidden_dim: int = 128,
         critic_hidden_dim: int = 256,
+        actor_hidden_dims: Sequence[int] | None = None,
+        critic_hidden_dims: Sequence[int] | None = None,
         actor_num_blocks: int = 2,
         critic_num_blocks: int = 2,
         num_atoms: int = 101,
@@ -218,6 +220,7 @@ class FlashSACLearner(LearnerBoilerplateMixin):
         use_whole_cycle_cuda_graph: bool | None = None,
         actor_normalize_parameters: bool = True,
         critic_normalize_parameters: bool = True,
+        actor_module: nn.Module | None = None,
     ):
         self.actor_normalize_parameters = bool(actor_normalize_parameters)
         self.critic_normalize_parameters = bool(critic_normalize_parameters)
@@ -261,19 +264,27 @@ class FlashSACLearner(LearnerBoilerplateMixin):
             device_gated=self._device_type == "cuda" and self.use_compile,
         )
         self._gradient_sync: Callable[[Iterable[torch.Tensor]], None] | None = None
-        self.actor = FlashSACActor(
-            num_blocks=actor_num_blocks,
-            input_dim=obs_dim,
-            hidden_dim=actor_hidden_dim,
-            action_dim=action_dim,
-            noise_zeta_mu=actor_noise_zeta_mu,
-            noise_zeta_max=actor_noise_zeta_max,
-            device=self.device,
+        # SONIC injects its packed-layout actor here; ``None`` keeps the
+        # generic FlashSAC actor.
+        self.actor = (
+            actor_module.to(self.device)
+            if actor_module is not None
+            else FlashSACActor(
+                num_blocks=actor_num_blocks,
+                input_dim=obs_dim,
+                hidden_dim=actor_hidden_dim,
+                action_dim=action_dim,
+                noise_zeta_mu=actor_noise_zeta_mu,
+                noise_zeta_max=actor_noise_zeta_max,
+                hidden_dims=actor_hidden_dims,
+                device=self.device,
+            )
         )
         self.critic = FlashSACDoubleCritic(
             num_blocks=critic_num_blocks,
             input_dim=self.critic_obs_dim + action_dim,
             hidden_dim=critic_hidden_dim,
+            hidden_dims=critic_hidden_dims,
             num_bins=num_atoms,
             min_v=critic_min_v,
             max_v=critic_max_v,
