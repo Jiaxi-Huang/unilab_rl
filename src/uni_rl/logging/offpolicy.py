@@ -286,8 +286,11 @@ class OffPolicyLogger(BaseTrainingLogger):
         self._throughput_env_steps: int = 0
         # Keep a bounded tail window for a stable end-to-end throughput gate.
         # The final single iteration is intentionally not authoritative: one
-        # iteration can absorb asynchronous collector/learner jitter.
-        self._tail_iteration_times: deque[float] = deque(maxlen=20)
+        # iteration can absorb asynchronous collector/learner jitter. The
+        # 100-iteration window also spans replay ingress and asynchronous
+        # scheduling effects that remain visible over tens of iterations.
+        self.tail_window_iterations = 100
+        self._tail_iteration_times: deque[float] = deque(maxlen=self.tail_window_iterations)
         self._tail_throughput_env_steps = 0
         self._env_steps_per_sec_override: float | None = None
         self._learner_replay_rows_per_sec_override: float | None = None
