@@ -2434,6 +2434,7 @@ class DoubleBufferOffPolicyRunner(OffPolicyRunner):
             "final_env_steps_per_sec": logger._get_iter_env_steps_per_sec(),
             "tail_env_steps_per_sec": logger._get_tail_env_steps_per_sec(),
             "tail_iteration_count": len(getattr(logger, "_tail_iteration_times", ())),
+            "tail_window_iterations": getattr(logger, "tail_window_iterations", 0),
             "final_learner_replay_rows_per_sec": (logger._get_learner_replay_rows_per_sec()),
             "final_cycle_wall_ms": logger._get_iter_wall_time() * 1000.0,
             "final_inference_ms": getattr(logger, "_inference_time", 0.0) * 1000.0,
