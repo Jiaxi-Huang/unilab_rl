@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 from dataclasses import dataclass
 
 import torch
@@ -15,6 +16,7 @@ class TensorMetricFlush:
     lengths: list[int]
     done_count: int
     timeout_count: int
+    reward_component_sums: dict[str, float] | None = None
 
 
 class TensorCollectorMetrics:
@@ -31,6 +33,7 @@ class TensorCollectorMetrics:
         *,
         interval: int,
         device: str | torch.device,
+        reward_component_names: Sequence[str] = (),
     ) -> None:
         if isinstance(num_envs, bool) or not isinstance(num_envs, int) or num_envs <= 0:
             raise ValueError("tensor collector metrics require a positive environment count")
@@ -39,6 +42,13 @@ class TensorCollectorMetrics:
         self.num_envs = int(num_envs)
         self.interval = int(interval)
         self.device = torch.device(device)
+        self.reward_component_names = tuple(reward_component_names)
+        self.reward_component_count = len(self.reward_component_names)
+        self.reward_component_sums = (
+            torch.zeros(self.reward_component_count, dtype=torch.float64, device=self.device)
+            if self.reward_component_count
+            else None
+        )
         self.current_rewards = torch.zeros(self.num_envs, device=self.device)
         self.current_lengths = torch.zeros(self.num_envs, dtype=torch.int64, device=self.device)
         self.finished_rewards = torch.zeros(
@@ -65,6 +75,7 @@ class TensorCollectorMetrics:
         rewards: torch.Tensor,
         done: torch.Tensor,
         timeout: torch.Tensor,
+        reward_components: torch.Tensor | None = None,
     ) -> None:
         if not isinstance(rewards, torch.Tensor):
             raise TypeError("tensor metric rewards must be Torch tensors")
@@ -84,6 +95,20 @@ class TensorCollectorMetrics:
             or timeout.device != self.device
         ):
             raise ValueError("tensor metric values must live on one device")
+        if self.reward_component_count:
+            if not isinstance(reward_components, torch.Tensor):
+                raise TypeError("tensor metric reward components must be a Torch tensor")
+            expected_components = (self.num_envs, self.reward_component_count)
+            if reward_components.shape != expected_components:
+                raise ValueError(
+                    f"tensor metric reward components must have shape {expected_components}"
+                )
+            if reward_components.dtype != torch.float32 or not reward_components.is_contiguous():
+                raise TypeError("tensor metric reward components must be contiguous float32")
+            if reward_components.device != self.device:
+                raise ValueError(f"tensor metric reward components must live on {self.device}")
+        elif reward_components is not None:
+            raise ValueError("tensor metric has no reward component names")
         if self._updates >= self.interval:
             raise RuntimeError("tensor metric window was not flushed before reuse")
 
@@ -97,6 +122,8 @@ class TensorCollectorMetrics:
         self.current_lengths = torch.where(done, torch.zeros_like(episode_lengths), episode_lengths)
         self.done_count += done.sum()
         self.timeout_count += timeout.sum()
+        if self.reward_component_sums is not None and reward_components is not None:
+            self.reward_component_sums += reward_components.sum(dim=0, dtype=torch.float64)
         self._cursor = (row + 1) % self.interval
         self._updates += 1
 
@@ -134,24 +161,49 @@ class TensorCollectorMetrics:
             (
                 rewards,
                 lengths,
+                self.reward_component_sums
+                if self.reward_component_sums is not None
+                else torch.empty(0, dtype=torch.float64, device=self.device),
                 self.done_count.reshape(1),
                 self.timeout_count.reshape(1),
             )
         ).cpu()
         episode_count = int(rewards.numel())
         reward_values = host_values[:episode_count].tolist()
-        length_values = host_values[episode_count:-2].tolist()
+        component_tail = self.reward_component_count + 2
+        length_values = (
+            host_values[episode_count:-component_tail].tolist()
+            if self.reward_component_count
+            else host_values[episode_count:-2].tolist()
+        )
+        component_values = (
+            host_values[-(self.reward_component_count + 2) : -2].tolist()
+            if self.reward_component_count
+            else []
+        )
         result = TensorMetricFlush(
             rewards=[float(value) for value in reward_values],
             lengths=[int(value) for value in length_values],
             done_count=int(host_values[-2].item()),
             timeout_count=int(host_values[-1].item()),
+            reward_component_sums=(
+                {
+                    name: float(value)
+                    for name, value in zip(
+                        self.reward_component_names, component_values, strict=True
+                    )
+                }
+                if self.reward_component_sums is not None
+                else None
+            ),
         )
         self.finished_rewards.zero_()
         self.finished_lengths.zero_()
         self.finished_valid.zero_()
         self.done_count.zero_()
         self.timeout_count.zero_()
+        if self.reward_component_sums is not None:
+            self.reward_component_sums.zero_()
         self._cursor = 0
         self._updates = 0
         return result

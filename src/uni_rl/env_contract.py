@@ -88,6 +88,11 @@ class EnvAlgoCapabilitiesProtocol(Protocol):
         """Joint names in action order, for symmetry-augmentation maps."""
         ...
 
+    @property
+    def reward_component_names(self) -> tuple[str, ...] | None:
+        """Reward component names for fixed-width tensor metric aggregation."""
+        ...
+
 
 @dataclass(frozen=True)
 class EnvAlgoCapabilities:
@@ -96,6 +101,7 @@ class EnvAlgoCapabilities:
     action_low: torch.Tensor | None = None
     action_high: torch.Tensor | None = None
     joint_names: tuple[str, ...] | None = None
+    reward_component_names: tuple[str, ...] | None = None
 
 
 @runtime_checkable

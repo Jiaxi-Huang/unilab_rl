@@ -580,3 +580,14 @@ def test_drain_metrics_averages_reward_components_across_reports() -> None:
     APPORunner._drain_metrics(second, deque(maxlen=10), window, _DrainFakeLogger())
 
     assert window.take() == {"task": 2.0}
+
+
+def test_drain_metrics_preserves_interval_component_sums() -> None:
+    reports = queue.Queue()
+    reports.put({"reward_components": {"task": 3.0}, "reward_component_sums": True})
+    reports.put({"reward_components": {"task": 5.0}, "reward_component_sums": True})
+    window = RewardComponentWindow()
+
+    APPORunner._drain_metrics(reports, deque(maxlen=10), window, _DrainFakeLogger())
+
+    assert window.take() == {"task": 8.0}

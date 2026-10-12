@@ -93,6 +93,44 @@ def test_tensor_collector_metrics_resets_done_episodes_and_flushes_one_transfer(
     assert torch.count_nonzero(metrics.current_lengths) == 0
 
 
+def test_tensor_collector_metrics_packs_reward_components_in_same_transfer(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    metrics = TensorCollectorMetrics(
+        num_envs=2,
+        interval=2,
+        device="cpu",
+        reward_component_names=("left", "right"),
+    )
+    calls = 0
+    original_cpu = torch.Tensor.cpu
+
+    def counting_cpu(tensor: torch.Tensor) -> torch.Tensor:
+        nonlocal calls
+        calls += 1
+        return original_cpu(tensor)
+
+    monkeypatch.setattr(torch.Tensor, "cpu", counting_cpu)
+    metrics.update(
+        rewards=torch.tensor([1.0, 2.0]),
+        done=torch.tensor([False, True]),
+        timeout=torch.tensor([False, False]),
+        reward_components=torch.tensor([[1.0, 2.0], [3.0, 4.0]]),
+    )
+    metrics.update(
+        rewards=torch.tensor([3.0, 4.0]),
+        done=torch.tensor([True, False]),
+        timeout=torch.tensor([True, False]),
+        reward_components=torch.tensor([[5.0, 6.0], [7.0, 8.0]]),
+    )
+
+    flushed = metrics.flush()
+
+    assert flushed.reward_component_sums == {"left": 16.0, "right": 20.0}
+    assert calls == 1
+    assert torch.count_nonzero(metrics.reward_component_sums) == 0
+
+
 def test_tensor_collector_metrics_supports_no_done_window() -> None:
     metrics = TensorCollectorMetrics(num_envs=2, interval=2, device="cpu")
     metrics.update(
@@ -789,6 +827,108 @@ def test_tensor_collector_reports_bounded_inference_scheduling_diagnostics(
     assert next_critic.shape == (2, 2)
     assert inference_request_queue.get_nowait() == worker_module.COLLECTOR_READY_TICK
     assert inference_request_queue.get_nowait() == 0
+
+
+def test_tensor_collector_preserves_interval_reward_component_sums(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    stop_event = threading.Event()
+    metrics_queue: queue.Queue[dict] = queue.Queue(maxsize=4)
+
+    class _Capabilities:
+        reward_component_names = ("left", "right")
+
+    class _Env:
+        state = None
+        algo_capabilities = _Capabilities()
+
+        def init_state(self) -> None:
+            self.state = SimpleNamespace(obs={"obs": torch.zeros((2, 2))}, info={})
+
+        def step(self, actions):
+            del actions
+            stop_event.set()
+            self.state = SimpleNamespace(
+                obs={"obs": torch.ones((2, 2), dtype=torch.float32)},
+                reward=torch.ones(2),
+                terminated=torch.zeros(2, dtype=torch.bool),
+                truncated=torch.zeros(2, dtype=torch.bool),
+                final_observation=None,
+                info={
+                    "timing": {},
+                    "reward_components": torch.tensor(
+                        [[1.0, 2.0], [3.0, 4.0]], dtype=torch.float32
+                    ),
+                },
+            )
+            return self.state
+
+        def close(self) -> None:
+            pass
+
+    class _ReplayBuffer:
+        trace_recorder = None
+        trace_thread_time = False
+        size = torch.zeros(1, dtype=torch.int64)
+
+        def attach_stop_event(self, stop) -> None:
+            del stop
+
+        def add_batch(self, *args, **kwargs) -> bool:
+            del args, kwargs
+            return True
+
+        def release_ipc(self) -> None:
+            pass
+
+    ring = SharedInferenceRing(2, 2, 2, capacity=1)
+
+    def serve_learner_action(coordination_queue, tick_id, stop, **kwargs):
+        del coordination_queue, stop, kwargs
+        ring.copy_observation_to(
+            tick_id=tick_id,
+            observations=torch.empty((2, 2)),
+            dones=torch.empty(2),
+            epoch=0,
+        )
+        ring.publish_action(
+            tick_id=tick_id,
+            policy_version=0,
+            actions=torch.zeros((2, 2)),
+            epoch=0,
+        )
+        return True
+
+    monkeypatch.setattr(worker_module, "apply_torch_thread_runtime", lambda *a, **kw: None)
+    monkeypatch.setattr(worker_module, "apply_training_seed", lambda *a, **kw: None)
+    monkeypatch.setattr(worker_module, "_wait_for_inference_tick", serve_learner_action)
+
+    worker_module._run_collector(
+        stop_event=stop_event,
+        env_factory=lambda num_envs, env_cfg_override=None: _Env(),
+        num_envs=2,
+        replay_buffer=_ReplayBuffer(),
+        inference_slot=ring,
+        inference_request_queue=queue.Queue(),
+        inference_response_queue=queue.Queue(),
+        algo_type="sac",
+        actor_adapter_modules=None,
+        metrics_queue=metrics_queue,
+        inference_transport="legacy_tensor",
+        sim_backend="mujoco",
+        backend_device=None,
+        env_cfg_override=None,
+        inference_epoch=0,
+        collector_metrics_interval=1,
+        seed=1,
+        trace_enabled=False,
+        trace_thread_time=False,
+    )
+
+    metrics_queue.get_nowait()  # runtime manifest
+    report = metrics_queue.get_nowait()
+    assert report["reward_components"] == {"left": 4.0, "right": 6.0}
+    assert report["reward_component_sums"] is True
 
 
 def test_worker_shutdown_flushes_partial_metrics_before_abnormal_cleanup(
