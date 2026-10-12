@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- Off-policy collectors now publish backend tensor-runtime diagnostics into
+  the runtime manifest as `backend_diagnostics` (unilabsim/UniLab#2278). Envs
+  expose them through the new `uni_rl.env_contract.get_backend_runtime_diagnostics`
+  extension point (cold path only); the payload records `available`,
+  `backend_type`, and per-optimization `requested` / `enabled` /
+  `disable_reason` entries (e.g. MJWarp `cuda_graph`). Envs without the
+  provider record an explicit unavailable marker, and the runtime manifest
+  schema validates the section fail-closed.
+
 ## [1.4.11] - 2026-10-09
 
 ### Added

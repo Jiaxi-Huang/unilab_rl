@@ -9,7 +9,7 @@ import numpy as np
 import torch
 
 from uni_rl.algos.common.collector_timing import extract_env_step_breakdown_timing_ms
-from uni_rl.env_contract import EnvFactory
+from uni_rl.env_contract import EnvFactory, get_backend_runtime_diagnostics
 from uni_rl.offpolicy.actor_adapter import get_offpolicy_actor_adapter, import_actor_adapter_modules
 from uni_rl.offpolicy.coordination import (
     LearnerCoordinationState,
@@ -594,6 +594,12 @@ def _run_collector(
     prev_dones_t = torch.zeros(num_envs, dtype=torch.float32, device=state.obs["obs"].device)
     import time as _time
 
+    backend_diagnostics = get_backend_runtime_diagnostics(env)
+    if backend_diagnostics is None:
+        backend_diagnostics = {
+            "available": False,
+            "unavailable_reason": "env does not expose backend runtime diagnostics",
+        }
     runtime_manifest = {
         "inference_owner": "learner",
         "actor_owned": False,
@@ -608,6 +614,7 @@ def _run_collector(
         "inference_scheduling_policy": INFERENCE_SCHEDULING_POLICY,
         "inference_legal_max_in_flight": 1,
         "inference_dependency_graph": dict(INFERENCE_DEPENDENCY_GRAPH),
+        "backend_diagnostics": dict(backend_diagnostics),
     }
     if trace_recorder:
         manifest_ns = _time.perf_counter_ns()
