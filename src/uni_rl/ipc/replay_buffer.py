@@ -8,6 +8,7 @@ import torch
 
 from uni_rl.ipc.graph_completion import (
     GraphCompletionTokenProtocol,
+    record_ingress_publication,
     wait_graph_completion,
 )
 from uni_rl.ipc.shared_buffer import SharedBufferBase
@@ -458,6 +459,10 @@ class ReplayBuffer(SharedBufferBase):
                 last_sequence=self._graph_completion_sequence,
             )
             if completion is not None:
+                completion = record_ingress_publication(
+                    completion,
+                    stream=self._ingress_read_stream,
+                )
                 self._graph_completion_sequence = completion.sequence
                 self._graph_capture_id = completion.capture_id
                 self._last_graph_completion = completion

@@ -5,6 +5,40 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any, Protocol, runtime_checkable
 
+MAX_GRAPH_IPC_HANDLE_BYTES = 256
+MAX_GRAPH_CAPTURE_ID_BYTES = 256
+
+
+def _validate_public_metadata(
+    *,
+    contract_version: int,
+    operation: str,
+    sequence: int,
+    stream_id: int,
+    capture_id: str | None,
+    ipc_handle: bytes,
+) -> None:
+    """Validate IPC receipt metadata without interpreting the event handle."""
+    if not isinstance(contract_version, int) or isinstance(contract_version, bool):
+        raise TypeError("graph completion contract_version must be an integer")
+    if contract_version != 1:
+        raise ValueError(f"unsupported graph completion contract {contract_version}")
+    if operation not in ("step", "selected_reset", "mask_reset"):
+        raise ValueError(f"unsupported graph completion operation {operation!r}")
+    if not isinstance(sequence, int) or isinstance(sequence, bool) or sequence < 0:
+        raise TypeError("graph completion sequence must be a non-negative integer")
+    if not isinstance(stream_id, int) or isinstance(stream_id, bool) or stream_id < 0:
+        raise TypeError("graph completion stream_id must be a non-negative integer")
+    if capture_id is not None:
+        if not isinstance(capture_id, str) or not capture_id.strip():
+            raise TypeError("graph completion capture_id must be a non-empty string or None")
+        if len(capture_id.encode("utf-8")) > MAX_GRAPH_CAPTURE_ID_BYTES:
+            raise ValueError("graph completion capture_id exceeds the IPC metadata limit")
+    else:
+        raise ValueError("an interprocess graph completion requires a capture_id")
+    if not isinstance(ipc_handle, bytes) or not 0 < len(ipc_handle) <= MAX_GRAPH_IPC_HANDLE_BYTES:
+        raise TypeError("graph completion ipc_handle must be non-empty bounded bytes")
+
 
 @runtime_checkable
 class GraphCompletionTokenProtocol(Protocol):
@@ -56,9 +90,7 @@ def wait_graph_completion(
     if completion.operation not in ("step", "selected_reset", "mask_reset"):
         raise ValueError(f"unsupported graph completion operation {completion.operation!r}")
     if completion.operation != operation:
-        raise ValueError(
-            f"expected {operation!r} graph completion, got {completion.operation!r}"
-        )
+        raise ValueError(f"expected {operation!r} graph completion, got {completion.operation!r}")
     if capture_id is not None and completion.capture_id != capture_id:
         raise ValueError(
             f"graph completion capture {completion.capture_id!r} does not match {capture_id!r}"
@@ -91,3 +123,91 @@ class ImmediateGraphCompletion:
 
     def ipc_handle(self) -> bytes:
         raise NotImplementedError("this graph completion receipt has no IPC transport")
+
+
+@dataclass
+class EventGraphCompletion:
+    """Consumer-local receipt reconstructed from a public CUDA IPC event."""
+
+    contract_version: int
+    operation: str
+    sequence: int
+    stream_id: int
+    capture_id: str | None
+    event: Any
+
+    def wait_before_read(self, stream: Any | None = None) -> None:
+        if stream is None:
+            self.event.synchronize()
+        else:
+            self.event.wait(stream)
+
+    def ipc_handle(self) -> bytes:
+        return bytes(self.event.ipc_handle())
+
+
+def record_ingress_publication(
+    completion: GraphCompletionTokenProtocol,
+    *,
+    stream: Any | None,
+) -> GraphCompletionTokenProtocol:
+    """Record a publication receipt after ingress writes are enqueued.
+
+    The producer graph event orders backend outputs, while this event also
+    includes the CUDA ingress-slot copies submitted after that graph event.
+    It remains stream-local: neither endpoint synchronizes the producer stream.
+    """
+    if stream is None or getattr(stream.device, "type", None) != "cuda":
+        return completion
+    import torch
+
+    _validate_public_metadata(
+        contract_version=completion.contract_version,
+        operation=completion.operation,
+        sequence=completion.sequence,
+        stream_id=completion.stream_id,
+        capture_id=completion.capture_id,
+        ipc_handle=b"metadata-only",
+    )
+    event = torch.cuda.Event(interprocess=True)
+    event.record(stream)
+    return EventGraphCompletion(
+        contract_version=completion.contract_version,
+        operation=completion.operation,
+        sequence=completion.sequence,
+        stream_id=completion.stream_id,
+        capture_id=completion.capture_id,
+        event=event,
+    )
+
+
+def import_graph_completion(
+    *,
+    contract_version: int,
+    operation: str,
+    sequence: int,
+    stream_id: int,
+    capture_id: str | None,
+    ipc_handle: bytes,
+    device: Any,
+) -> EventGraphCompletion:
+    """Reconstruct a neutral receipt from its public CUDA IPC descriptor."""
+    import torch
+
+    _validate_public_metadata(
+        contract_version=contract_version,
+        operation=operation,
+        sequence=sequence,
+        stream_id=stream_id,
+        capture_id=capture_id,
+        ipc_handle=ipc_handle,
+    )
+    event = torch.cuda.Event.from_ipc_handle(device, ipc_handle)
+    return EventGraphCompletion(
+        contract_version=contract_version,
+        operation=operation,
+        sequence=sequence,
+        stream_id=stream_id,
+        capture_id=capture_id,
+        event=event,
+    )

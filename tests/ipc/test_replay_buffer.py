@@ -292,7 +292,10 @@ def test_cuda_ingress_publication_requires_completion_read_gate(
             def wait_before_read(self, stream=None):
                 assert isinstance(stream, torch.cuda.Stream)
 
-        buf.add(*batch, completion=StreamCompletion(operation="step"))
+        buf.add(
+            *batch,
+            completion=StreamCompletion(operation="step", capture_id="capture-ingress"),
+        )
 
         assert protected_ingress_slots
         assert buf.ingress_diagnostics()["high_water_occupancy"] == 1
@@ -332,7 +335,13 @@ def test_cuda_add_batch_reuses_one_completion_gate_for_each_chunk(
     del monkeypatch
 
     try:
-        assert buf.add_batch(*batch, completion=RecordingCompletion()) is True
+        assert (
+            buf.add_batch(
+                *batch,
+                completion=RecordingCompletion(capture_id="capture-ingress"),
+            )
+            is True
+        )
         chunks = [_take_and_commit(buf) for _ in range(3)]
         assert [count for _, count, _ in chunks] == [2, 2, 1]
         assert all(isinstance(stream, torch.cuda.Stream) for stream in waited_streams)
