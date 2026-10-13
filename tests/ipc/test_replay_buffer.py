@@ -358,6 +358,26 @@ def test_cuda_add_batch_reuses_one_completion_gate_for_each_chunk(
         buf.close()
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+def test_cuda_replay_buffer_is_spawn_serializable_before_collector_start():
+    """CUDA ingress must cross the spawn boundary without a process-local Stream."""
+    buf = ReplayBuffer(
+        capacity=16,
+        obs_dim=_OBS_DIM,
+        action_dim=_ACTION_DIM,
+        device="cuda",
+        ingress_slot_rows=4,
+        ingress_device="cuda",
+    )
+    try:
+        process = _SPAWN_CTX.Process(target=_spawn_serialize, args=(buf,))
+        process.start()
+        process.join(timeout=15.0)
+        assert process.exitcode == 0
+    finally:
+        buf.close()
+
+
 def test_ingress_stores_done_and_truncated_contract():
     buf = _make_buf(slot_rows=3)
     truncated = torch.tensor([0.0, 1.0, 0.0])
@@ -590,6 +610,11 @@ def _collector_publish_cuda_completion(buf: ReplayBuffer) -> None:
         operation="step", sequence=1, capture_id="capture-cross-process"
     )
     assert buf.add(*batch, completion=completion) is True
+
+
+def _spawn_serialize(buf: ReplayBuffer) -> None:
+    """Mimic the collector-side ForkingPickler used by ``Process.start()``."""
+    del buf
 
 
 def test_spawned_collector_publishes_bounded_chunks():
