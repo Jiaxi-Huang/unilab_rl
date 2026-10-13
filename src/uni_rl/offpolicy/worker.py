@@ -249,6 +249,11 @@ def _graph_lifecycle_manifest(env: Any) -> dict[str, Any]:
         entries = diagnostics.get("diagnostics")
         if isinstance(entries, dict):
             entry = entries.get("cuda_graph")
+    snapshot = getattr(env, "get_graph_lifecycle_manifest", None)
+    if callable(snapshot):
+        values = snapshot()
+        if isinstance(values, dict):
+            return {str(key): value for key, value in values.items()}
     return {"contract_version": 1, "backend_diagnostics": entry}
 
 

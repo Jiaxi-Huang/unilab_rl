@@ -35,3 +35,12 @@ def test_wait_graph_completion_validates_public_metadata() -> None:
 def test_wait_graph_completion_rejects_non_protocol_producer() -> None:
     with pytest.raises(TypeError, match="wait_before_read"):
         wait_graph_completion(object())  # type: ignore[arg-type]
+
+
+def test_wait_graph_completion_rejects_stale_sequences() -> None:
+    first = ImmediateGraphCompletion(sequence=1)
+    stale = ImmediateGraphCompletion(sequence=0)
+
+    wait_graph_completion(first)
+    with pytest.raises(ValueError, match="stale"):
+        wait_graph_completion(stale)

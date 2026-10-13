@@ -224,6 +224,11 @@ def test_backend_diagnostics_rejects_non_mapping_section() -> None:
 def test_graph_lifecycle_section_fails_closed() -> None:
     valid = {
         "contract_version": 1,
+        "state": "ready",
+        "capture_id": "capture-a",
+        "replay_count": 2,
+        "fallback_count": 0,
+        "disable_reason": None,
         "backend_diagnostics": {"requested": True, "enabled": True, "disable_reason": None},
     }
     manifest = _manifest()
@@ -235,6 +240,10 @@ def test_graph_lifecycle_section_fails_closed() -> None:
         lambda section: section.update(contract_version=True),
         lambda section: section.update(backend_diagnostics="cuda"),
         lambda section: section.update(backend_diagnostics={"requested": True, "enabled": "true"}),
+        lambda section: section.pop("capture_id"),
+        lambda section: section.update(disable_reason="stale reason"),
+        lambda section: section.update(state="capturing"),
+        lambda section: section.update(replay_count=True),
     ):
         malformed = _manifest()
         malformed["graph_lifecycle"] = {**valid}

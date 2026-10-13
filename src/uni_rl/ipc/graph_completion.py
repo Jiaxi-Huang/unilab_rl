@@ -2,8 +2,12 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+import itertools
+from dataclasses import dataclass, field
 from typing import Any, Protocol, runtime_checkable
+
+_LAST_SEQUENCE = 0
+_IMMEDIATE_SEQUENCE = itertools.count()
 
 
 @runtime_checkable
@@ -51,7 +55,14 @@ def wait_graph_completion(
         raise TypeError("graph completion sequence must be an integer")
     if isinstance(completion.stream_id, bool) or not isinstance(completion.stream_id, int):
         raise TypeError("graph completion stream_id must be an integer")
+    global _LAST_SEQUENCE
+    if completion.sequence < _LAST_SEQUENCE:
+        raise ValueError(
+            f"stale graph completion sequence {completion.sequence}; "
+            f"last published sequence is {_LAST_SEQUENCE}"
+        )
     completion.wait_before_read(stream)
+    _LAST_SEQUENCE = completion.sequence
     return completion
 
 
@@ -61,7 +72,7 @@ class ImmediateGraphCompletion:
 
     contract_version: int = 1
     operation: str = "step"
-    sequence: int = 0
+    sequence: int = field(default_factory=lambda: next(_IMMEDIATE_SEQUENCE))
     stream_id: int = 0
 
     def wait_before_read(self, stream: Any | None = None) -> None:
