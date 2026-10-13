@@ -614,3 +614,41 @@ def test_empty_terminal_contract_skips_host_bool_gate(monkeypatch: pytest.Monkey
     torch.testing.assert_close(packed[:, buf._nobs_sl], next_obs)
     assert not called
     buf.close()
+
+
+def test_commit_ingress_rejects_out_of_order_publication() -> None:
+    buf = _make_buf(capacity=32, slot_rows=4, depth=2)
+    first = _terminal_contract_batch(4)
+    second = _terminal_contract_batch(4)
+    buf.add(*first)
+    buf.add(*second)
+
+    first_ingress = buf.take_published_ingress()
+    second_ingress = buf.take_published_ingress()
+    assert first_ingress is not None and second_ingress is not None
+    second_slot, second_start, second_count, _ = second_ingress
+
+    with pytest.raises(RuntimeError, match="publication order"):
+        buf.commit_ingress(slot=second_slot, start=second_start, count=second_count)
+
+    first_slot, first_start, first_count, _ = first_ingress
+    buf.commit_ingress(slot=first_slot, start=first_start, count=first_count)
+    buf.commit_ingress(slot=second_slot, start=second_start, count=second_count)
+    assert int(buf.ptr[0]) == 8
+    assert int(buf.size[0]) == 8
+    buf.close()
+
+
+def test_commit_ingress_rejects_noncontiguous_start() -> None:
+    buf = _make_buf(capacity=32, slot_rows=4, depth=1)
+    buf.add(*_random_batch(4))
+    ingress = buf.take_published_ingress()
+    assert ingress is not None
+    slot, _start, count, _ = ingress
+
+    with pytest.raises(RuntimeError, match="not contiguous"):
+        buf.commit_ingress(slot=slot, start=4, count=count)
+
+    buf.commit_ingress(slot=slot, start=0, count=count)
+    assert int(buf.ptr[0]) == 4
+    buf.close()
