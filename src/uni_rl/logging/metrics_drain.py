@@ -16,22 +16,39 @@ from typing import Any
 
 @dataclass
 class RewardComponentWindow:
-    """Aggregate reward-term reports between learner iterations."""
+    """Aggregate reward-term reports between learner iterations.
+
+    Legacy per-step reports carry component means and are averaged by report
+    count. Tensor-native interval reports carry sums and must instead be
+    accumulated without changing the denominator.
+    """
 
     _sums: dict[str, float] = field(default_factory=dict)
     _counts: dict[str, int] = field(default_factory=dict)
+    _sum_semantics: dict[str, bool] = field(default_factory=dict)
 
-    def update(self, components: dict[str, float]) -> None:
+    def update(self, components: dict[str, float], *, sums: bool = False) -> None:
         for term, value in components.items():
             self._sums[term] = self._sums.get(term, 0.0) + float(value)
-            self._counts[term] = self._counts.get(term, 0) + 1
+            if sums:
+                self._sum_semantics[term] = True
+            else:
+                self._counts[term] = self._counts.get(term, 0) + 1
 
     def take(self) -> dict[str, float]:
-        if not self._counts:
+        if not self._sums:
             return {}
-        values = {term: total / self._counts[term] for term, total in self._sums.items()}
+        values = {
+            term: (
+                total
+                if self._sum_semantics.get(term, False)
+                else total / max(self._counts.get(term, 1), 1)
+            )
+            for term, total in self._sums.items()
+        }
         self._sums.clear()
         self._counts.clear()
+        self._sum_semantics.clear()
         return values
 
 
@@ -74,7 +91,9 @@ def drain_collector_metrics(
             if "return_mean_ep100" in metrics:
                 reward_history.append(metrics["return_mean_ep100"])
             if "reward_components" in metrics:
-                reward_components.update(metrics["reward_components"])
+                reward_components.update(
+                    metrics["reward_components"], sums=bool(metrics.get("reward_component_sums"))
+                )
             if "mean_episode_length" in metrics:
                 logger.update_mean_episode_length(metrics["mean_episode_length"])
             if "collector_timing_ms" in metrics:

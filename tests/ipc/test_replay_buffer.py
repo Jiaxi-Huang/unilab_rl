@@ -9,6 +9,7 @@ import time
 import pytest
 import torch
 
+from uni_rl.ipc.graph_completion import ImmediateGraphCompletion
 from uni_rl.ipc.replay_buffer import ReplayBuffer
 
 _SPAWN_CTX = mp.get_context("spawn")
@@ -261,24 +262,9 @@ def test_add_batch_backpressures_between_chunks_until_learner_commits():
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
-def test_cuda_ingress_publication_uses_current_stream_barrier(
+def test_cuda_ingress_publication_requires_completion_read_gate(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    original_current_stream = torch.cuda.current_stream
-    current_stream_devices: list[torch.device] = []
-
-    def fail_device_sync(*args, **kwargs) -> None:
-        raise AssertionError("replay ingress must not synchronize the whole device")
-
-    def tracking_current_stream(device=None, *args, **kwargs):
-        current_stream_devices.append(
-            torch.device(device) if device is not None else torch.device("cuda")
-        )
-        return original_current_stream(device, *args, **kwargs)
-
-    monkeypatch.setattr(torch.cuda, "synchronize", fail_device_sync)
-    monkeypatch.setattr(torch.cuda, "current_stream", tracking_current_stream)
-
     def fail_ingress_read(*args, **kwargs) -> None:
         del args, kwargs
         raise AssertionError("diagnostics must not read CUDA ingress tensors")
@@ -299,7 +285,17 @@ def test_cuda_ingress_publication_uses_current_stream_barrier(
             monkeypatch.setattr(slot, "item", fail_ingress_read)
             protected_ingress_slots.append(slot)
         batch = tuple(tensor.to("cuda") for tensor in _random_batch(4))
-        buf.add(*batch)
+        with pytest.raises(RuntimeError, match="graph completion receipt"):
+            buf.add(*batch)
+
+        class StreamCompletion(ImmediateGraphCompletion):
+            def wait_before_read(self, stream=None):
+                assert isinstance(stream, torch.cuda.Stream)
+
+        buf.add(
+            *batch,
+            completion=StreamCompletion(operation="step", capture_id="capture-ingress"),
+        )
 
         assert protected_ingress_slots
         assert buf.ingress_diagnostics()["high_water_occupancy"] == 1
@@ -312,28 +308,20 @@ def test_cuda_ingress_publication_uses_current_stream_barrier(
         assert (start, count) == (0, 4)
         torch.testing.assert_close(packed[:, buf._obs_sl], batch[0])
         torch.testing.assert_close(packed[:, buf._act_sl], batch[1])
-        assert len(current_stream_devices) == 1
     finally:
         buf.close()
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
-def test_cuda_add_batch_synchronizes_each_published_chunk(
+def test_cuda_add_batch_reuses_one_completion_gate_for_each_chunk(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    original_current_stream = torch.cuda.current_stream
-    synchronized_devices: list[torch.device] = []
+    waited_streams: list[object] = []
 
-    def tracking_current_stream(device=None, *args, **kwargs):
-        stream = original_current_stream(device, *args, **kwargs)
+    class RecordingCompletion(ImmediateGraphCompletion):
+        def wait_before_read(self, stream=None):
+            waited_streams.append(stream)
 
-        def synchronize():
-            synchronized_devices.append(torch.device(device if device is not None else "cuda"))
-
-        stream.synchronize = synchronize
-        return stream
-
-    monkeypatch.setattr(torch.cuda, "current_stream", tracking_current_stream)
     buf = ReplayBuffer(
         capacity=16,
         obs_dim=_OBS_DIM,
@@ -344,12 +332,20 @@ def test_cuda_add_batch_synchronizes_each_published_chunk(
         ingress_device="cuda",
     )
     batch = tuple(tensor.to("cuda") for tensor in _random_batch(5))
+    del monkeypatch
 
     try:
-        assert buf.add_batch(*batch) is True
+        assert (
+            buf.add_batch(
+                *batch,
+                completion=RecordingCompletion(capture_id="capture-ingress"),
+            )
+            is True
+        )
         chunks = [_take_and_commit(buf) for _ in range(3)]
         assert [count for _, count, _ in chunks] == [2, 2, 1]
-        assert synchronized_devices == [torch.device("cuda")] * 3
+        assert all(isinstance(stream, torch.cuda.Stream) for stream in waited_streams)
+        assert len(waited_streams) == 3
         packed_obs = torch.cat(
             (
                 chunks[0][2][:, buf._obs_sl],
@@ -378,6 +374,21 @@ def test_ingress_stores_done_and_truncated_contract():
     _, _, packed = _take_and_commit(buf)
     torch.testing.assert_close(packed[:, buf._done_col], dones)
     torch.testing.assert_close(packed[:, buf._trunc_col], truncated)
+    buf.close()
+
+
+def test_ingress_rejects_stale_completion_within_one_buffer() -> None:
+    buf = _make_buf()
+
+    assert buf.add(
+        *_random_batch(4),
+        completion=ImmediateGraphCompletion(sequence=2),
+    )
+    with pytest.raises(ValueError, match="stale graph completion"):
+        buf.add(
+            *_random_batch(4),
+            completion=ImmediateGraphCompletion(sequence=1),
+        )
     buf.close()
 
 
@@ -582,4 +593,73 @@ def test_spawned_collector_publishes_bounded_chunks():
     assert diagnostics["release_sequence"] == 4
     assert 1 <= diagnostics["high_water_occupancy"] <= 2
     assert diagnostics["dropped_batches"] == 0
+    buf.close()
+
+
+def test_empty_terminal_contract_skips_host_bool_gate(monkeypatch: pytest.MonkeyPatch) -> None:
+    buf = _make_buf(capacity=16, slot_rows=4, depth=2)
+    called = False
+
+    def fail_any(mask):
+        raise AssertionError("empty terminal contract host-converted terminal_mask.any()")
+
+    monkeypatch.setattr(torch.Tensor, "any", fail_any)
+    obs, actions, rewards, next_obs, dones, truncated = _random_batch(4)
+    empty_terminal_obs = torch.full((4, _OBS_DIM), 17.0)
+
+    try:
+        buf.add(
+            obs,
+            actions,
+            rewards,
+            next_obs,
+            dones,
+            truncated,
+            terminal_mask=torch.zeros(4, dtype=torch.bool),
+            terminal_next_obs=empty_terminal_obs,
+        )
+    finally:
+        monkeypatch.undo()
+
+    _, _, packed = _take_and_commit(buf)
+    torch.testing.assert_close(packed[:, buf._nobs_sl], next_obs)
+    assert not called
+    buf.close()
+
+
+def test_commit_ingress_rejects_out_of_order_publication() -> None:
+    buf = _make_buf(capacity=32, slot_rows=4, depth=2)
+    first = _terminal_contract_batch(4)
+    second = _terminal_contract_batch(4)
+    buf.add(*first)
+    buf.add(*second)
+
+    first_ingress = buf.take_published_ingress()
+    second_ingress = buf.take_published_ingress()
+    assert first_ingress is not None and second_ingress is not None
+    second_slot, second_start, second_count, _ = second_ingress
+
+    with pytest.raises(RuntimeError, match="publication order"):
+        buf.commit_ingress(slot=second_slot, start=second_start, count=second_count)
+
+    first_slot, first_start, first_count, _ = first_ingress
+    buf.commit_ingress(slot=first_slot, start=first_start, count=first_count)
+    buf.commit_ingress(slot=second_slot, start=second_start, count=second_count)
+    assert int(buf.ptr[0]) == 8
+    assert int(buf.size[0]) == 8
+    buf.close()
+
+
+def test_commit_ingress_rejects_noncontiguous_start() -> None:
+    buf = _make_buf(capacity=32, slot_rows=4, depth=1)
+    buf.add(*_random_batch(4))
+    ingress = buf.take_published_ingress()
+    assert ingress is not None
+    slot, _start, count, _ = ingress
+
+    with pytest.raises(RuntimeError, match="not contiguous"):
+        buf.commit_ingress(slot=slot, start=4, count=count)
+
+    buf.commit_ingress(slot=slot, start=0, count=count)
+    assert int(buf.ptr[0]) == 4
     buf.close()

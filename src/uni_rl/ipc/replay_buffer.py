@@ -6,6 +6,11 @@ from typing import Any
 
 import torch
 
+from uni_rl.ipc.graph_completion import (
+    GraphCompletionTokenProtocol,
+    record_ingress_publication,
+    wait_graph_completion,
+)
 from uni_rl.ipc.shared_buffer import SharedBufferBase
 
 DEFAULT_REPLAY_INGRESS_DEPTH = 2
@@ -120,6 +125,14 @@ class ReplayBuffer(SharedBufferBase):
         self._ingress_ready = spawn_context.Semaphore(0)
         self._ingress_consume_seq = 0
         self._ingress_release_seq = 0
+        self._graph_completion_sequence = 0
+        self._graph_capture_id: str | None = None
+        self._last_graph_completion: GraphCompletionTokenProtocol | None = None
+        self._ingress_read_stream = (
+            torch.cuda.current_stream(self._ingress_device)
+            if self._ingress_device.type == "cuda"
+            else None
+        )
 
     @property
     def storage_width(self) -> int:
@@ -204,6 +217,21 @@ class ReplayBuffer(SharedBufferBase):
         count = int(self._ingress_counts[slot])
         return slot, start, count, self._ingress_slots[slot][:count]
 
+    @property
+    def last_graph_completion(self) -> GraphCompletionTokenProtocol | None:
+        """Return the receipt guarding the newest published ingress slot."""
+        return self._last_graph_completion
+
+    @property
+    def graph_completion_sequence(self) -> int:
+        """Return the latest completion sequence accepted by this buffer."""
+        return self._graph_completion_sequence
+
+    @property
+    def graph_capture_id(self) -> str | None:
+        """Return the capture identity accepted by this ingress producer."""
+        return self._graph_capture_id
+
     def commit_ingress(self, *, slot: int, start: int, count: int) -> None:
         expected_slot = self._ingress_release_seq % self._ingress_depth
         if slot != expected_slot:
@@ -242,6 +270,7 @@ class ReplayBuffer(SharedBufferBase):
         state = self.__dict__.copy()
         state["trace_recorder"] = None
         state["_stop_event"] = None
+        state["_last_graph_completion"] = None
         return state
 
     def add(
@@ -257,6 +286,7 @@ class ReplayBuffer(SharedBufferBase):
         critic=None,
         next_critic=None,
         terminal_next_critic=None,
+        completion: GraphCompletionTokenProtocol | None = None,
     ) -> bool:
         """Add batch (called by collector).
 
@@ -278,6 +308,7 @@ class ReplayBuffer(SharedBufferBase):
             next_critic,
             terminal_next_critic,
             trace_start_ns=_trace_ns,
+            completion=completion,
         )
 
     def add_batch(
@@ -293,6 +324,7 @@ class ReplayBuffer(SharedBufferBase):
         critic=None,
         next_critic=None,
         terminal_next_critic=None,
+        completion: GraphCompletionTokenProtocol | None = None,
     ) -> bool:
         """Publish a collector vector in bounded ingress-sized chunks.
 
@@ -313,6 +345,7 @@ class ReplayBuffer(SharedBufferBase):
                 critic=critic,
                 next_critic=next_critic,
                 terminal_next_critic=terminal_next_critic,
+                completion=completion,
             )
 
         def optional_slice(
@@ -334,6 +367,7 @@ class ReplayBuffer(SharedBufferBase):
                 critic=optional_slice(critic, start, end),
                 next_critic=optional_slice(next_critic, start, end),
                 terminal_next_critic=optional_slice(terminal_next_critic, start, end),
+                completion=completion,
             )
             if not published:
                 return False
@@ -354,6 +388,7 @@ class ReplayBuffer(SharedBufferBase):
         terminal_next_critic,
         *,
         trace_start_ns: int,
+        completion: GraphCompletionTokenProtocol | None = None,
     ) -> bool:
         count = int(obs.shape[0])
         if count > self._ingress_slot_rows:
@@ -417,12 +452,28 @@ class ReplayBuffer(SharedBufferBase):
                 target[:, self._ncritic_sl] if has_critic else None,
                 terminal_next_critic,
             )
+            completion = wait_graph_completion(
+                completion,
+                stream=self._ingress_read_stream,
+                capture_id=self._graph_capture_id,
+                last_sequence=self._graph_completion_sequence,
+            )
+            if completion is not None:
+                completion = record_ingress_publication(
+                    completion,
+                    stream=self._ingress_read_stream,
+                )
+                self._graph_completion_sequence = completion.sequence
+                self._graph_capture_id = completion.capture_id
+                self._last_graph_completion = completion
             if self._ingress_device.type == "cuda":
-                # The CPU semaphore cannot order producer CUDA writes against
-                # the learner's ingress copy. Publish only after the producer
-                # stream that wrote this slot has completed; retain this
-                # conservative barrier rather than using a cross-process event.
-                torch.cuda.current_stream(self._ingress_device).synchronize()
+                # A CUDA slot is unreadable without a negotiated completion
+                # receipt. Fail closed instead of synchronizing the producer
+                # stream or publishing a race against the learner's copy.
+                if completion is None:
+                    raise RuntimeError(
+                        "CUDA replay ingress publication requires a graph completion receipt"
+                    )
             start = int(self._published_ptr[0])
             self._ingress_starts[slot] = start
             self._ingress_counts[slot] = count

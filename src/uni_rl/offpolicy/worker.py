@@ -9,7 +9,7 @@ import numpy as np
 import torch
 
 from uni_rl.algos.common.collector_timing import extract_env_step_breakdown_timing_ms
-from uni_rl.env_contract import EnvFactory, get_backend_runtime_diagnostics
+from uni_rl.env_contract import EnvFactory, get_algo_capabilities, get_backend_runtime_diagnostics
 from uni_rl.offpolicy.actor_adapter import get_offpolicy_actor_adapter, import_actor_adapter_modules
 from uni_rl.offpolicy.coordination import (
     LearnerCoordinationState,
@@ -229,6 +229,34 @@ def _collector_action_numpy(actions: np.ndarray | torch.Tensor) -> np.ndarray:
     return np.asarray(actions, dtype=np.float32)
 
 
+def _merge_reward_component_sums(
+    left: dict[str, float] | None, right: dict[str, float] | None
+) -> dict[str, float] | None:
+    if left is None and right is None:
+        return None
+    if left is None:
+        return dict(right or {})
+    if right is None:
+        return dict(left)
+    return {key: left.get(key, 0.0) + right.get(key, 0.0) for key in left.keys() | right.keys()}
+
+
+def _graph_lifecycle_manifest(env: Any) -> dict[str, Any]:
+    """Snapshot optional graph lifecycle evidence without backend probing."""
+    diagnostics = get_backend_runtime_diagnostics(env)
+    entry = None
+    if diagnostics is not None:
+        entries = diagnostics.get("diagnostics")
+        if isinstance(entries, dict):
+            entry = entries.get("cuda_graph")
+    snapshot = getattr(env, "get_graph_lifecycle_manifest", None)
+    if callable(snapshot):
+        values = snapshot()
+        if isinstance(values, dict):
+            return {str(key): value for key, value in values.items()}
+    return {"contract_version": 1, "backend_diagnostics": entry}
+
+
 def off_policy_collector_fn(
     stop_event,
     env_factory: EnvFactory,
@@ -411,11 +439,13 @@ def _run_collector(
         )
     current_ep_rewards = np.zeros(num_envs, dtype=np.float32)
     current_ep_lengths = np.zeros(num_envs, dtype=np.int32)
+    reward_component_names = get_algo_capabilities(env).reward_component_names or ()
     tensor_metrics = (
         TensorCollectorMetrics(
             num_envs,
             interval=collector_metrics_interval,
             device=state.obs["obs"].device,
+            reward_component_names=reward_component_names,
         )
         if tensor_collector
         else None
@@ -440,6 +470,7 @@ def _run_collector(
         final: bool = False,
         reward_history: deque[float] | None = None,
         length_history: deque[int] | None = None,
+        reward_component_sums: dict[str, float] | None = None,
     ) -> bool:
         """Publish one collector metric snapshot without losing window state."""
 
@@ -465,8 +496,12 @@ def _run_collector(
         components_mean = {
             key: statistics.mean(values) for key, values in ep_reward_components.items() if values
         }
+        if reward_component_sums:
+            components_mean.update(reward_component_sums)
         if components_mean:
             msg["reward_components"] = components_mean
+            if reward_component_sums:
+                msg["reward_component_sums"] = True
         if timing_counts:
             msg["collector_timing_ms"] = {
                 key: total / timing_counts[key]
@@ -537,6 +572,10 @@ def _run_collector(
                     pending_flush.lengths + metric_flush.lengths,
                     pending_flush.done_count + metric_flush.done_count,
                     pending_flush.timeout_count + metric_flush.timeout_count,
+                    reward_component_sums=_merge_reward_component_sums(
+                        pending_flush.reward_component_sums,
+                        metric_flush.reward_component_sums,
+                    ),
                 )
             else:
                 completed_flush = metric_flush
@@ -557,6 +596,7 @@ def _run_collector(
                 final=True,
                 reward_history=publication_rewards,
                 length_history=publication_lengths,
+                reward_component_sums=completed_flush.reward_component_sums,
             )
             if published:
                 ep_rewards = publication_rewards
@@ -615,6 +655,7 @@ def _run_collector(
         "inference_legal_max_in_flight": 1,
         "inference_dependency_graph": dict(INFERENCE_DEPENDENCY_GRAPH),
         "backend_diagnostics": dict(backend_diagnostics),
+        "graph_lifecycle": _graph_lifecycle_manifest(env),
     }
     if trace_recorder:
         manifest_ns = _time.perf_counter_ns()
@@ -799,10 +840,12 @@ def _run_collector(
                 prev_dones_t = combined_dones_t
                 done_mask_t = combined_dones_t > 0.5
                 assert tensor_metrics is not None
+                reward_components_t = state.info.get("reward_components")
                 tensor_metrics.update(
                     rewards_t,
                     done_mask_t,
                     truncated_t > 0.5,
+                    reward_components=reward_components_t,
                 )
                 terminal_final = state.final_observation
                 if terminal_final is not None:
@@ -881,6 +924,7 @@ def _run_collector(
                     critic=critic_t,
                     next_critic=next_critic_t,
                     terminal_next_critic=terminal_critic_t,
+                    completion=state.info.get("graph_completion"),
                 )
                 if not published and not stop_event.is_set():
                     raise RuntimeError("replay ingress closed before collector shutdown")
@@ -914,6 +958,7 @@ def _run_collector(
                         if terminal_contract.terminal_critic is not None
                         else None
                     ),
+                    completion=state.info.get("graph_completion"),
                 )
                 if not published and not stop_event.is_set():
                     raise RuntimeError("replay ingress closed before collector shutdown")
@@ -952,7 +997,7 @@ def _run_collector(
             total_steps += num_envs
 
             # Extract reward components from env info
-            log_info = state.info.get("log", {})
+            log_info = state.info.get("log", {}) if reward_component_names else {}
             if log_info:
                 for k, v in log_info.items():
                     if k.startswith("reward/"):
@@ -974,6 +1019,10 @@ def _run_collector(
                             pending_flush.lengths + metric_flush.lengths,
                             pending_flush.done_count + metric_flush.done_count,
                             pending_flush.timeout_count + metric_flush.timeout_count,
+                            reward_component_sums=_merge_reward_component_sums(
+                                pending_flush.reward_component_sums,
+                                metric_flush.reward_component_sums,
+                            ),
                         )
                     publication_rewards = deque(ep_rewards, maxlen=ep_rewards.maxlen)
                     publication_lengths = deque(ep_lengths, maxlen=ep_lengths.maxlen)
@@ -984,6 +1033,7 @@ def _run_collector(
                     published = enqueue_collector_metrics(
                         reward_history=publication_rewards,
                         length_history=publication_lengths,
+                        reward_component_sums=completed_flush.reward_component_sums,
                     )
                     if published:
                         ep_rewards = publication_rewards

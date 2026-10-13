@@ -55,6 +55,7 @@ def test_runtime_checkable_isinstance_semantics():
         action_low = np.zeros((2,), dtype=np.float32)
         action_high = np.ones((2,), dtype=np.float32)
         joint_names = ("a", "b")
+        reward_component_names = ("alive",)
 
     class _MissingField:
         action_low = np.zeros((2,), dtype=np.float32)

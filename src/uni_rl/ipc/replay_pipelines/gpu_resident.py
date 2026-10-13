@@ -25,6 +25,7 @@ from typing import Any, Dict, List, Tuple, cast
 
 import torch
 
+from uni_rl.ipc.graph_completion import wait_graph_completion
 from uni_rl.ipc.replay_buffer import ReplayBuffer
 from uni_rl.ipc.replay_pipelines.base import ReplayTickMetadata
 from uni_rl.ipc.replay_pipelines.transfer import build_replay_transfer_backend
@@ -388,6 +389,12 @@ class GPUResidentReplayPipeline:
 
         if self._device.type == "cuda":
             with torch.cuda.device(self._device), torch.cuda.stream(self._sync_stream):
+                wait_graph_completion(
+                    self._replay_buffer.last_graph_completion,
+                    stream=self._sync_stream,
+                    capture_id=self._replay_buffer.graph_capture_id,
+                    last_sequence=self._replay_buffer.graph_completion_sequence,
+                )
                 if record_cuda:
                     start_event = cast(Any, torch.cuda.Event(enable_timing=True))
                     end_event = cast(Any, torch.cuda.Event(enable_timing=True))

@@ -11,6 +11,7 @@ from threading import Condition, Lock
 import pytest
 import torch
 
+from uni_rl.ipc.graph_completion import ImmediateGraphCompletion
 from uni_rl.ipc.replay_buffer import ReplayBuffer
 from uni_rl.ipc.replay_pipelines.gpu_resident import (
     GPUResidentReplayPipeline,
@@ -226,6 +227,44 @@ class TestMPSIngressEventLifecycle:
         assert pipeline._drain_completed_spans() is True
         assert commits == [(0, 6, 4)]
         assert pipeline._visible_ptr == 10
+
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+    def test_cuda_ingress_copy_waits_public_completion_before_read(self):
+        pipeline = object.__new__(GPUResidentReplayPipeline)
+        pipeline._device = torch.device("cuda")
+        pipeline._capacity = 4
+        pipeline._gpu_storage = torch.zeros(4, 2, device="cuda")
+        pipeline._submitted_ptr = 0
+        pipeline._visible_ptr = 0
+        pipeline._span_events = deque()
+        pipeline._trace_recorder = None
+        pipeline._trace_cuda_events = False
+        pipeline._submission_lock = Lock()
+        pipeline._sync_stream = torch.cuda.Stream()
+        waited: list[object] = []
+
+        class Completion(ImmediateGraphCompletion):
+            def wait_before_read(self, stream=None):
+                waited.append(stream)
+
+            capture_id = "capture-a"
+
+        class Replay:
+            last_graph_completion = Completion(sequence=1, capture_id="capture-a")
+            graph_completion_sequence = 1
+            graph_capture_id = "capture-a"
+
+        pipeline._replay_buffer = Replay()
+
+        pipeline._submit_span_copy(
+            start=0,
+            end=4,
+            source=torch.ones(4, 2, device="cuda"),
+            ingress_slot=0,
+        )
+
+        assert waited == [pipeline._sync_stream]
+        assert pipeline._span_events
 
     def test_multiple_pending_spans_commit_in_order_and_release_slots(self):
         pipeline = object.__new__(GPUResidentReplayPipeline)

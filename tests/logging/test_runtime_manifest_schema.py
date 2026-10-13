@@ -221,6 +221,37 @@ def test_backend_diagnostics_rejects_non_mapping_section() -> None:
         validate_runtime_manifest(manifest, completed=True)
 
 
+def test_graph_lifecycle_section_fails_closed() -> None:
+    valid = {
+        "contract_version": 1,
+        "state": "ready",
+        "capture_id": "capture-a",
+        "replay_count": 2,
+        "fallback_count": 0,
+        "disable_reason": None,
+        "backend_diagnostics": {"requested": True, "enabled": True, "disable_reason": None},
+    }
+    manifest = _manifest()
+    manifest["graph_lifecycle"] = dict(valid)
+    validate_runtime_manifest(manifest, completed=True)
+
+    for mutation in (
+        lambda section: section.pop("contract_version"),
+        lambda section: section.update(contract_version=True),
+        lambda section: section.update(backend_diagnostics="cuda"),
+        lambda section: section.update(backend_diagnostics={"requested": True, "enabled": "true"}),
+        lambda section: section.pop("capture_id"),
+        lambda section: section.update(disable_reason="stale reason"),
+        lambda section: section.update(state="capturing"),
+        lambda section: section.update(replay_count=True),
+    ):
+        malformed = _manifest()
+        malformed["graph_lifecycle"] = {**valid}
+        mutation(malformed["graph_lifecycle"])
+        with pytest.raises(ValueError, match="graph_lifecycle"):
+            validate_runtime_manifest(malformed, completed=True)
+
+
 def test_metric_schema_version_is_separate_from_runtime_manifest_version() -> None:
     assert METRIC_SCHEMA_VERSION == 1
     assert RUNTIME_MANIFEST_SCHEMA_VERSION == 1

@@ -32,6 +32,8 @@ _STABLE_NONNEGATIVE_INT_FIELDS = (
     ("replay_ingress", "stop_returns"),
     ("inference_memory_budget", "ipc_event_count"),
 )
+_GRAPH_LIFECYCLE_NONNEGATIVE_INT_FIELDS = (("graph_lifecycle", "contract_version"),)
+_GRAPH_LIFECYCLE_STATES = frozenset({"unavailable", "ready", "invalidated"})
 _COMPLETED_REQUIRED_SECTIONS = (
     "inference_flight",
     "replay_ingress",
@@ -105,6 +107,7 @@ def validate_runtime_manifest(
             )
 
     _validate_backend_diagnostics(manifest)
+    _validate_graph_lifecycle(manifest)
 
 
 def _validate_backend_diagnostics(manifest: Mapping[str, Any]) -> None:
@@ -162,6 +165,63 @@ def _validate_backend_diagnostics(manifest: Mapping[str, Any]) -> None:
             isinstance(disable_reason, str) and disable_reason.strip()
         ):
             raise ValueError(f"{label} is disabled and must declare a disable reason")
+
+
+def _validate_graph_lifecycle(manifest: Mapping[str, Any]) -> None:
+    """Validate the optional graph lifecycle producer section."""
+    section = manifest.get("graph_lifecycle")
+    if section is None:
+        return
+    if not isinstance(section, Mapping):
+        raise ValueError("runtime_manifest.graph_lifecycle must be a mapping")
+    for section_name, field_name in _GRAPH_LIFECYCLE_NONNEGATIVE_INT_FIELDS:
+        value = section.get(field_name)
+        if value is None:
+            raise ValueError(f"runtime_manifest.{section_name}.{field_name} is required")
+        _require_nonnegative_int(
+            value,
+            f"runtime_manifest.{section_name}.{field_name}",
+        )
+    for field_name in ("replay_count", "fallback_count"):
+        value = section.get(field_name)
+        if value is not None:
+            _require_nonnegative_int(
+                value,
+                f"runtime_manifest.graph_lifecycle.{field_name}",
+            )
+    state = section.get("state")
+    if state is not None and state not in _GRAPH_LIFECYCLE_STATES:
+        raise ValueError(
+            "runtime_manifest.graph_lifecycle.state must be "
+            f"one of {sorted(_GRAPH_LIFECYCLE_STATES)}"
+        )
+    if state == "ready":
+        capture_id = section.get("capture_id")
+        if not isinstance(capture_id, str) or not capture_id.strip():
+            raise ValueError(
+                "runtime_manifest.graph_lifecycle.capture_id is required when state is ready"
+            )
+        if section.get("disable_reason") is not None:
+            raise ValueError(
+                "runtime_manifest.graph_lifecycle.disable_reason must be null when state is ready"
+            )
+    elif state is not None and not (
+        isinstance(section.get("disable_reason"), str) and section["disable_reason"].strip()
+    ):
+        raise ValueError(
+            "runtime_manifest.graph_lifecycle.disable_reason is required when state is not ready"
+        )
+    entry = section.get("backend_diagnostics")
+    if entry is not None:
+        if not isinstance(entry, Mapping):
+            raise ValueError(
+                "runtime_manifest.graph_lifecycle.backend_diagnostics must be a mapping or null"
+            )
+        for field in ("requested", "enabled"):
+            if not isinstance(entry.get(field), bool):
+                raise ValueError(
+                    f"runtime_manifest.graph_lifecycle.backend_diagnostics.{field} must be a bool"
+                )
 
 
 def _validate_positive_int(
