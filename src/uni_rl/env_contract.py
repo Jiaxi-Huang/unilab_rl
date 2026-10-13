@@ -128,6 +128,84 @@ class SupportsBackendDiagnosticsProtocol(Protocol):
 
 
 @runtime_checkable
+class SupportsCollectorGraphModeProtocol(Protocol):
+    """Optional provider protocol: envs negotiate collector graph execution.
+
+    This is a cold-path owner contract. A collector may request a mode after
+    env initialization and before its first control tick; it must never call
+    the negotiation method inside ``step``/``reset``. ``disabled`` and
+    ``eager`` are independent explicit modes: backend physics graph state, or
+    a backend ``UNAVAILABLE`` graph lifecycle, must never be interpreted as
+    collector mode selection.
+    """
+
+    def configure_collector_graph(
+        self,
+        mode: str,
+        *,
+        allow_eager_fallback: bool = False,
+    ) -> None:
+        """Negotiate ``disabled``, ``eager``, or ``graph`` execution.
+
+        Unsupported graph negotiation fails closed by default. If the owner
+        explicitly allows fallback, the returned manifest alone records the
+        eager mode, reason, and fallback count.
+        """
+        ...
+
+    def get_collector_graph_manifest(self) -> Mapping[str, Any]:
+        """Return requested/enabled/state/reason/counter evidence."""
+        ...
+
+
+@dataclass(frozen=True)
+class CollectorGraphNegotiation:
+    """Result of the neutral collector mode negotiation."""
+
+    mode: str = "disabled"
+    manifest: Mapping[str, Any] | None = None
+
+
+COLLECTOR_GRAPH_MODES = frozenset({"disabled", "eager", "graph"})
+
+
+def negotiate_collector_graph(
+    env: Any,
+    mode: str,
+    *,
+    allow_eager_fallback: bool = False,
+) -> CollectorGraphNegotiation:
+    """Negotiate collector execution through the optional env protocol.
+
+    All modes fail closed when an env does not implement the public protocol;
+    there is no implicit graph/eager inference from backend state. The call is
+    cold-path only and returns a JSON-safe manifest snapshot.
+    """
+    if not isinstance(mode, str):
+        raise TypeError(f"collector graph mode must be a string, got {type(mode).__name__}")
+    normalized = mode.strip().lower()
+    if normalized not in COLLECTOR_GRAPH_MODES:
+        choices = ", ".join(sorted(COLLECTOR_GRAPH_MODES))
+        raise ValueError(f"collector graph mode must be one of {choices}; got {mode!r}")
+    provider = env if isinstance(env, SupportsCollectorGraphModeProtocol) else None
+    if provider is None:
+        if normalized == "disabled":
+            return CollectorGraphNegotiation(mode="disabled")
+        raise NotImplementedError("env does not implement the public collector graph mode protocol")
+    provider.configure_collector_graph(
+        normalized,
+        allow_eager_fallback=allow_eager_fallback,
+    )
+    manifest = provider.get_collector_graph_manifest()
+    if not isinstance(manifest, Mapping):
+        raise TypeError("collector graph manifest must be a mapping")
+    negotiated = str(manifest.get("mode", normalized))
+    if negotiated not in COLLECTOR_GRAPH_MODES:
+        raise ValueError(f"env returned unsupported collector graph mode {negotiated!r}")
+    return CollectorGraphNegotiation(mode=negotiated, manifest=manifest)
+
+
+@runtime_checkable
 class EnvProtocol(Protocol):
     """Vectorized tensor env consumed by uni_rl runners and collectors."""
 
@@ -216,8 +294,12 @@ __all__ = [
     "EnvPlayCapabilitiesProtocol",
     "EnvProtocol",
     "EnvStateProtocol",
+    "COLLECTOR_GRAPH_MODES",
+    "CollectorGraphNegotiation",
     "SupportsAlgoCapabilitiesProtocol",
     "SupportsBackendDiagnosticsProtocol",
+    "SupportsCollectorGraphModeProtocol",
     "get_algo_capabilities",
     "get_backend_runtime_diagnostics",
+    "negotiate_collector_graph",
 ]

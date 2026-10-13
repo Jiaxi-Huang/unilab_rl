@@ -252,6 +252,48 @@ def test_graph_lifecycle_section_fails_closed() -> None:
             validate_runtime_manifest(malformed, completed=True)
 
 
+def test_collector_graph_section_fails_closed() -> None:
+    valid = {
+        "mode": "eager",
+        "requested": False,
+        "enabled": False,
+        "state": "eager",
+        "capture_id": None,
+        "disable_reason": "explicit eager collector execution",
+    }
+    manifest = _manifest()
+    manifest["collector_graph"] = dict(valid)
+    validate_runtime_manifest(manifest, completed=True)
+
+    for mutation, message in (
+        (lambda section: section.pop("mode"), "collector_graph.mode"),
+        (lambda section: section.update(mode="capture"), "collector_graph.mode"),
+        (lambda section: section.update(requested="false"), "requested/enabled"),
+        (lambda section: section.update(enabled=True), "requested READY graph"),
+        (lambda section: section.update(state="capturing"), "collector_graph.state"),
+        (lambda section: section.update(capture_id="capture-a"), "must not declare capture_id"),
+        (lambda section: section.update(disable_reason=None), "non-empty disable_reason"),
+    ):
+        malformed = _manifest()
+        malformed["collector_graph"] = {**valid}
+        mutation(malformed["collector_graph"])
+        with pytest.raises(ValueError, match=message):
+            validate_runtime_manifest(malformed, completed=True)
+
+
+def test_collector_graph_ready_evidence_requires_capture_identity() -> None:
+    manifest = _manifest()
+    manifest["collector_graph"] = {
+        "mode": "graph",
+        "requested": True,
+        "enabled": True,
+        "state": "ready",
+        "capture_id": "collector-capture-a",
+        "disable_reason": None,
+    }
+    validate_runtime_manifest(manifest, completed=True)
+
+
 def test_metric_schema_version_is_separate_from_runtime_manifest_version() -> None:
     assert METRIC_SCHEMA_VERSION == 1
     assert RUNTIME_MANIFEST_SCHEMA_VERSION == 1

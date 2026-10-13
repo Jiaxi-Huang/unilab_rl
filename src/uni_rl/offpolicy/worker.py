@@ -9,7 +9,12 @@ import numpy as np
 import torch
 
 from uni_rl.algos.common.collector_timing import extract_env_step_breakdown_timing_ms
-from uni_rl.env_contract import EnvFactory, get_algo_capabilities, get_backend_runtime_diagnostics
+from uni_rl.env_contract import (
+    EnvFactory,
+    get_algo_capabilities,
+    get_backend_runtime_diagnostics,
+    negotiate_collector_graph,
+)
 from uni_rl.offpolicy.actor_adapter import get_offpolicy_actor_adapter, import_actor_adapter_modules
 from uni_rl.offpolicy.coordination import (
     LearnerCoordinationState,
@@ -283,6 +288,7 @@ def off_policy_collector_fn(
     backend_device_binder=None,
     learner_coordination: LearnerCoordinationState | None = None,
     learner_pid: int | None = None,
+    collector_graph_mode: str = "disabled",
 ):
     """Entry point for the off-policy collector subprocess.
 
@@ -315,6 +321,7 @@ def off_policy_collector_fn(
         backend_device_binder=backend_device_binder,
         learner_coordination=learner_coordination,
         learner_pid=learner_pid,
+        collector_graph_mode=collector_graph_mode,
     )
 
 
@@ -344,6 +351,7 @@ def _run_collector(
     backend_device_binder=None,
     learner_coordination=None,
     learner_pid=None,
+    collector_graph_mode="disabled",
 ):
     # Spawn subprocesses do not inherit the parent's adapter registrations;
     # import the configured modules so registration side effects run here too.
@@ -371,6 +379,11 @@ def _run_collector(
         )
     if "inference_transport" in (env_cfg_override or {}):
         raise ValueError("Collector env override must not set inference_transport")
+    collector_graph_negotiation = negotiate_collector_graph(
+        env,
+        collector_graph_mode,
+        allow_eager_fallback=True,
+    )
     tensor_runtime_requested = requested_transport == "cuda"
     if tensor_runtime_requested:
         if inference_slot is None or inference_slot.device.type != "cuda":
@@ -656,6 +669,13 @@ def _run_collector(
         "inference_dependency_graph": dict(INFERENCE_DEPENDENCY_GRAPH),
         "backend_diagnostics": dict(backend_diagnostics),
         "graph_lifecycle": _graph_lifecycle_manifest(env),
+        "collector_graph": collector_graph_negotiation.manifest
+        or {
+            "mode": collector_graph_negotiation.mode,
+            "requested": False,
+            "enabled": False,
+            "disable_reason": "env does not implement the public collector graph mode protocol",
+        },
     }
     if trace_recorder:
         manifest_ns = _time.perf_counter_ns()
