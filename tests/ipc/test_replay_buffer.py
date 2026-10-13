@@ -679,6 +679,54 @@ def test_empty_terminal_contract_skips_host_bool_gate(monkeypatch: pytest.Monkey
     buf.close()
 
 
+def test_terminal_contract_patch_is_fixed_width_masked_copy(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    buf = ReplayBuffer(
+        capacity=16,
+        obs_dim=_OBS_DIM,
+        action_dim=_ACTION_DIM,
+        device="cpu",
+        ingress_slot_rows=4,
+        critic_dim=3,
+    )
+
+    def fail_host_call(*_args, **_kwargs):
+        raise AssertionError("terminal publication must not convert masks to host")
+
+    monkeypatch.setattr(torch.Tensor, "any", fail_host_call)
+    monkeypatch.setattr(torch.Tensor, "item", fail_host_call)
+    monkeypatch.setattr(torch.Tensor, "tolist", fail_host_call)
+    monkeypatch.setattr(torch.Tensor, "cpu", fail_host_call)
+    try:
+        buf.add(
+            *_terminal_contract_batch(4)[:6],
+            terminal_mask=torch.tensor([False, True, False, True]),
+            terminal_next_obs=torch.full((4, _OBS_DIM), 17.0),
+            critic=torch.zeros(4, 3),
+            next_critic=torch.zeros(4, 3),
+            terminal_next_critic=torch.full((4, 3), 19.0),
+        )
+    finally:
+        monkeypatch.undo()
+
+    _, _, packed = _take_and_commit(buf)
+    torch.testing.assert_close(
+        packed[:, buf._nobs_sl],
+        torch.stack(
+            (
+                packed[0, buf._nobs_sl],
+                torch.full((_OBS_DIM,), 17.0),
+                packed[2, buf._nobs_sl],
+                torch.full((_OBS_DIM,), 17.0),
+            )
+        ),
+    )
+    torch.testing.assert_close(packed[:, buf._ncritic_sl][1], torch.full((3,), 19.0))
+    torch.testing.assert_close(packed[:, buf._ncritic_sl][0], torch.zeros(3))
+    buf.close()
+
+
 def test_commit_ingress_rejects_out_of_order_publication() -> None:
     buf = _make_buf(capacity=32, slot_rows=4, depth=2)
     first = _terminal_contract_batch(4)
