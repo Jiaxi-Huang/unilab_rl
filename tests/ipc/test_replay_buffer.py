@@ -368,6 +368,21 @@ def test_ingress_stores_done_and_truncated_contract():
     buf.close()
 
 
+def test_ingress_rejects_stale_completion_within_one_buffer() -> None:
+    buf = _make_buf()
+
+    assert buf.add(
+        *_random_batch(4),
+        completion=ImmediateGraphCompletion(sequence=2),
+    )
+    with pytest.raises(ValueError, match="stale graph completion"):
+        buf.add(
+            *_random_batch(4),
+            completion=ImmediateGraphCompletion(sequence=1),
+        )
+    buf.close()
+
+
 def test_ingress_writes_packed_columns_without_cat(monkeypatch: pytest.MonkeyPatch):
     buf = ReplayBuffer(
         capacity=8,

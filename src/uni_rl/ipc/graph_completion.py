@@ -2,12 +2,8 @@
 
 from __future__ import annotations
 
-import itertools
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Any, Protocol, runtime_checkable
-
-_LAST_SEQUENCE = 0
-_IMMEDIATE_SEQUENCE = itertools.count()
 
 
 @runtime_checkable
@@ -41,6 +37,7 @@ def wait_graph_completion(
     completion: GraphCompletionTokenProtocol | None,
     *,
     stream: Any | None = None,
+    last_sequence: int = 0,
 ) -> GraphCompletionTokenProtocol | None:
     """Gate a consumer read on an optional public completion receipt."""
     if completion is None:
@@ -55,14 +52,12 @@ def wait_graph_completion(
         raise TypeError("graph completion sequence must be an integer")
     if isinstance(completion.stream_id, bool) or not isinstance(completion.stream_id, int):
         raise TypeError("graph completion stream_id must be an integer")
-    global _LAST_SEQUENCE
-    if completion.sequence < _LAST_SEQUENCE:
+    if completion.sequence < last_sequence:
         raise ValueError(
             f"stale graph completion sequence {completion.sequence}; "
-            f"last published sequence is {_LAST_SEQUENCE}"
+            f"last published sequence is {last_sequence}"
         )
     completion.wait_before_read(stream)
-    _LAST_SEQUENCE = completion.sequence
     return completion
 
 
@@ -72,7 +67,7 @@ class ImmediateGraphCompletion:
 
     contract_version: int = 1
     operation: str = "step"
-    sequence: int = field(default_factory=lambda: next(_IMMEDIATE_SEQUENCE))
+    sequence: int = 0
     stream_id: int = 0
 
     def wait_before_read(self, stream: Any | None = None) -> None:

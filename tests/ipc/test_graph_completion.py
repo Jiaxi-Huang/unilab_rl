@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import pytest
 
-import uni_rl.ipc.graph_completion as graph_completion
 from uni_rl.ipc.graph_completion import (
     ImmediateGraphCompletion,
     wait_graph_completion,
@@ -39,18 +38,9 @@ def test_wait_graph_completion_rejects_non_protocol_producer() -> None:
 
 
 def test_wait_graph_completion_rejects_stale_sequences() -> None:
-    monkey_sequence = object.__new__(ImmediateGraphCompletion)
-    object.__setattr__(monkey_sequence, "sequence", 10**9)
+    current = ImmediateGraphCompletion(sequence=10**9)
     stale = ImmediateGraphCompletion(sequence=10**9 - 1)
 
-    graph_completion._LAST_SEQUENCE = 10**9 - 1
-    try:
-        wait_graph_completion(monkey_sequence)
-    finally:
-        graph_completion._LAST_SEQUENCE = 0
-    graph_completion._LAST_SEQUENCE = 10**9
-    try:
-        with pytest.raises(ValueError, match="stale"):
-            wait_graph_completion(stale)
-    finally:
-        graph_completion._LAST_SEQUENCE = 0
+    wait_graph_completion(current, last_sequence=10**9 - 1)
+    with pytest.raises(ValueError, match="stale"):
+        wait_graph_completion(stale, last_sequence=10**9)
