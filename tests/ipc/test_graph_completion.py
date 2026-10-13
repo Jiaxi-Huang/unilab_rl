@@ -62,6 +62,17 @@ def test_wait_graph_completion_binds_operation_and_capture() -> None:
     assert wait_graph_completion(completion, capture_id="capture-a") is completion
 
 
+def test_collector_tick_is_a_public_neutral_completion_operation() -> None:
+    completion = ImmediateGraphCompletion(
+        operation="collector_tick",
+        sequence=11,
+        stream_id=13,
+        capture_id="collector-capture-a",
+    )
+
+    assert wait_graph_completion(completion, operation="collector_tick") is completion
+
+
 def test_immediate_completion_has_no_undeclared_ipc_transport() -> None:
     with pytest.raises(NotImplementedError, match="IPC"):
         ImmediateGraphCompletion().ipc_handle()
