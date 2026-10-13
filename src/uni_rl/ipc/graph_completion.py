@@ -35,6 +35,8 @@ class GraphCompletionTokenProtocol(Protocol):
         """Make the completed producer prefix visible before this read."""
         ...
 
+    def ipc_handle(self) -> bytes: ...
+
 
 def wait_graph_completion(
     completion: GraphCompletionTokenProtocol | None,
@@ -86,3 +88,6 @@ class ImmediateGraphCompletion:
 
     def wait_before_read(self, stream: Any | None = None) -> None:
         del stream
+
+    def ipc_handle(self) -> bytes:
+        raise NotImplementedError("this graph completion receipt has no IPC transport")

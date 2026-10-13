@@ -54,3 +54,8 @@ def test_wait_graph_completion_binds_operation_and_capture() -> None:
     with pytest.raises(ValueError, match="capture"):
         wait_graph_completion(completion, capture_id="capture-b")
     assert wait_graph_completion(completion, capture_id="capture-a") is completion
+
+
+def test_immediate_completion_has_no_undeclared_ipc_transport() -> None:
+    with pytest.raises(NotImplementedError, match="IPC"):
+        ImmediateGraphCompletion().ipc_handle()
