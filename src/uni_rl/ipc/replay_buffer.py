@@ -661,13 +661,12 @@ class ReplayBuffer(SharedBufferBase):
             return
         if terminal_mask.ndim != 1 or terminal_mask.shape[0] != target_next_obs.shape[0]:
             return
-        if not torch.any(terminal_mask):
-            return
-
-        target_next_obs[terminal_mask] = terminal_next_obs[terminal_mask]
-
+        expanded = terminal_mask[:, None]
+        target_next_obs.copy_(torch.where(expanded, terminal_next_obs, target_next_obs))
         if target_next_critic is not None and terminal_next_critic is not None:
-            target_next_critic[terminal_mask] = terminal_next_critic[terminal_mask]
+            target_next_critic.copy_(
+                torch.where(expanded, terminal_next_critic, target_next_critic)
+            )
 
     def field_view(self, packed: torch.Tensor, field_name: str) -> torch.Tensor:
         field = {
