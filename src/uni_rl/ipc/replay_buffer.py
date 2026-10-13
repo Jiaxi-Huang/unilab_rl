@@ -9,6 +9,7 @@ import torch
 
 from uni_rl.ipc.graph_completion import (
     GraphCompletionTokenProtocol,
+    collector_tick_receipt,
     import_graph_completion,
     record_ingress_publication,
     wait_graph_completion,
@@ -542,6 +543,7 @@ class ReplayBuffer(SharedBufferBase):
         sequence = int(self._ingress_publish_seq[0])
         slot = sequence % self._ingress_depth
         target = self._ingress_slots[slot][:count]
+        producer_sequence = int(completion.sequence) if completion is not None else 0
         try:
             self._write_transition_rows(
                 target,
@@ -572,6 +574,10 @@ class ReplayBuffer(SharedBufferBase):
                 completion = record_ingress_publication(
                     completion,
                     stream=self._ingress_read_stream,
+                )
+                completion = collector_tick_receipt(
+                    completion,
+                    sequence=producer_sequence,
                 )
                 self._graph_completion_sequence = completion.sequence
                 self._graph_capture_id = completion.capture_id

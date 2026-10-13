@@ -182,6 +182,43 @@ def record_ingress_publication(
     )
 
 
+def collector_tick_receipt(
+    completion: GraphCompletionTokenProtocol,
+    *,
+    sequence: int,
+) -> GraphCompletionTokenProtocol:
+    """Return a neutral receipt for one complete collector publication tick.
+
+    The producer calls this only after every output and ingress-slot write for
+    the tick is enqueued. The operation name is changed to ``collector_tick``
+    so downstream waits cannot mistake a backend-only step receipt for complete
+    transition publication. Event ownership and stream identity are unchanged.
+    """
+    contract_version = int(completion.contract_version)
+    operation = "collector_tick"
+    tick_sequence = int(sequence)
+    stream_id = int(completion.stream_id)
+    capture_id = completion.capture_id
+    if isinstance(completion, EventGraphCompletion):
+        return EventGraphCompletion(
+            contract_version=contract_version,
+            operation=operation,
+            sequence=tick_sequence,
+            stream_id=stream_id,
+            capture_id=capture_id,
+            event=completion.event,
+        )
+    if isinstance(completion, ImmediateGraphCompletion):
+        return ImmediateGraphCompletion(
+            contract_version=contract_version,
+            operation=operation,
+            sequence=tick_sequence,
+            stream_id=stream_id,
+            capture_id=capture_id,
+        )
+    raise TypeError("collector tick publication requires the producer's public concrete receipt")
+
+
 def import_graph_completion(
     *,
     contract_version: int,

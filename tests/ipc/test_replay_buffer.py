@@ -392,6 +392,23 @@ def test_ingress_rejects_stale_completion_within_one_buffer() -> None:
     buf.close()
 
 
+def test_ingress_receipt_is_relabeled_whole_collector_tick() -> None:
+    buf = _make_buf()
+
+    assert buf.add(
+        *_random_batch(4),
+        completion=ImmediateGraphCompletion(sequence=1, capture_id="capture-a"),
+    )
+
+    completion = buf.last_graph_completion
+    assert completion is not None
+    assert completion.operation == "collector_tick"
+    assert completion.sequence == 1
+    assert completion.capture_id == "capture-a"
+    assert buf.graph_completion_sequence == 1
+    buf.close()
+
+
 def test_ingress_writes_packed_columns_without_cat(monkeypatch: pytest.MonkeyPatch):
     buf = ReplayBuffer(
         capacity=8,
@@ -635,6 +652,7 @@ def test_spawned_collector_transports_ingress_completion_to_learner_copy() -> No
             wait_graph_completion(
                 imported,
                 stream=consumer,
+                operation="collector_tick",
                 capture_id="capture-cross-process",
                 last_sequence=0,
             )
