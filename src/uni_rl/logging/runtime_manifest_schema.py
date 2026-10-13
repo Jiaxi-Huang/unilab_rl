@@ -32,6 +32,7 @@ _STABLE_NONNEGATIVE_INT_FIELDS = (
     ("replay_ingress", "stop_returns"),
     ("inference_memory_budget", "ipc_event_count"),
 )
+_GRAPH_LIFECYCLE_NONNEGATIVE_INT_FIELDS = (("graph_lifecycle", "contract_version"),)
 _COMPLETED_REQUIRED_SECTIONS = (
     "inference_flight",
     "replay_ingress",
@@ -105,6 +106,7 @@ def validate_runtime_manifest(
             )
 
     _validate_backend_diagnostics(manifest)
+    _validate_graph_lifecycle(manifest)
 
 
 def _validate_backend_diagnostics(manifest: Mapping[str, Any]) -> None:
@@ -162,6 +164,34 @@ def _validate_backend_diagnostics(manifest: Mapping[str, Any]) -> None:
             isinstance(disable_reason, str) and disable_reason.strip()
         ):
             raise ValueError(f"{label} is disabled and must declare a disable reason")
+
+
+def _validate_graph_lifecycle(manifest: Mapping[str, Any]) -> None:
+    """Validate the optional graph lifecycle producer section."""
+    section = manifest.get("graph_lifecycle")
+    if section is None:
+        return
+    if not isinstance(section, Mapping):
+        raise ValueError("runtime_manifest.graph_lifecycle must be a mapping")
+    for section_name, field_name in _GRAPH_LIFECYCLE_NONNEGATIVE_INT_FIELDS:
+        value = section.get(field_name)
+        if value is None:
+            raise ValueError(f"runtime_manifest.{section_name}.{field_name} is required")
+        _require_nonnegative_int(
+            value,
+            f"runtime_manifest.{section_name}.{field_name}",
+        )
+    entry = section.get("backend_diagnostics")
+    if entry is not None:
+        if not isinstance(entry, Mapping):
+            raise ValueError(
+                "runtime_manifest.graph_lifecycle.backend_diagnostics must be a mapping or null"
+            )
+        for field in ("requested", "enabled"):
+            if not isinstance(entry.get(field), bool):
+                raise ValueError(
+                    f"runtime_manifest.graph_lifecycle.backend_diagnostics.{field} must be a bool"
+                )
 
 
 def _validate_positive_int(

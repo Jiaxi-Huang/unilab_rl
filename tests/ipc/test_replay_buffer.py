@@ -9,6 +9,7 @@ import time
 import pytest
 import torch
 
+from uni_rl.ipc.graph_completion import ImmediateGraphCompletion
 from uni_rl.ipc.replay_buffer import ReplayBuffer
 
 _SPAWN_CTX = mp.get_context("spawn")
@@ -261,24 +262,9 @@ def test_add_batch_backpressures_between_chunks_until_learner_commits():
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
-def test_cuda_ingress_publication_uses_current_stream_barrier(
+def test_cuda_ingress_publication_requires_completion_read_gate(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    original_current_stream = torch.cuda.current_stream
-    current_stream_devices: list[torch.device] = []
-
-    def fail_device_sync(*args, **kwargs) -> None:
-        raise AssertionError("replay ingress must not synchronize the whole device")
-
-    def tracking_current_stream(device=None, *args, **kwargs):
-        current_stream_devices.append(
-            torch.device(device) if device is not None else torch.device("cuda")
-        )
-        return original_current_stream(device, *args, **kwargs)
-
-    monkeypatch.setattr(torch.cuda, "synchronize", fail_device_sync)
-    monkeypatch.setattr(torch.cuda, "current_stream", tracking_current_stream)
-
     def fail_ingress_read(*args, **kwargs) -> None:
         del args, kwargs
         raise AssertionError("diagnostics must not read CUDA ingress tensors")
@@ -299,7 +285,10 @@ def test_cuda_ingress_publication_uses_current_stream_barrier(
             monkeypatch.setattr(slot, "item", fail_ingress_read)
             protected_ingress_slots.append(slot)
         batch = tuple(tensor.to("cuda") for tensor in _random_batch(4))
-        buf.add(*batch)
+        with pytest.raises(RuntimeError, match="graph completion receipt"):
+            buf.add(*batch)
+
+        buf.add(*batch, completion=ImmediateGraphCompletion(operation="step"))
 
         assert protected_ingress_slots
         assert buf.ingress_diagnostics()["high_water_occupancy"] == 1
@@ -312,28 +301,20 @@ def test_cuda_ingress_publication_uses_current_stream_barrier(
         assert (start, count) == (0, 4)
         torch.testing.assert_close(packed[:, buf._obs_sl], batch[0])
         torch.testing.assert_close(packed[:, buf._act_sl], batch[1])
-        assert len(current_stream_devices) == 1
     finally:
         buf.close()
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
-def test_cuda_add_batch_synchronizes_each_published_chunk(
+def test_cuda_add_batch_reuses_one_completion_gate_for_each_chunk(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    original_current_stream = torch.cuda.current_stream
-    synchronized_devices: list[torch.device] = []
+    waited_streams: list[object] = []
 
-    def tracking_current_stream(device=None, *args, **kwargs):
-        stream = original_current_stream(device, *args, **kwargs)
+    class RecordingCompletion(ImmediateGraphCompletion):
+        def wait_before_read(self, stream=None):
+            waited_streams.append(stream)
 
-        def synchronize():
-            synchronized_devices.append(torch.device(device if device is not None else "cuda"))
-
-        stream.synchronize = synchronize
-        return stream
-
-    monkeypatch.setattr(torch.cuda, "current_stream", tracking_current_stream)
     buf = ReplayBuffer(
         capacity=16,
         obs_dim=_OBS_DIM,
@@ -344,12 +325,13 @@ def test_cuda_add_batch_synchronizes_each_published_chunk(
         ingress_device="cuda",
     )
     batch = tuple(tensor.to("cuda") for tensor in _random_batch(5))
+    del monkeypatch
 
     try:
-        assert buf.add_batch(*batch) is True
+        assert buf.add_batch(*batch, completion=RecordingCompletion()) is True
         chunks = [_take_and_commit(buf) for _ in range(3)]
         assert [count for _, count, _ in chunks] == [2, 2, 1]
-        assert synchronized_devices == [torch.device("cuda")] * 3
+        assert waited_streams == [buf.ingress_device] * 3
         packed_obs = torch.cat(
             (
                 chunks[0][2][:, buf._obs_sl],

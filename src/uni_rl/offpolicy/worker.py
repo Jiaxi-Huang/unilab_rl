@@ -241,6 +241,17 @@ def _merge_reward_component_sums(
     return {key: left.get(key, 0.0) + right.get(key, 0.0) for key in left.keys() | right.keys()}
 
 
+def _graph_lifecycle_manifest(env: Any) -> dict[str, Any]:
+    """Snapshot optional graph lifecycle evidence without backend probing."""
+    diagnostics = get_backend_runtime_diagnostics(env)
+    entry = None
+    if diagnostics is not None:
+        entries = diagnostics.get("diagnostics")
+        if isinstance(entries, dict):
+            entry = entries.get("cuda_graph")
+    return {"contract_version": 1, "backend_diagnostics": entry}
+
+
 def off_policy_collector_fn(
     stop_event,
     env_factory: EnvFactory,
@@ -639,6 +650,7 @@ def _run_collector(
         "inference_legal_max_in_flight": 1,
         "inference_dependency_graph": dict(INFERENCE_DEPENDENCY_GRAPH),
         "backend_diagnostics": dict(backend_diagnostics),
+        "graph_lifecycle": _graph_lifecycle_manifest(env),
     }
     if trace_recorder:
         manifest_ns = _time.perf_counter_ns()
@@ -907,6 +919,7 @@ def _run_collector(
                     critic=critic_t,
                     next_critic=next_critic_t,
                     terminal_next_critic=terminal_critic_t,
+                    completion=state.info.get("graph_completion"),
                 )
                 if not published and not stop_event.is_set():
                     raise RuntimeError("replay ingress closed before collector shutdown")
@@ -940,6 +953,7 @@ def _run_collector(
                         if terminal_contract.terminal_critic is not None
                         else None
                     ),
+                    completion=state.info.get("graph_completion"),
                 )
                 if not published and not stop_event.is_set():
                     raise RuntimeError("replay ingress closed before collector shutdown")

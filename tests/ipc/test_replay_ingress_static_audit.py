@@ -10,6 +10,7 @@ SOURCE = Path(__file__).resolve().parents[2] / "src" / "uni_rl" / "ipc" / "repla
 
 FORBIDDEN_ALLOCATION_CALLS = frozenset({"empty", "zeros", "ones", "cat", "stack"})
 FORBIDDEN_HOST_CALLS = frozenset({"cpu", "tolist", "numpy", "item", "nonzero"})
+FORBIDDEN_STREAM_CALLS = frozenset({"synchronize", "current_stream"})
 
 
 @dataclass(frozen=True)
@@ -45,34 +46,17 @@ def _unparse(node: ast.AST) -> str:
         return "<unparseable>"
 
 
-def _publication_barrier_line(method: ast.FunctionDef) -> int:
-    candidates = [
-        node.lineno
-        for node in ast.walk(method)
-        if isinstance(node, ast.Call) and _call_name(node) == "synchronize"
-    ]
-    assert len(candidates) == 1, "replay ingress publication barrier must remain singular"
-    return candidates[0]
-
-
-def test_cuda_ingress_publication_barrier_is_explicit_and_singular() -> None:
-    tree = ast.parse(SOURCE.read_text(encoding="utf-8"))
-    method = _method(tree, "_add_to_ingress")
-    assert _publication_barrier_line(method) > 0
-
-
 def test_replay_ingress_publication_path_has_no_unclassified_host_detours() -> None:
     tree = ast.parse(SOURCE.read_text(encoding="utf-8"))
     method = _method(tree, "_add_to_ingress")
-    barrier = _publication_barrier_line(method)
     violations: list[Violation] = []
     for node in ast.walk(method):
         if not isinstance(node, ast.Call):
             continue
         called = _call_name(node)
         expression = _unparse(node)
-        if called == "synchronize" and node.lineno != barrier:
-            violations.append(Violation("_add_to_ingress", node.lineno, "host-sync", expression))
+        if called in FORBIDDEN_STREAM_CALLS:
+            violations.append(Violation("_add_to_ingress", node.lineno, "stream-sync", expression))
         if called in FORBIDDEN_HOST_CALLS:
             violations.append(Violation("_add_to_ingress", node.lineno, "host-detour", expression))
         if called in FORBIDDEN_ALLOCATION_CALLS and not any(
