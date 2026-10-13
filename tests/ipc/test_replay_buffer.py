@@ -567,6 +567,14 @@ def _collector_add(buf: ReplayBuffer, chunks: int) -> None:
         buf.add(*_random_batch(8))
 
 
+def _collector_publish_cuda_completion(buf: ReplayBuffer) -> None:
+    batch = tuple(tensor.to("cuda") for tensor in _random_batch(4))
+    completion = ImmediateGraphCompletion(
+        operation="step", sequence=1, capture_id="capture-cross-process"
+    )
+    assert buf.add(*batch, completion=completion) is True
+
+
 def test_spawned_collector_publishes_bounded_chunks():
     buf = _make_buf(capacity=128, slot_rows=8)
     process = _SPAWN_CTX.Process(target=_collector_add, args=(buf, 4))
@@ -594,6 +602,50 @@ def test_spawned_collector_publishes_bounded_chunks():
     assert 1 <= diagnostics["high_water_occupancy"] <= 2
     assert diagnostics["dropped_batches"] == 0
     buf.close()
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+def test_spawned_collector_transports_ingress_completion_to_learner_copy() -> None:
+    buf = ReplayBuffer(
+        capacity=16,
+        obs_dim=_OBS_DIM,
+        action_dim=_ACTION_DIM,
+        device="cuda",
+        ingress_slot_rows=4,
+        ingress_device="cuda",
+    )
+    process = _SPAWN_CTX.Process(target=_collector_publish_cuda_completion, args=(buf,))
+    process.start()
+    try:
+        deadline = time.monotonic() + 15.0
+        while buf.published_ptr == 0 and time.monotonic() < deadline:
+            time.sleep(0.001)
+        imported = buf.import_shared_graph_completion()
+        assert imported is not None
+        assert imported.capture_id == "capture-cross-process"
+        assert imported.sequence == 1
+        assert buf.graph_capture_id == "capture-cross-process"
+        ingress = buf.take_published_ingress()
+        assert ingress is not None
+        slot, start, count, packed = ingress
+        consumer = torch.cuda.Stream()
+        with torch.cuda.stream(consumer):
+            from uni_rl.ipc.graph_completion import wait_graph_completion
+
+            wait_graph_completion(
+                imported,
+                stream=consumer,
+                capture_id="capture-cross-process",
+                last_sequence=0,
+            )
+            copied = packed.clone()
+        consumer.synchronize()
+        assert copied.shape == (4, buf.storage_width)
+        buf.commit_ingress(slot=slot, start=start, count=count)
+    finally:
+        process.join(timeout=15)
+        buf.close()
+    assert process.exitcode == 0
 
 
 def test_empty_terminal_contract_skips_host_bool_gate(monkeypatch: pytest.MonkeyPatch) -> None:

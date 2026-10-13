@@ -346,6 +346,7 @@ class GPUResidentReplayPipeline:
         with self._submission_lock:
             submitted = False
             while True:
+                self._replay_buffer.import_shared_graph_completion()
                 ingress = self._replay_buffer.take_published_ingress()
                 if ingress is None:
                     return submitted

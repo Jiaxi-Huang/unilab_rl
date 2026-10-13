@@ -4,10 +4,12 @@ import multiprocessing as mp
 import time
 from typing import Any
 
+import numpy as np
 import torch
 
 from uni_rl.ipc.graph_completion import (
     GraphCompletionTokenProtocol,
+    import_graph_completion,
     record_ingress_publication,
     wait_graph_completion,
 )
@@ -128,6 +130,40 @@ class ReplayBuffer(SharedBufferBase):
         self._graph_completion_sequence = 0
         self._graph_capture_id: str | None = None
         self._last_graph_completion: GraphCompletionTokenProtocol | None = None
+        self._completion_metadata_version = torch.zeros(
+            1, dtype=torch.int64, device="cpu"
+        ).share_memory_()
+        self._completion_metadata_contract = torch.zeros(
+            1, dtype=torch.int64, device="cpu"
+        ).share_memory_()
+        self._completion_metadata_sequence = torch.zeros(
+            1, dtype=torch.int64, device="cpu"
+        ).share_memory_()
+        self._completion_metadata_stream_id = torch.zeros(
+            1, dtype=torch.uint64, device="cpu"
+        ).share_memory_()
+        self._completion_metadata_available = torch.zeros(
+            1, dtype=torch.bool, device="cpu"
+        ).share_memory_()
+        self._completion_metadata_handle = torch.zeros(
+            (1, 256), dtype=torch.uint8, device="cpu"
+        ).share_memory_()
+        self._completion_metadata_handle_size = torch.zeros(
+            1, dtype=torch.int64, device="cpu"
+        ).share_memory_()
+        self._completion_metadata_capture = torch.zeros(
+            (1, 256), dtype=torch.uint8, device="cpu"
+        ).share_memory_()
+        self._completion_metadata_capture_size = torch.zeros(
+            1, dtype=torch.int64, device="cpu"
+        ).share_memory_()
+        self._completion_metadata_operation_size = torch.zeros(
+            1, dtype=torch.int64, device="cpu"
+        ).share_memory_()
+        self._completion_metadata_operation = torch.zeros(
+            32, dtype=torch.int8, device="cpu"
+        ).share_memory_()
+        self._completion_metadata_local_version = 0
         self._ingress_read_stream = (
             torch.cuda.current_stream(self._ingress_device)
             if self._ingress_device.type == "cuda"
@@ -232,6 +268,74 @@ class ReplayBuffer(SharedBufferBase):
         """Return the capture identity accepted by this ingress producer."""
         return self._graph_capture_id
 
+    def _publish_completion_metadata(self, completion: Any) -> None:
+        """Publish neutral receipt metadata for the learner-local process copy."""
+        try:
+            handle = bytes(completion.ipc_handle())
+        except (AttributeError, NotImplementedError, RuntimeError):
+            return
+        capture = completion.capture_id.encode("utf-8") if completion.capture_id else b""
+        operation = completion.operation.encode("ascii")
+        if (
+            len(handle) > self._completion_metadata_handle.shape[1]
+            or len(capture) > (self._completion_metadata_capture.shape[1])
+        ):
+            raise ValueError("graph completion IPC metadata exceeds ingress limits")
+        self._completion_metadata_contract[0] = int(completion.contract_version)
+        self._completion_metadata_sequence[0] = int(completion.sequence)
+        self._completion_metadata_stream_id[0] = int(completion.stream_id)
+        self._completion_metadata_handle_size[0] = len(handle)
+        self._completion_metadata_capture_size[0] = len(capture)
+        self._completion_metadata_operation_size[0] = len(operation)
+        self._completion_metadata_handle.zero_()
+        self._completion_metadata_handle[0, : len(handle)] = torch.from_numpy(
+            np.frombuffer(handle, dtype=np.uint8).copy()
+        )
+        self._completion_metadata_capture.zero_()
+        self._completion_metadata_capture[0, : len(capture)] = torch.from_numpy(
+            np.frombuffer(capture, dtype=np.uint8).copy()
+        )
+        self._completion_metadata_operation.zero_()
+        operation_tensor = torch.from_numpy(np.frombuffer(operation, dtype=np.int8).copy())
+        self._completion_metadata_operation[: operation_tensor.numel()] = operation_tensor
+        self._completion_metadata_available[0] = True
+        self._completion_metadata_version[0] += 1
+
+    def _import_shared_completion(self) -> GraphCompletionTokenProtocol | None:
+        """Import the newest collector-recorded receipt on the learner copy."""
+        if not bool(self._completion_metadata_available[0]):
+            return None
+        handle_size = int(self._completion_metadata_handle_size[0])
+        capture_size = int(self._completion_metadata_capture_size[0])
+        operation_size = int(self._completion_metadata_operation_size[0])
+        handle_bytes = bytes(self._completion_metadata_handle[0, :handle_size].numpy().tobytes())
+        capture_bytes = bytes(self._completion_metadata_capture[0, :capture_size].numpy().tobytes())
+        operation_bytes = bytes(
+            self._completion_metadata_operation[:operation_size].numpy().tobytes()
+        )
+        imported = import_graph_completion(
+            contract_version=int(self._completion_metadata_contract[0]),
+            operation=operation_bytes.decode("ascii"),
+            sequence=int(self._completion_metadata_sequence[0]),
+            stream_id=int(self._completion_metadata_stream_id[0]),
+            capture_id=capture_bytes.decode("utf-8") or None,
+            ipc_handle=handle_bytes,
+            device=self._ingress_device,
+        )
+        self._graph_completion_sequence = imported.sequence
+        self._graph_capture_id = imported.capture_id
+        self._last_graph_completion = imported
+        return imported
+
+    def import_shared_graph_completion(self) -> GraphCompletionTokenProtocol | None:
+        """Import collector receipt metadata once per new shared version."""
+        version = int(self._completion_metadata_version[0])
+        if version == self._completion_metadata_local_version:
+            return self._last_graph_completion
+        imported = self._import_shared_completion()
+        self._completion_metadata_local_version = version
+        return imported
+
     def commit_ingress(self, *, slot: int, start: int, count: int) -> None:
         expected_slot = self._ingress_release_seq % self._ingress_depth
         if slot != expected_slot:
@@ -271,7 +375,13 @@ class ReplayBuffer(SharedBufferBase):
         state["trace_recorder"] = None
         state["_stop_event"] = None
         state["_last_graph_completion"] = None
+        state["_ingress_read_stream"] = None
         return state
+
+    def __setstate__(self, state: dict) -> None:
+        self.__dict__.update(state)
+        if self._ingress_read_stream is None and self._ingress_device.type == "cuda":
+            self._ingress_read_stream = torch.cuda.current_stream(self._ingress_device)
 
     def add(
         self,
@@ -466,6 +576,7 @@ class ReplayBuffer(SharedBufferBase):
                 self._graph_completion_sequence = completion.sequence
                 self._graph_capture_id = completion.capture_id
                 self._last_graph_completion = completion
+                self._publish_completion_metadata(completion)
             if self._ingress_device.type == "cuda":
                 # A CUDA slot is unreadable without a negotiated completion
                 # receipt. Fail closed instead of synchronizing the producer
