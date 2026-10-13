@@ -583,3 +583,34 @@ def test_spawned_collector_publishes_bounded_chunks():
     assert 1 <= diagnostics["high_water_occupancy"] <= 2
     assert diagnostics["dropped_batches"] == 0
     buf.close()
+
+
+def test_empty_terminal_contract_skips_host_bool_gate(monkeypatch: pytest.MonkeyPatch) -> None:
+    buf = _make_buf(capacity=16, slot_rows=4, depth=2)
+    called = False
+
+    def fail_any(mask):
+        raise AssertionError("empty terminal contract host-converted terminal_mask.any()")
+
+    monkeypatch.setattr(torch.Tensor, "any", fail_any)
+    obs, actions, rewards, next_obs, dones, truncated = _random_batch(4)
+    empty_terminal_obs = torch.full((4, _OBS_DIM), 17.0)
+
+    try:
+        buf.add(
+            obs,
+            actions,
+            rewards,
+            next_obs,
+            dones,
+            truncated,
+            terminal_mask=torch.zeros(4, dtype=torch.bool),
+            terminal_next_obs=empty_terminal_obs,
+        )
+    finally:
+        monkeypatch.undo()
+
+    _, _, packed = _take_and_commit(buf)
+    torch.testing.assert_close(packed[:, buf._nobs_sl], next_obs)
+    assert not called
+    buf.close()
