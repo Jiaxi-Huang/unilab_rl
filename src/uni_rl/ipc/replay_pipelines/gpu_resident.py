@@ -393,6 +393,7 @@ class GPUResidentReplayPipeline:
                 wait_graph_completion(
                     self._replay_buffer.last_graph_completion,
                     stream=self._sync_stream,
+                    operation="collector_tick",
                     capture_id=self._replay_buffer.graph_capture_id,
                     last_sequence=self._replay_buffer.graph_completion_sequence,
                 )
@@ -577,8 +578,28 @@ class GPUResidentReplayPipeline:
         """Advance ingress work without changing replay lifecycle state."""
         if self._main_thread_submission:
             return self._drive_mps_learner_thread(wait=wait)
-        if not wait:
-            return False
+        if self._sync_thread is not None:
+            # The CUDA daemon is the sole ingress consumer. Learner polling
+            # observes pending spans without racing token acquisition; callers
+            # that must see committed rows use read_committed_fields().
+            daemon_owned = self._sync_thread.is_alive()
+            if not wait:
+                return bool(self._span_events) or self._submitted_ptr != self._visible_ptr
+            deadline = time.monotonic() + 15.0
+            while time.monotonic() < deadline:
+                self._refresh_prepare_state()
+                pending = bool(self._span_events) or self._submitted_ptr != self._visible_ptr
+                if not pending:
+                    return False
+                time.sleep(self._POLL_INTERVAL_S)
+            if not daemon_owned:
+                did_work = self._submit_new_spans()
+                with self._submission_lock:
+                    for _, event, _, _, _ in self._span_events:
+                        event.synchronize()
+                    did_work |= self._drain_completed_spans_locked()
+                return did_work
+            raise TimeoutError("CUDA replay ingress did not commit published spans")
         did_work = self._submit_new_spans()
         with self._submission_lock:
             for _, event, _, _, _ in self._span_events:
