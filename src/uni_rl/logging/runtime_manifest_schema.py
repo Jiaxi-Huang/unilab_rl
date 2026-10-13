@@ -36,6 +36,9 @@ _GRAPH_LIFECYCLE_NONNEGATIVE_INT_FIELDS = (("graph_lifecycle", "contract_version
 _GRAPH_LIFECYCLE_STATES = frozenset({"unavailable", "ready", "invalidated"})
 _COLLECTOR_GRAPH_MODES = frozenset({"disabled", "eager", "graph"})
 _COLLECTOR_GRAPH_STATES = frozenset({"unavailable", "eager", "ready", "invalidated"})
+_COLLECTOR_GRAPH_INVALIDATION_REASONS = frozenset(
+    {"model", "data", "view", "capacity", "policy_io", "stream_event", "capture_failed"}
+)
 _COMPLETED_REQUIRED_SECTIONS = (
     "inference_flight",
     "replay_ingress",
@@ -251,6 +254,15 @@ def _validate_collector_graph(manifest: Mapping[str, Any]) -> None:
         )
     capture_id = section.get("capture_id")
     reason = section.get("disable_reason")
+    invalidation_reason = section.get("invalidation_reason")
+    if invalidation_reason is not None and (
+        not isinstance(invalidation_reason, str)
+        or invalidation_reason not in _COLLECTOR_GRAPH_INVALIDATION_REASONS
+    ):
+        raise ValueError(
+            "runtime_manifest.collector_graph.invalidation_reason must be one of "
+            f"{sorted(_COLLECTOR_GRAPH_INVALIDATION_REASONS)} or null"
+        )
     if enabled:
         if mode != "graph" or not requested or state != "ready":
             raise ValueError("an enabled collector_graph must be requested READY graph mode")
@@ -258,11 +270,17 @@ def _validate_collector_graph(manifest: Mapping[str, Any]) -> None:
             raise ValueError("an enabled collector_graph requires a non-empty capture_id")
         if reason is not None:
             raise ValueError("an enabled collector_graph must not declare disable_reason")
+        if invalidation_reason is not None:
+            raise ValueError("an enabled collector_graph must not declare invalidation_reason")
     elif state is not None:
         if capture_id is not None:
             raise ValueError("a disabled collector_graph must not declare capture_id")
         if not isinstance(reason, str) or not reason.strip():
             raise ValueError("a disabled collector_graph requires a non-empty disable_reason")
+        if state == "invalidated" and invalidation_reason is None:
+            raise ValueError("an invalidated collector_graph requires invalidation_reason")
+        if state != "invalidated" and invalidation_reason is not None:
+            raise ValueError("only an invalidated collector_graph may declare invalidation_reason")
     elif not isinstance(reason, str) or not reason.strip():
         raise ValueError("runtime_manifest.collector_graph.disable_reason is required")
 

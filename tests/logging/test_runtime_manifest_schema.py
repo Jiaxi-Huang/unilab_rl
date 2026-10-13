@@ -259,6 +259,7 @@ def test_collector_graph_section_fails_closed() -> None:
         "enabled": False,
         "state": "eager",
         "capture_id": None,
+        "invalidation_reason": None,
         "disable_reason": "explicit eager collector execution",
     }
     manifest = _manifest()
@@ -273,6 +274,14 @@ def test_collector_graph_section_fails_closed() -> None:
         (lambda section: section.update(state="capturing"), "collector_graph.state"),
         (lambda section: section.update(capture_id="capture-a"), "must not declare capture_id"),
         (lambda section: section.update(disable_reason=None), "non-empty disable_reason"),
+        (
+            lambda section: section.update(invalidation_reason="capture_failed"),
+            "only an invalidated collector_graph",
+        ),
+        (
+            lambda section: section.update(invalidation_reason="unsupported"),
+            "invalidation_reason",
+        ),
     ):
         malformed = _manifest()
         malformed["collector_graph"] = {**valid}
@@ -289,6 +298,7 @@ def test_collector_graph_ready_evidence_requires_capture_identity() -> None:
         "enabled": True,
         "state": "ready",
         "capture_id": "collector-capture-a",
+        "invalidation_reason": None,
         "disable_reason": None,
     }
     validate_runtime_manifest(manifest, completed=True)
