@@ -125,6 +125,7 @@ class ReplayBuffer(SharedBufferBase):
         self._ingress_consume_seq = 0
         self._ingress_release_seq = 0
         self._graph_completion_sequence = 0
+        self._last_graph_completion: GraphCompletionTokenProtocol | None = None
         self._ingress_read_stream = (
             torch.cuda.current_stream(self._ingress_device)
             if self._ingress_device.type == "cuda"
@@ -214,6 +215,16 @@ class ReplayBuffer(SharedBufferBase):
         count = int(self._ingress_counts[slot])
         return slot, start, count, self._ingress_slots[slot][:count]
 
+    @property
+    def last_graph_completion(self) -> GraphCompletionTokenProtocol | None:
+        """Return the receipt guarding the newest published ingress slot."""
+        return self._last_graph_completion
+
+    @property
+    def graph_completion_sequence(self) -> int:
+        """Return the latest completion sequence accepted by this buffer."""
+        return self._graph_completion_sequence
+
     def commit_ingress(self, *, slot: int, start: int, count: int) -> None:
         expected_slot = self._ingress_release_seq % self._ingress_depth
         if slot != expected_slot:
@@ -252,6 +263,7 @@ class ReplayBuffer(SharedBufferBase):
         state = self.__dict__.copy()
         state["trace_recorder"] = None
         state["_stop_event"] = None
+        state["_last_graph_completion"] = None
         return state
 
     def add(
@@ -440,6 +452,7 @@ class ReplayBuffer(SharedBufferBase):
             )
             if completion is not None:
                 self._graph_completion_sequence = completion.sequence
+                self._last_graph_completion = completion
             if self._ingress_device.type == "cuda":
                 # A CUDA slot is unreadable without a negotiated completion
                 # receipt. Fail closed instead of synchronizing the producer
