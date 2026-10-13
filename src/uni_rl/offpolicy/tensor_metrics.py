@@ -16,7 +16,8 @@ class TensorMetricFlush:
     lengths: list[int]
     done_count: int
     timeout_count: int
-    reward_component_sums: dict[str, float] | None = None
+    reward_component_means: dict[str, float] | None = None
+    reward_component_updates: int = 0
 
 
 class TensorCollectorMetrics:
@@ -44,11 +45,12 @@ class TensorCollectorMetrics:
         self.device = torch.device(device)
         self.reward_component_names = tuple(reward_component_names)
         self.reward_component_count = len(self.reward_component_names)
-        self.reward_component_sums = (
+        self._reward_component_sum = (
             torch.zeros(self.reward_component_count, dtype=torch.float64, device=self.device)
             if self.reward_component_count
             else None
         )
+        self._reward_component_updates = 0
         self.current_rewards = torch.zeros(self.num_envs, device=self.device)
         self.current_lengths = torch.zeros(self.num_envs, dtype=torch.int64, device=self.device)
         self.finished_rewards = torch.zeros(
@@ -122,8 +124,9 @@ class TensorCollectorMetrics:
         self.current_lengths = torch.where(done, torch.zeros_like(episode_lengths), episode_lengths)
         self.done_count += done.sum()
         self.timeout_count += timeout.sum()
-        if self.reward_component_sums is not None and reward_components is not None:
-            self.reward_component_sums += reward_components.sum(dim=0, dtype=torch.float64)
+        if self._reward_component_sum is not None and reward_components is not None:
+            self._reward_component_sum += reward_components.mean(dim=0, dtype=torch.float64)
+            self._reward_component_updates += 1
         self._cursor = (row + 1) % self.interval
         self._updates += 1
 
@@ -161,8 +164,8 @@ class TensorCollectorMetrics:
             (
                 rewards,
                 lengths,
-                self.reward_component_sums
-                if self.reward_component_sums is not None
+                self._reward_component_sum
+                if self._reward_component_sum is not None
                 else torch.empty(0, dtype=torch.float64, device=self.device),
                 self.done_count.reshape(1),
                 self.timeout_count.reshape(1),
@@ -186,24 +189,26 @@ class TensorCollectorMetrics:
             lengths=[int(value) for value in length_values],
             done_count=int(host_values[-2].item()),
             timeout_count=int(host_values[-1].item()),
-            reward_component_sums=(
+            reward_component_means=(
                 {
-                    name: float(value)
+                    name: float(value) / max(self._reward_component_updates, 1)
                     for name, value in zip(
                         self.reward_component_names, component_values, strict=True
                     )
                 }
-                if self.reward_component_sums is not None
+                if self._reward_component_sum is not None
                 else None
             ),
+            reward_component_updates=self._reward_component_updates,
         )
         self.finished_rewards.zero_()
         self.finished_lengths.zero_()
         self.finished_valid.zero_()
         self.done_count.zero_()
         self.timeout_count.zero_()
-        if self.reward_component_sums is not None:
-            self.reward_component_sums.zero_()
+        if self._reward_component_sum is not None:
+            self._reward_component_sum.zero_()
+        self._reward_component_updates = 0
         self._cursor = 0
         self._updates = 0
         return result

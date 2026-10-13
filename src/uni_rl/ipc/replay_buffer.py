@@ -165,7 +165,10 @@ class ReplayBuffer(SharedBufferBase):
             32, dtype=torch.int8, device="cpu"
         ).share_memory_()
         self._completion_metadata_local_version = 0
-        self._ingress_read_stream = (
+
+    def _ingress_read_stream(self) -> Any | None:
+        """Return this process's current ordered CUDA ingress stream."""
+        return (
             torch.cuda.current_stream(self._ingress_device)
             if self._ingress_device.type == "cuda"
             else None
@@ -376,13 +379,7 @@ class ReplayBuffer(SharedBufferBase):
         state["trace_recorder"] = None
         state["_stop_event"] = None
         state["_last_graph_completion"] = None
-        state["_ingress_read_stream"] = None
         return state
-
-    def __setstate__(self, state: dict) -> None:
-        self.__dict__.update(state)
-        if self._ingress_read_stream is None and self._ingress_device.type == "cuda":
-            self._ingress_read_stream = torch.cuda.current_stream(self._ingress_device)
 
     def add(
         self,
@@ -566,14 +563,14 @@ class ReplayBuffer(SharedBufferBase):
             )
             completion = wait_graph_completion(
                 completion,
-                stream=self._ingress_read_stream,
+                stream=self._ingress_read_stream(),
                 capture_id=self._graph_capture_id,
                 last_sequence=self._graph_completion_sequence,
             )
             if completion is not None:
                 completion = record_ingress_publication(
                     completion,
-                    stream=self._ingress_read_stream,
+                    stream=self._ingress_read_stream(),
                 )
                 completion = collector_tick_receipt(
                     completion,

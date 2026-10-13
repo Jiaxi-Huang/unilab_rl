@@ -234,8 +234,12 @@ def _collector_action_numpy(actions: np.ndarray | torch.Tensor) -> np.ndarray:
     return np.asarray(actions, dtype=np.float32)
 
 
-def _merge_reward_component_sums(
-    left: dict[str, float] | None, right: dict[str, float] | None
+def _merge_reward_component_means(
+    left: dict[str, float] | None,
+    right: dict[str, float] | None,
+    *,
+    left_updates: int = 1,
+    right_updates: int = 1,
 ) -> dict[str, float] | None:
     if left is None and right is None:
         return None
@@ -243,7 +247,12 @@ def _merge_reward_component_sums(
         return dict(right or {})
     if right is None:
         return dict(left)
-    return {key: left.get(key, 0.0) + right.get(key, 0.0) for key in left.keys() | right.keys()}
+    total = left_updates + right_updates
+    return {
+        key: (left.get(key, 0.0) * left_updates + right.get(key, 0.0) * right_updates)
+        / max(total, 1)
+        for key in left.keys() | right.keys()
+    }
 
 
 def _graph_lifecycle_manifest(env: Any) -> dict[str, Any]:
@@ -483,7 +492,7 @@ def _run_collector(
         final: bool = False,
         reward_history: deque[float] | None = None,
         length_history: deque[int] | None = None,
-        reward_component_sums: dict[str, float] | None = None,
+        reward_component_means: dict[str, float] | None = None,
     ) -> bool:
         """Publish one collector metric snapshot without losing window state."""
 
@@ -509,12 +518,12 @@ def _run_collector(
         components_mean = {
             key: statistics.mean(values) for key, values in ep_reward_components.items() if values
         }
-        if reward_component_sums:
-            components_mean.update(reward_component_sums)
+        if reward_component_means:
+            components_mean.update(reward_component_means)
         if components_mean:
             msg["reward_components"] = components_mean
-            if reward_component_sums:
-                msg["reward_component_sums"] = True
+            if reward_component_means:
+                msg["reward_component_means"] = True
         if timing_counts:
             msg["collector_timing_ms"] = {
                 key: total / timing_counts[key]
@@ -585,9 +594,15 @@ def _run_collector(
                     pending_flush.lengths + metric_flush.lengths,
                     pending_flush.done_count + metric_flush.done_count,
                     pending_flush.timeout_count + metric_flush.timeout_count,
-                    reward_component_sums=_merge_reward_component_sums(
-                        pending_flush.reward_component_sums,
-                        metric_flush.reward_component_sums,
+                    reward_component_means=_merge_reward_component_means(
+                        pending_flush.reward_component_means,
+                        metric_flush.reward_component_means,
+                        left_updates=pending_flush.reward_component_updates,
+                        right_updates=metric_flush.reward_component_updates,
+                    ),
+                    reward_component_updates=(
+                        pending_flush.reward_component_updates
+                        + metric_flush.reward_component_updates
                     ),
                 )
             else:
@@ -609,7 +624,7 @@ def _run_collector(
                 final=True,
                 reward_history=publication_rewards,
                 length_history=publication_lengths,
-                reward_component_sums=completed_flush.reward_component_sums,
+                reward_component_means=completed_flush.reward_component_means,
             )
             if published:
                 ep_rewards = publication_rewards
@@ -1039,9 +1054,15 @@ def _run_collector(
                             pending_flush.lengths + metric_flush.lengths,
                             pending_flush.done_count + metric_flush.done_count,
                             pending_flush.timeout_count + metric_flush.timeout_count,
-                            reward_component_sums=_merge_reward_component_sums(
-                                pending_flush.reward_component_sums,
-                                metric_flush.reward_component_sums,
+                            reward_component_means=_merge_reward_component_means(
+                                pending_flush.reward_component_means,
+                                metric_flush.reward_component_means,
+                                left_updates=pending_flush.reward_component_updates,
+                                right_updates=metric_flush.reward_component_updates,
+                            ),
+                            reward_component_updates=(
+                                pending_flush.reward_component_updates
+                                + metric_flush.reward_component_updates
                             ),
                         )
                     publication_rewards = deque(ep_rewards, maxlen=ep_rewards.maxlen)
@@ -1053,7 +1074,7 @@ def _run_collector(
                     published = enqueue_collector_metrics(
                         reward_history=publication_rewards,
                         length_history=publication_lengths,
-                        reward_component_sums=completed_flush.reward_component_sums,
+                        reward_component_means=completed_flush.reward_component_means,
                     )
                     if published:
                         ep_rewards = publication_rewards

@@ -142,9 +142,9 @@ def test_tensor_collector_metrics_packs_reward_components_in_same_transfer(
 
     flushed = metrics.flush()
 
-    assert flushed.reward_component_sums == {"left": 16.0, "right": 20.0}
+    assert flushed.reward_component_means == {"left": 4.0, "right": 5.0}
     assert calls == 1
-    assert torch.count_nonzero(metrics.reward_component_sums) == 0
+    assert torch.count_nonzero(metrics._reward_component_sum) == 0
 
 
 def test_tensor_collector_metrics_supports_no_done_window() -> None:
@@ -845,7 +845,7 @@ def test_tensor_collector_reports_bounded_inference_scheduling_diagnostics(
     assert inference_request_queue.get_nowait() == 0
 
 
-def test_tensor_collector_preserves_interval_reward_component_sums(
+def test_tensor_collector_preserves_interval_reward_component_means(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     stop_event = threading.Event()
@@ -943,8 +943,8 @@ def test_tensor_collector_preserves_interval_reward_component_sums(
 
     metrics_queue.get_nowait()  # runtime manifest
     report = metrics_queue.get_nowait()
-    assert report["reward_components"] == {"left": 4.0, "right": 6.0}
-    assert report["reward_component_sums"] is True
+    assert report["reward_components"] == {"left": 2.0, "right": 3.0}
+    assert report["reward_component_means"] is True
 
 
 def test_worker_shutdown_flushes_partial_metrics_before_abnormal_cleanup(
