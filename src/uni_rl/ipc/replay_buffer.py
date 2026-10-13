@@ -124,6 +124,11 @@ class ReplayBuffer(SharedBufferBase):
         self._ingress_ready = spawn_context.Semaphore(0)
         self._ingress_consume_seq = 0
         self._ingress_release_seq = 0
+        self._ingress_read_stream = (
+            torch.cuda.current_stream(self._ingress_device)
+            if self._ingress_device.type == "cuda"
+            else None
+        )
 
     @property
     def storage_width(self) -> int:
@@ -427,7 +432,7 @@ class ReplayBuffer(SharedBufferBase):
                 target[:, self._ncritic_sl] if has_critic else None,
                 terminal_next_critic,
             )
-            completion = wait_graph_completion(completion, stream=self._ingress_device)
+            completion = wait_graph_completion(completion, stream=self._ingress_read_stream)
             if self._ingress_device.type == "cuda":
                 # A CUDA slot is unreadable without a negotiated completion
                 # receipt. Fail closed instead of synchronizing the producer

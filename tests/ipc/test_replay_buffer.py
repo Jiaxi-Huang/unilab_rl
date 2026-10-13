@@ -288,7 +288,11 @@ def test_cuda_ingress_publication_requires_completion_read_gate(
         with pytest.raises(RuntimeError, match="graph completion receipt"):
             buf.add(*batch)
 
-        buf.add(*batch, completion=ImmediateGraphCompletion(operation="step"))
+        class StreamCompletion(ImmediateGraphCompletion):
+            def wait_before_read(self, stream=None):
+                assert isinstance(stream, torch.cuda.Stream)
+
+        buf.add(*batch, completion=StreamCompletion(operation="step"))
 
         assert protected_ingress_slots
         assert buf.ingress_diagnostics()["high_water_occupancy"] == 1
@@ -331,7 +335,8 @@ def test_cuda_add_batch_reuses_one_completion_gate_for_each_chunk(
         assert buf.add_batch(*batch, completion=RecordingCompletion()) is True
         chunks = [_take_and_commit(buf) for _ in range(3)]
         assert [count for _, count, _ in chunks] == [2, 2, 1]
-        assert waited_streams == [buf.ingress_device] * 3
+        assert all(isinstance(stream, torch.cuda.Stream) for stream in waited_streams)
+        assert len(waited_streams) == 3
         packed_obs = torch.cat(
             (
                 chunks[0][2][:, buf._obs_sl],

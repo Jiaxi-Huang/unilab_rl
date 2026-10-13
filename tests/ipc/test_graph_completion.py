@@ -38,9 +38,9 @@ def test_wait_graph_completion_rejects_non_protocol_producer() -> None:
 
 
 def test_wait_graph_completion_rejects_stale_sequences() -> None:
-    first = ImmediateGraphCompletion(sequence=1)
-    stale = ImmediateGraphCompletion(sequence=0)
+    current = ImmediateGraphCompletion(sequence=10**9)
+    stale = ImmediateGraphCompletion(sequence=current.sequence - 1)
 
-    wait_graph_completion(first)
+    wait_graph_completion(current)
     with pytest.raises(ValueError, match="stale"):
         wait_graph_completion(stale)
