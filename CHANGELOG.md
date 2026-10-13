@@ -7,6 +7,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.4.13] - 2026-10-13
+
+### Added
+
+- Replay ingress consumes a neutral public graph-completion receipt contract
+  without importing UniLab or UniSim (Motphys/UniLab#2309). CUDA ingress
+  publication is gated on operation, capture identity, and monotonic sequence;
+  stale, malformed, or missing CUDA receipts fail closed.
+- Collector-side CUDA ingress publication records an interprocess event after
+  slot writes without synchronizing the producer stream. Learner-side device
+  copies wait on that receipt on their own stream, and spawned collectors can
+  export/import opaque IPC handles for consumer-stream ordering.
+- Runtime manifests publish and validate graph lifecycle evidence fail-closed.
+
 ## [1.4.12] - 2026-10-12
 
 ### Added
