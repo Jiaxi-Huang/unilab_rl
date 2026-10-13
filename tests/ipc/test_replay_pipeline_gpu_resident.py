@@ -250,7 +250,9 @@ class TestMPSIngressEventLifecycle:
             capture_id = "capture-a"
 
         class Replay:
-            last_graph_completion = Completion(sequence=1, capture_id="capture-a")
+            last_graph_completion = Completion(
+                operation="collector_tick", sequence=1, capture_id="capture-a"
+            )
             graph_completion_sequence = 1
             graph_capture_id = "capture-a"
 
@@ -463,6 +465,27 @@ class TestGPUResidentPipeline:
             fields["rewards"].cpu(),
             torch.arange(15, dtype=torch.float32),
         )
+
+    @cuda_only
+    def test_background_and_learner_progress_own_ingress_without_token_race(self, pipeline_factory):
+        rb = _make_bounded_replay(capacity=64, slot_rows=8)
+        pipeline = pipeline_factory(rb, sample_count=8)
+
+        _pattern_add(rb, 0, 8)
+        _pattern_add(rb, 8, 8)
+        deadline = time.monotonic() + 10.0
+        while not pipeline.progress() and time.monotonic() < deadline:
+            time.sleep(0.005)
+        # A learner wait must observe daemon-owned work without consuming any
+        # ingress token itself.
+        pipeline.progress(wait=True)
+        _wait_visible(pipeline, 16)
+
+        diagnostics = rb.ingress_diagnostics()
+        assert diagnostics["published_sequence"] == 2
+        assert diagnostics["release_sequence"] == 2
+        assert diagnostics["occupancy"] == 0
+        assert pipeline._submitted_ptr == 16
 
     def test_bounded_ingress_samples_only_committed_rows(self, pipeline_factory):
         rb = _make_bounded_replay(capacity=64, slot_rows=16)
