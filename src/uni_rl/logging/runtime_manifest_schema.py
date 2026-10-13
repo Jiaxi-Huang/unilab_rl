@@ -34,6 +34,8 @@ _STABLE_NONNEGATIVE_INT_FIELDS = (
 )
 _GRAPH_LIFECYCLE_NONNEGATIVE_INT_FIELDS = (("graph_lifecycle", "contract_version"),)
 _GRAPH_LIFECYCLE_STATES = frozenset({"unavailable", "ready", "invalidated"})
+_COLLECTOR_GRAPH_MODES = frozenset({"disabled", "eager", "graph"})
+_COLLECTOR_GRAPH_STATES = frozenset({"unavailable", "eager", "ready", "invalidated"})
 _COMPLETED_REQUIRED_SECTIONS = (
     "inference_flight",
     "replay_ingress",
@@ -108,6 +110,7 @@ def validate_runtime_manifest(
 
     _validate_backend_diagnostics(manifest)
     _validate_graph_lifecycle(manifest)
+    _validate_collector_graph(manifest)
 
 
 def _validate_backend_diagnostics(manifest: Mapping[str, Any]) -> None:
@@ -222,6 +225,46 @@ def _validate_graph_lifecycle(manifest: Mapping[str, Any]) -> None:
                 raise ValueError(
                     f"runtime_manifest.graph_lifecycle.backend_diagnostics.{field} must be a bool"
                 )
+
+
+def _validate_collector_graph(manifest: Mapping[str, Any]) -> None:
+    """Validate the optional owner-controlled collector execution section."""
+    section = manifest.get("collector_graph")
+    if section is None:
+        return
+    if not isinstance(section, Mapping):
+        raise ValueError("runtime_manifest.collector_graph must be a mapping")
+    mode = section.get("mode")
+    if mode not in _COLLECTOR_GRAPH_MODES:
+        raise ValueError(
+            f"runtime_manifest.collector_graph.mode must be one of {sorted(_COLLECTOR_GRAPH_MODES)}"
+        )
+    requested = section.get("requested")
+    enabled = section.get("enabled")
+    if not isinstance(requested, bool) or not isinstance(enabled, bool):
+        raise ValueError("runtime_manifest.collector_graph requested/enabled must be bools")
+    state = section.get("state")
+    if state is not None and state not in _COLLECTOR_GRAPH_STATES:
+        raise ValueError(
+            "runtime_manifest.collector_graph.state must be "
+            f"one of {sorted(_COLLECTOR_GRAPH_STATES)}"
+        )
+    capture_id = section.get("capture_id")
+    reason = section.get("disable_reason")
+    if enabled:
+        if mode != "graph" or not requested or state != "ready":
+            raise ValueError("an enabled collector_graph must be requested READY graph mode")
+        if not isinstance(capture_id, str) or not capture_id.strip():
+            raise ValueError("an enabled collector_graph requires a non-empty capture_id")
+        if reason is not None:
+            raise ValueError("an enabled collector_graph must not declare disable_reason")
+    elif state is not None:
+        if capture_id is not None:
+            raise ValueError("a disabled collector_graph must not declare capture_id")
+        if not isinstance(reason, str) or not reason.strip():
+            raise ValueError("a disabled collector_graph requires a non-empty disable_reason")
+    elif not isinstance(reason, str) or not reason.strip():
+        raise ValueError("runtime_manifest.collector_graph.disable_reason is required")
 
 
 def _validate_positive_int(
