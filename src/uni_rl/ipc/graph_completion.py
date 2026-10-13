@@ -7,6 +7,7 @@ from typing import Any, Protocol, runtime_checkable
 
 MAX_GRAPH_IPC_HANDLE_BYTES = 256
 MAX_GRAPH_CAPTURE_ID_BYTES = 256
+GRAPH_COMPLETION_OPERATIONS = frozenset({"step", "selected_reset", "mask_reset", "collector_tick"})
 
 
 def _validate_public_metadata(
@@ -23,7 +24,7 @@ def _validate_public_metadata(
         raise TypeError("graph completion contract_version must be an integer")
     if contract_version != 1:
         raise ValueError(f"unsupported graph completion contract {contract_version}")
-    if operation not in ("step", "selected_reset", "mask_reset"):
+    if operation not in GRAPH_COMPLETION_OPERATIONS:
         raise ValueError(f"unsupported graph completion operation {operation!r}")
     if not isinstance(sequence, int) or isinstance(sequence, bool) or sequence < 0:
         raise TypeError("graph completion sequence must be a non-negative integer")
@@ -87,7 +88,7 @@ def wait_graph_completion(
         raise TypeError("graph completion must implement the public wait_before_read protocol")
     if completion.contract_version != 1:
         raise ValueError(f"unsupported graph completion contract {completion.contract_version}")
-    if completion.operation not in ("step", "selected_reset", "mask_reset"):
+    if completion.operation not in GRAPH_COMPLETION_OPERATIONS:
         raise ValueError(f"unsupported graph completion operation {completion.operation!r}")
     if completion.operation != operation:
         raise ValueError(f"expected {operation!r} graph completion, got {completion.operation!r}")
