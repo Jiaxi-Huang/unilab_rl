@@ -44,3 +44,13 @@ def test_wait_graph_completion_rejects_stale_sequences() -> None:
     wait_graph_completion(current, last_sequence=10**9 - 1)
     with pytest.raises(ValueError, match="stale"):
         wait_graph_completion(stale, last_sequence=10**9)
+
+
+def test_wait_graph_completion_binds_operation_and_capture() -> None:
+    completion = ImmediateGraphCompletion(operation="step", capture_id="capture-a")
+
+    with pytest.raises(ValueError, match="expected 'mask_reset'"):
+        wait_graph_completion(completion, operation="mask_reset")
+    with pytest.raises(ValueError, match="capture"):
+        wait_graph_completion(completion, capture_id="capture-b")
+    assert wait_graph_completion(completion, capture_id="capture-a") is completion

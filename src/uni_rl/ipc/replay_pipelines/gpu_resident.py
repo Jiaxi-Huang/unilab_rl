@@ -392,6 +392,7 @@ class GPUResidentReplayPipeline:
                 wait_graph_completion(
                     self._replay_buffer.last_graph_completion,
                     stream=self._sync_stream,
+                    capture_id=self._replay_buffer.graph_capture_id,
                     last_sequence=self._replay_buffer.graph_completion_sequence,
                 )
                 if record_cuda:

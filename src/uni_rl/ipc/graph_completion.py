@@ -28,6 +28,9 @@ class GraphCompletionTokenProtocol(Protocol):
     @property
     def stream_id(self) -> int: ...
 
+    @property
+    def capture_id(self) -> str | None: ...
+
     def wait_before_read(self, stream: Any | None = None) -> None:
         """Make the completed producer prefix visible before this read."""
         ...
@@ -37,6 +40,8 @@ def wait_graph_completion(
     completion: GraphCompletionTokenProtocol | None,
     *,
     stream: Any | None = None,
+    operation: str = "step",
+    capture_id: str | None = None,
     last_sequence: int = 0,
 ) -> GraphCompletionTokenProtocol | None:
     """Gate a consumer read on an optional public completion receipt."""
@@ -48,6 +53,14 @@ def wait_graph_completion(
         raise ValueError(f"unsupported graph completion contract {completion.contract_version}")
     if completion.operation not in ("step", "selected_reset", "mask_reset"):
         raise ValueError(f"unsupported graph completion operation {completion.operation!r}")
+    if completion.operation != operation:
+        raise ValueError(
+            f"expected {operation!r} graph completion, got {completion.operation!r}"
+        )
+    if capture_id is not None and completion.capture_id != capture_id:
+        raise ValueError(
+            f"graph completion capture {completion.capture_id!r} does not match {capture_id!r}"
+        )
     if isinstance(completion.sequence, bool) or not isinstance(completion.sequence, int):
         raise TypeError("graph completion sequence must be an integer")
     if isinstance(completion.stream_id, bool) or not isinstance(completion.stream_id, int):
@@ -69,6 +82,7 @@ class ImmediateGraphCompletion:
     operation: str = "step"
     sequence: int = 0
     stream_id: int = 0
+    capture_id: str | None = None
 
     def wait_before_read(self, stream: Any | None = None) -> None:
         del stream

@@ -247,9 +247,12 @@ class TestMPSIngressEventLifecycle:
             def wait_before_read(self, stream=None):
                 waited.append(stream)
 
+            capture_id = "capture-a"
+
         class Replay:
-            last_graph_completion = Completion(sequence=1)
+            last_graph_completion = Completion(sequence=1, capture_id="capture-a")
             graph_completion_sequence = 1
+            graph_capture_id = "capture-a"
 
         pipeline._replay_buffer = Replay()
 
