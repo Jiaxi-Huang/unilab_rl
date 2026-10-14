@@ -5,7 +5,25 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [2.0.0] - 2026-10-15
+
+### Removed
+
+- Removed the collector graph protocol, configuration, runner state, public
+  lifecycle manifest, and whole-collector completion operation with no
+  compatibility path (Motphys/UniLab#2358 and Motphys/UniLab#2359). Replay ingress now uses
+  the neutral v2 completion contract: `CompletionTokenProtocol`,
+  `wait_completion`, `import_shared_completion`, top-level env `completion`
+  receipts, `producer_id`, and publication-sequence metadata. Backend physics
+  graphs and FlashSAC learner CUDA graphs are unchanged. Runtime manifests use
+  schema version 2 so v1 collector-graph manifests fail closed.
+
+### Fixed
+
+- Replay ingress now validates and waits for the producer completion before
+  its first transition-source read or copy, instead of enqueueing the wait
+  after the ingress copies. Unexpected CUDA IPC handle export failures also
+  fail closed rather than silently marking receipt metadata unavailable.
 
 ## [1.4.14] - 2026-10-14
 

@@ -19,7 +19,6 @@ from uni_rl.logging.offpolicy import OffPolicyLogger
 from uni_rl.offpolicy.tensor_metrics import TensorCollectorMetrics
 from uni_rl.offpolicy.worker import (
     _collector_action_numpy,
-    _graph_lifecycle_manifest,
     _publish_collector_ready,
     _publish_inference_tick,
     _wait_for_inference_tick,
@@ -44,21 +43,6 @@ def test_cpu_collector_action_conversion_preserves_legacy_contract(
     assert isinstance(converted, np.ndarray)
     assert converted.dtype == np.float32
     np.testing.assert_array_equal(converted, values)
-
-
-def test_graph_lifecycle_manifest_prefers_public_env_snapshot() -> None:
-    env = SimpleNamespace(
-        get_graph_lifecycle_manifest=lambda: {
-            "contract_version": 1,
-            "state": "ready",
-            "capture_id": "capture-a",
-            "replay_count": 2,
-            "fallback_count": 0,
-            "disable_reason": None,
-        }
-    )
-
-    assert _graph_lifecycle_manifest(env)["capture_id"] == "capture-a"
 
 
 def test_tensor_collector_metrics_resets_done_episodes_and_flushes_one_transfer(

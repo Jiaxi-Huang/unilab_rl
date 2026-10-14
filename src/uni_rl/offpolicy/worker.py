@@ -13,7 +13,6 @@ from uni_rl.env_contract import (
     EnvFactory,
     get_algo_capabilities,
     get_backend_runtime_diagnostics,
-    negotiate_collector_graph,
 )
 from uni_rl.offpolicy.actor_adapter import get_offpolicy_actor_adapter, import_actor_adapter_modules
 from uni_rl.offpolicy.coordination import (
@@ -255,22 +254,6 @@ def _merge_reward_component_means(
     }
 
 
-def _graph_lifecycle_manifest(env: Any) -> dict[str, Any]:
-    """Snapshot optional graph lifecycle evidence without backend probing."""
-    diagnostics = get_backend_runtime_diagnostics(env)
-    entry = None
-    if diagnostics is not None:
-        entries = diagnostics.get("diagnostics")
-        if isinstance(entries, dict):
-            entry = entries.get("cuda_graph")
-    snapshot = getattr(env, "get_graph_lifecycle_manifest", None)
-    if callable(snapshot):
-        values = snapshot()
-        if isinstance(values, dict):
-            return {str(key): value for key, value in values.items()}
-    return {"contract_version": 1, "backend_diagnostics": entry}
-
-
 def off_policy_collector_fn(
     stop_event,
     env_factory: EnvFactory,
@@ -297,7 +280,6 @@ def off_policy_collector_fn(
     backend_device_binder=None,
     learner_coordination: LearnerCoordinationState | None = None,
     learner_pid: int | None = None,
-    collector_graph_mode: str = "disabled",
 ):
     """Entry point for the off-policy collector subprocess.
 
@@ -330,7 +312,6 @@ def off_policy_collector_fn(
         backend_device_binder=backend_device_binder,
         learner_coordination=learner_coordination,
         learner_pid=learner_pid,
-        collector_graph_mode=collector_graph_mode,
     )
 
 
@@ -360,7 +341,6 @@ def _run_collector(
     backend_device_binder=None,
     learner_coordination=None,
     learner_pid=None,
-    collector_graph_mode="disabled",
 ):
     # Spawn subprocesses do not inherit the parent's adapter registrations;
     # import the configured modules so registration side effects run here too.
@@ -388,11 +368,6 @@ def _run_collector(
         )
     if "inference_transport" in (env_cfg_override or {}):
         raise ValueError("Collector env override must not set inference_transport")
-    collector_graph_negotiation = negotiate_collector_graph(
-        env,
-        collector_graph_mode,
-        allow_eager_fallback=True,
-    )
     tensor_runtime_requested = requested_transport == "cuda"
     if tensor_runtime_requested:
         if inference_slot is None or inference_slot.device.type != "cuda":
@@ -683,14 +658,6 @@ def _run_collector(
         "inference_legal_max_in_flight": 1,
         "inference_dependency_graph": dict(INFERENCE_DEPENDENCY_GRAPH),
         "backend_diagnostics": dict(backend_diagnostics),
-        "graph_lifecycle": _graph_lifecycle_manifest(env),
-        "collector_graph": collector_graph_negotiation.manifest
-        or {
-            "mode": collector_graph_negotiation.mode,
-            "requested": False,
-            "enabled": False,
-            "disable_reason": "env does not implement the public collector graph mode protocol",
-        },
     }
     if trace_recorder:
         manifest_ns = _time.perf_counter_ns()
@@ -959,7 +926,7 @@ def _run_collector(
                     critic=critic_t,
                     next_critic=next_critic_t,
                     terminal_next_critic=terminal_critic_t,
-                    completion=state.info.get("graph_completion"),
+                    completion=state.info.get("completion"),
                 )
                 if not published and not stop_event.is_set():
                     raise RuntimeError("replay ingress closed before collector shutdown")
@@ -993,7 +960,7 @@ def _run_collector(
                         if terminal_contract.terminal_critic is not None
                         else None
                     ),
-                    completion=state.info.get("graph_completion"),
+                    completion=state.info.get("completion"),
                 )
                 if not published and not stop_event.is_set():
                     raise RuntimeError("replay ingress closed before collector shutdown")

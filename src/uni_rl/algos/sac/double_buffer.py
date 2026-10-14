@@ -162,8 +162,5 @@ def build_sac_double_buffer_runner(
         actor_adapter_modules=actor_adapter_modules,
         inference_placement=inference_placement,
         tensor_runtime_settings=tensor_runtime_settings,
-        collector_graph_mode=str(
-            OmegaConf.select(cfg, "training.collector_graph", default="disabled")
-        ),
         log_interval=int(cfg.training.log_interval),
     )

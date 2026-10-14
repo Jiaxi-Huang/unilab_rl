@@ -112,7 +112,7 @@ def test_scheduler_rejects_slot_reuse_before_response_release() -> None:
         scheduler.finish_update()
 
 
-def test_scheduler_rejects_out_of_order_collector_tick() -> None:
+def test_scheduler_rejects_out_of_order_collector_publication() -> None:
     scheduler = _LearnerInferenceScheduler(env_steps_per_sync=1)
 
     with pytest.raises(RuntimeError, match="expected 0, got 1"):

@@ -11,7 +11,7 @@ from threading import Condition, Lock
 import pytest
 import torch
 
-from uni_rl.ipc.graph_completion import ImmediateGraphCompletion
+from uni_rl.ipc.completion import COMPLETION_CONTRACT_VERSION, ImmediateCompletion
 from uni_rl.ipc.replay_buffer import ReplayBuffer
 from uni_rl.ipc.replay_pipelines.gpu_resident import (
     GPUResidentReplayPipeline,
@@ -243,18 +243,16 @@ class TestMPSIngressEventLifecycle:
         pipeline._sync_stream = torch.cuda.Stream()
         waited: list[object] = []
 
-        class Completion(ImmediateGraphCompletion):
+        class Completion(ImmediateCompletion):
             def wait_before_read(self, stream=None):
                 waited.append(stream)
 
-            capture_id = "capture-a"
+            producer_id = "producer-a"
 
         class Replay:
-            last_graph_completion = Completion(
-                operation="collector_tick", sequence=1, capture_id="capture-a"
-            )
-            graph_completion_sequence = 1
-            graph_capture_id = "capture-a"
+            last_completion = Completion(operation="step", sequence=1, producer_id="producer-a")
+            completion_sequence = 1
+            completion_producer_id = "producer-a"
 
         pipeline._replay_buffer = Replay()
 
@@ -269,7 +267,7 @@ class TestMPSIngressEventLifecycle:
         assert pipeline._span_events
 
     @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
-    def test_cuda_ingress_copy_waits_env_update_receipt_operation(self):
+    def test_cuda_ingress_copy_rejects_removed_env_update_operation(self):
         pipeline = object.__new__(GPUResidentReplayPipeline)
         pipeline._device = torch.device("cuda")
         pipeline._capacity = 4
@@ -281,30 +279,34 @@ class TestMPSIngressEventLifecycle:
         pipeline._trace_cuda_events = False
         pipeline._submission_lock = Lock()
         pipeline._sync_stream = torch.cuda.Stream()
-        waited: list[object] = []
 
-        class Completion(ImmediateGraphCompletion):
+        class InvalidCompletion:
+            contract_version = COMPLETION_CONTRACT_VERSION
             operation = "env_update"
+            sequence = 1
+            stream_id = 0
+            producer_id = "producer-update"
 
             def wait_before_read(self, stream=None):
-                waited.append(stream)
+                del stream
+
+            def ipc_handle(self):
+                return b"x"
 
         class Replay:
-            last_graph_completion = Completion(sequence=1, capture_id="capture-update")
-            graph_completion_sequence = 1
-            graph_capture_id = "capture-update"
+            last_completion = InvalidCompletion()
+            completion_sequence = 1
+            completion_producer_id = "producer-update"
 
         pipeline._replay_buffer = Replay()
 
-        pipeline._submit_span_copy(
-            start=0,
-            end=4,
-            source=torch.ones(4, 2, device="cuda"),
-            ingress_slot=0,
-        )
-
-        assert waited == [pipeline._sync_stream]
-        assert pipeline._span_events
+        with pytest.raises(ValueError, match="unsupported completion operation"):
+            pipeline._submit_span_copy(
+                start=0,
+                end=4,
+                source=torch.ones(4, 2, device="cuda"),
+                ingress_slot=0,
+            )
 
     def test_multiple_pending_spans_commit_in_order_and_release_slots(self):
         pipeline = object.__new__(GPUResidentReplayPipeline)

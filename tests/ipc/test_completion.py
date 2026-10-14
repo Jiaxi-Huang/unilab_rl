@@ -1,4 +1,4 @@
-"""Neutral graph-completion contract tests."""
+"""Neutral ordered-completion contract tests."""
 
 from __future__ import annotations
 
@@ -7,104 +7,104 @@ import multiprocessing as mp
 import pytest
 import torch
 
-from uni_rl.ipc.graph_completion import (
-    EventGraphCompletion,
-    ImmediateGraphCompletion,
-    import_graph_completion,
+from uni_rl.ipc.completion import (
+    EventCompletion,
+    ImmediateCompletion,
+    import_shared_completion,
     record_ingress_publication,
-    wait_graph_completion,
+    wait_completion,
 )
 
 
 def test_immediate_completion_is_pass_through() -> None:
-    completion = ImmediateGraphCompletion()
+    completion = ImmediateCompletion()
 
-    assert wait_graph_completion(completion, stream=object()) is completion
+    assert wait_completion(completion, stream=object()) is completion
 
 
-def test_wait_graph_completion_validates_public_metadata() -> None:
-    bad_contract = ImmediateGraphCompletion(contract_version=2)
-    bad_operation = ImmediateGraphCompletion(operation="learner-update")
-    bad_sequence = ImmediateGraphCompletion(sequence=True)
-    bad_stream = ImmediateGraphCompletion(stream_id=True)
+def test_wait_completion_validates_public_metadata() -> None:
+    bad_contract = ImmediateCompletion(contract_version=1)
+    bad_operation = ImmediateCompletion(operation="learner-update")
+    bad_sequence = ImmediateCompletion(sequence=True)
+    bad_stream = ImmediateCompletion(stream_id=True)
+    bad_producer = ImmediateCompletion(producer_id=" ")
 
     with pytest.raises(ValueError, match="contract"):
-        wait_graph_completion(bad_contract)
+        wait_completion(bad_contract)
     with pytest.raises(ValueError, match="operation"):
-        wait_graph_completion(bad_operation)
+        wait_completion(bad_operation)
     with pytest.raises(TypeError, match="sequence"):
-        wait_graph_completion(bad_sequence)
+        wait_completion(bad_sequence)
     with pytest.raises(TypeError, match="stream_id"):
-        wait_graph_completion(bad_stream)
+        wait_completion(bad_stream)
+    with pytest.raises(TypeError, match="producer_id"):
+        wait_completion(bad_producer)
 
 
-def test_wait_graph_completion_rejects_non_protocol_producer() -> None:
+def test_wait_completion_rejects_non_protocol_producer() -> None:
     with pytest.raises(TypeError, match="wait_before_read"):
-        wait_graph_completion(object())  # type: ignore[arg-type]
+        wait_completion(object())  # type: ignore[arg-type]
 
 
-def test_wait_graph_completion_rejects_stale_sequences() -> None:
-    current = ImmediateGraphCompletion(sequence=10**9)
-    stale = ImmediateGraphCompletion(sequence=10**9 - 1)
+def test_wait_completion_rejects_stale_sequences() -> None:
+    current = ImmediateCompletion(sequence=10**9)
+    stale = ImmediateCompletion(sequence=10**9 - 1)
 
-    wait_graph_completion(current, last_sequence=10**9 - 1)
+    wait_completion(current, last_sequence=10**9 - 1)
     with pytest.raises(ValueError, match="stale"):
-        wait_graph_completion(stale, last_sequence=10**9)
+        wait_completion(stale, last_sequence=10**9)
 
 
-def test_wait_graph_completion_binds_operation_and_capture() -> None:
-    completion = ImmediateGraphCompletion(operation="step", capture_id="capture-a")
+def test_wait_completion_binds_operation_and_producer() -> None:
+    completion = ImmediateCompletion(operation="step", producer_id="producer-a")
 
     with pytest.raises(ValueError, match="expected 'mask_reset'"):
-        wait_graph_completion(completion, operation="mask_reset")
-    with pytest.raises(ValueError, match="capture"):
-        wait_graph_completion(completion, capture_id="capture-b")
-    assert wait_graph_completion(completion, capture_id="capture-a") is completion
+        wait_completion(completion, operation="mask_reset")
+    with pytest.raises(ValueError, match="producer"):
+        wait_completion(completion, producer_id="producer-b")
+    assert wait_completion(completion, producer_id="producer-a") is completion
 
 
-def test_collector_tick_is_a_public_neutral_completion_operation() -> None:
-    completion = ImmediateGraphCompletion(
-        operation="collector_tick",
-        sequence=11,
-        stream_id=13,
-        capture_id="collector-capture-a",
-    )
+def test_removed_whole_collector_operation_is_rejected() -> None:
+    completion = ImmediateCompletion()
+    completion.operation = "whole_collector"
 
-    assert wait_graph_completion(completion, operation="collector_tick") is completion
+    with pytest.raises(ValueError, match="unsupported completion operation"):
+        wait_completion(completion)
 
 
 def test_immediate_completion_has_no_undeclared_ipc_transport() -> None:
     with pytest.raises(NotImplementedError, match="IPC"):
-        ImmediateGraphCompletion().ipc_handle()
+        ImmediateCompletion().ipc_handle()
 
 
 def test_ingress_publication_preserves_cpu_receipt() -> None:
-    completion = ImmediateGraphCompletion(capture_id="capture-cpu")
+    completion = ImmediateCompletion(producer_id="producer-cpu")
 
     assert record_ingress_publication(completion, stream=None) is completion
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
 def test_cuda_ingress_publication_records_interprocess_event() -> None:
-    completion = ImmediateGraphCompletion(
+    completion = ImmediateCompletion(
         operation="step",
         sequence=7,
         stream_id=11,
-        capture_id="capture-cuda",
+        producer_id="producer-cuda",
     )
     stream = torch.cuda.Stream()
 
     with torch.cuda.stream(stream):
         published = record_ingress_publication(completion, stream=stream)
 
-    assert isinstance(published, EventGraphCompletion)
+    assert isinstance(published, EventCompletion)
     assert published.operation == completion.operation
     assert published.sequence == completion.sequence
     assert published.stream_id == completion.stream_id
-    assert published.capture_id == completion.capture_id
+    assert published.producer_id == completion.producer_id
     consumer = torch.cuda.Stream()
     with torch.cuda.stream(consumer):
-        wait_graph_completion(published, stream=consumer)
+        wait_completion(published, stream=consumer)
     consumer.synchronize()
     assert isinstance(published.ipc_handle(), bytes)
 
@@ -114,11 +114,11 @@ def _spawned_collector(queue, release) -> None:
     device = torch.device("cuda", index=torch.cuda.current_device())
     stream = torch.cuda.current_stream(device)
     slot = torch.full((4, 3), 17.0, dtype=torch.float32, device=device).share_memory_()
-    completion = ImmediateGraphCompletion(
+    completion = ImmediateCompletion(
         operation="step",
         sequence=9,
         stream_id=int(stream.cuda_stream),
-        capture_id="capture-spawn",
+        producer_id="producer-spawn",
     )
     published = record_ingress_publication(completion, stream=stream)
     queue.put(
@@ -128,7 +128,7 @@ def _spawned_collector(queue, release) -> None:
             published.operation,
             published.sequence,
             published.stream_id,
-            published.capture_id,
+            published.producer_id,
             published.ipc_handle(),
             device,
         )
@@ -147,20 +147,20 @@ def test_spawned_collector_completion_receipt_imports_and_orders_read() -> None:
     process.start()
     try:
         payload = queue.get(timeout=30)
-        slot, version, operation, sequence, stream_id, capture_id, handle, device = payload
+        slot, version, operation, sequence, stream_id, producer_id, handle, device = payload
 
-        imported = import_graph_completion(
+        imported = import_shared_completion(
             contract_version=version,
             operation=operation,
             sequence=sequence,
             stream_id=stream_id,
-            capture_id=capture_id,
+            producer_id=producer_id,
             ipc_handle=handle,
             device=device,
         )
         consumer = torch.cuda.Stream()
         with torch.cuda.stream(consumer):
-            wait_graph_completion(imported, stream=consumer)
+            wait_completion(imported, stream=consumer)
             copied = slot.clone()
         consumer.synchronize()
         torch.testing.assert_close(copied.cpu(), torch.full((4, 3), 17.0))
@@ -173,22 +173,23 @@ def test_spawned_collector_completion_receipt_imports_and_orders_read() -> None:
 @pytest.mark.parametrize(
     "field",
     (
-        {"contract_version": 2},
+        {"contract_version": 1},
         {"operation": "learner-update"},
-        {"capture_id": None},
+        {"producer_id": " "},
+        {"producer_id": "x" * 257},
         {"ipc_handle": b""},
         {"ipc_handle": b"x" * 257},
     ),
 )
-def test_import_graph_completion_rejects_malformed_metadata(field: dict) -> None:
+def test_import_shared_completion_rejects_malformed_metadata(field: dict) -> None:
     valid = {
-        "contract_version": 1,
+        "contract_version": 2,
         "operation": "step",
         "sequence": 1,
         "stream_id": 2,
-        "capture_id": "capture-a",
+        "producer_id": "producer-a",
         "ipc_handle": b"x" * 64,
         "device": object(),
     }
     with pytest.raises((TypeError, ValueError)):
-        import_graph_completion(**(valid | field))  # type: ignore[arg-type]
+        import_shared_completion(**(valid | field))  # type: ignore[arg-type]

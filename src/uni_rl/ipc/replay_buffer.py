@@ -7,12 +7,12 @@ from typing import Any
 import numpy as np
 import torch
 
-from uni_rl.ipc.graph_completion import (
-    GraphCompletionTokenProtocol,
-    collector_tick_receipt,
-    import_graph_completion,
+from uni_rl.ipc.completion import (
+    CompletionTokenProtocol,
+    import_shared_completion,
+    publication_receipt,
     record_ingress_publication,
-    wait_graph_completion,
+    wait_completion,
 )
 from uni_rl.ipc.shared_buffer import SharedBufferBase
 
@@ -128,9 +128,9 @@ class ReplayBuffer(SharedBufferBase):
         self._ingress_ready = spawn_context.Semaphore(0)
         self._ingress_consume_seq = 0
         self._ingress_release_seq = 0
-        self._graph_completion_sequence = 0
-        self._graph_capture_id: str | None = None
-        self._last_graph_completion: GraphCompletionTokenProtocol | None = None
+        self._completion_sequence = 0
+        self._completion_producer_id: str | None = None
+        self._last_completion: CompletionTokenProtocol | None = None
         self._completion_metadata_version = torch.zeros(
             1, dtype=torch.int64, device="cpu"
         ).share_memory_()
@@ -152,10 +152,10 @@ class ReplayBuffer(SharedBufferBase):
         self._completion_metadata_handle_size = torch.zeros(
             1, dtype=torch.int64, device="cpu"
         ).share_memory_()
-        self._completion_metadata_capture = torch.zeros(
+        self._completion_metadata_producer = torch.zeros(
             (1, 256), dtype=torch.uint8, device="cpu"
         ).share_memory_()
-        self._completion_metadata_capture_size = torch.zeros(
+        self._completion_metadata_producer_size = torch.zeros(
             1, dtype=torch.int64, device="cpu"
         ).share_memory_()
         self._completion_metadata_operation_size = torch.zeros(
@@ -258,46 +258,49 @@ class ReplayBuffer(SharedBufferBase):
         return slot, start, count, self._ingress_slots[slot][:count]
 
     @property
-    def last_graph_completion(self) -> GraphCompletionTokenProtocol | None:
+    def last_completion(self) -> CompletionTokenProtocol | None:
         """Return the receipt guarding the newest published ingress slot."""
-        return self._last_graph_completion
+        return self._last_completion
 
     @property
-    def graph_completion_sequence(self) -> int:
+    def completion_sequence(self) -> int:
         """Return the latest completion sequence accepted by this buffer."""
-        return self._graph_completion_sequence
+        return self._completion_sequence
 
     @property
-    def graph_capture_id(self) -> str | None:
-        """Return the capture identity accepted by this ingress producer."""
-        return self._graph_capture_id
+    def completion_producer_id(self) -> str | None:
+        """Return the producer identity accepted by this ingress producer."""
+        return self._completion_producer_id
 
     def _publish_completion_metadata(self, completion: Any) -> None:
         """Publish neutral receipt metadata for the learner-local process copy."""
         try:
             handle = bytes(completion.ipc_handle())
-        except (AttributeError, NotImplementedError, RuntimeError):
+        except NotImplementedError:
+            # Receipts such as eager host-bridge completions legitimately do
+            # not declare an interprocess transport. Driver and IPC export
+            # failures must fail closed instead of becoming a missing receipt.
             return
-        capture = completion.capture_id.encode("utf-8") if completion.capture_id else b""
+        producer = completion.producer_id.encode("utf-8")
         operation = completion.operation.encode("ascii")
         if (
             len(handle) > self._completion_metadata_handle.shape[1]
-            or len(capture) > (self._completion_metadata_capture.shape[1])
+            or len(producer) > (self._completion_metadata_producer.shape[1])
         ):
-            raise ValueError("graph completion IPC metadata exceeds ingress limits")
+            raise ValueError("completion IPC metadata exceeds ingress limits")
         self._completion_metadata_contract[0] = int(completion.contract_version)
         self._completion_metadata_sequence[0] = int(completion.sequence)
         self._completion_metadata_stream_id[0] = int(completion.stream_id)
         self._completion_metadata_handle_size[0] = len(handle)
-        self._completion_metadata_capture_size[0] = len(capture)
+        self._completion_metadata_producer_size[0] = len(producer)
         self._completion_metadata_operation_size[0] = len(operation)
         self._completion_metadata_handle.zero_()
         self._completion_metadata_handle[0, : len(handle)] = torch.from_numpy(
             np.frombuffer(handle, dtype=np.uint8).copy()
         )
-        self._completion_metadata_capture.zero_()
-        self._completion_metadata_capture[0, : len(capture)] = torch.from_numpy(
-            np.frombuffer(capture, dtype=np.uint8).copy()
+        self._completion_metadata_producer.zero_()
+        self._completion_metadata_producer[0, : len(producer)] = torch.from_numpy(
+            np.frombuffer(producer, dtype=np.uint8).copy()
         )
         self._completion_metadata_operation.zero_()
         operation_tensor = torch.from_numpy(np.frombuffer(operation, dtype=np.int8).copy())
@@ -305,37 +308,39 @@ class ReplayBuffer(SharedBufferBase):
         self._completion_metadata_available[0] = True
         self._completion_metadata_version[0] += 1
 
-    def _import_shared_completion(self) -> GraphCompletionTokenProtocol | None:
+    def _import_shared_completion(self) -> CompletionTokenProtocol | None:
         """Import the newest collector-recorded receipt on the learner copy."""
         if not bool(self._completion_metadata_available[0]):
             return None
         handle_size = int(self._completion_metadata_handle_size[0])
-        capture_size = int(self._completion_metadata_capture_size[0])
+        producer_size = int(self._completion_metadata_producer_size[0])
         operation_size = int(self._completion_metadata_operation_size[0])
         handle_bytes = bytes(self._completion_metadata_handle[0, :handle_size].numpy().tobytes())
-        capture_bytes = bytes(self._completion_metadata_capture[0, :capture_size].numpy().tobytes())
+        producer_bytes = bytes(
+            self._completion_metadata_producer[0, :producer_size].numpy().tobytes()
+        )
         operation_bytes = bytes(
             self._completion_metadata_operation[:operation_size].numpy().tobytes()
         )
-        imported = import_graph_completion(
+        imported = import_shared_completion(
             contract_version=int(self._completion_metadata_contract[0]),
             operation=operation_bytes.decode("ascii"),
             sequence=int(self._completion_metadata_sequence[0]),
             stream_id=int(self._completion_metadata_stream_id[0]),
-            capture_id=capture_bytes.decode("utf-8") or None,
+            producer_id=producer_bytes.decode("utf-8"),
             ipc_handle=handle_bytes,
             device=self._ingress_device,
         )
-        self._graph_completion_sequence = imported.sequence
-        self._graph_capture_id = imported.capture_id
-        self._last_graph_completion = imported
+        self._completion_sequence = imported.sequence
+        self._completion_producer_id = imported.producer_id
+        self._last_completion = imported
         return imported
 
-    def import_shared_graph_completion(self) -> GraphCompletionTokenProtocol | None:
+    def import_shared_completion(self) -> CompletionTokenProtocol | None:
         """Import collector receipt metadata once per new shared version."""
         version = int(self._completion_metadata_version[0])
         if version == self._completion_metadata_local_version:
-            return self._last_graph_completion
+            return self._last_completion
         imported = self._import_shared_completion()
         self._completion_metadata_local_version = version
         return imported
@@ -378,7 +383,7 @@ class ReplayBuffer(SharedBufferBase):
         state = self.__dict__.copy()
         state["trace_recorder"] = None
         state["_stop_event"] = None
-        state["_last_graph_completion"] = None
+        state["_last_completion"] = None
         return state
 
     def add(
@@ -394,7 +399,7 @@ class ReplayBuffer(SharedBufferBase):
         critic=None,
         next_critic=None,
         terminal_next_critic=None,
-        completion: GraphCompletionTokenProtocol | None = None,
+        completion: CompletionTokenProtocol | None = None,
     ) -> bool:
         """Add batch (called by collector).
 
@@ -432,7 +437,7 @@ class ReplayBuffer(SharedBufferBase):
         critic=None,
         next_critic=None,
         terminal_next_critic=None,
-        completion: GraphCompletionTokenProtocol | None = None,
+        completion: CompletionTokenProtocol | None = None,
     ) -> bool:
         """Publish a collector vector in bounded ingress-sized chunks.
 
@@ -496,7 +501,7 @@ class ReplayBuffer(SharedBufferBase):
         terminal_next_critic,
         *,
         trace_start_ns: int,
-        completion: GraphCompletionTokenProtocol | None = None,
+        completion: CompletionTokenProtocol | None = None,
     ) -> bool:
         count = int(obs.shape[0])
         if count > self._ingress_slot_rows:
@@ -542,6 +547,15 @@ class ReplayBuffer(SharedBufferBase):
         target = self._ingress_slots[slot][:count]
         producer_sequence = int(completion.sequence) if completion is not None else 0
         try:
+            # Gate the ingress stream before its first source-tensor read or
+            # copy. Enqueueing a wait after earlier copies cannot order them.
+            completion = wait_completion(
+                completion,
+                stream=self._ingress_read_stream(),
+                operation=completion.operation if completion is not None else "step",
+                producer_id=self._completion_producer_id,
+                last_sequence=self._completion_sequence,
+            )
             self._write_transition_rows(
                 target,
                 obs,
@@ -561,27 +575,18 @@ class ReplayBuffer(SharedBufferBase):
                 target[:, self._ncritic_sl] if has_critic else None,
                 terminal_next_critic,
             )
-            completion = wait_graph_completion(
-                completion,
-                stream=self._ingress_read_stream(),
-                operation="env_update"
-                if completion is not None and completion.operation == "env_update"
-                else "step",
-                capture_id=self._graph_capture_id,
-                last_sequence=self._graph_completion_sequence,
-            )
             if completion is not None:
                 completion = record_ingress_publication(
                     completion,
                     stream=self._ingress_read_stream(),
                 )
-                completion = collector_tick_receipt(
+                completion = publication_receipt(
                     completion,
                     sequence=producer_sequence,
                 )
-                self._graph_completion_sequence = completion.sequence
-                self._graph_capture_id = completion.capture_id
-                self._last_graph_completion = completion
+                self._completion_sequence = completion.sequence
+                self._completion_producer_id = completion.producer_id
+                self._last_completion = completion
                 self._publish_completion_metadata(completion)
             if self._ingress_device.type == "cuda":
                 # A CUDA slot is unreadable without a negotiated completion
@@ -589,7 +594,7 @@ class ReplayBuffer(SharedBufferBase):
                 # stream or publishing a race against the learner's copy.
                 if completion is None:
                     raise RuntimeError(
-                        "CUDA replay ingress publication requires a graph completion receipt"
+                        "CUDA replay ingress publication requires a completion receipt"
                     )
             start = int(self._published_ptr[0])
             self._ingress_starts[slot] = start
