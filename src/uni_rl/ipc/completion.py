@@ -11,16 +11,15 @@ MAX_COMPLETION_PRODUCER_ID_BYTES = 256
 COMPLETION_OPERATIONS = frozenset({"step", "selected_reset", "mask_reset"})
 
 
-def _validate_public_metadata(
+def _validate_receipt_metadata(
     *,
     contract_version: int,
     operation: str,
     sequence: int,
     stream_id: int,
     producer_id: str,
-    ipc_handle: bytes,
 ) -> None:
-    """Validate IPC receipt metadata without interpreting the event handle."""
+    """Validate the neutral public receipt fields."""
     if not isinstance(contract_version, int) or isinstance(contract_version, bool):
         raise TypeError("completion contract_version must be an integer")
     if contract_version != COMPLETION_CONTRACT_VERSION:
@@ -35,6 +34,25 @@ def _validate_public_metadata(
         raise TypeError("completion producer_id must be a non-empty string")
     if len(producer_id.encode("utf-8")) > MAX_COMPLETION_PRODUCER_ID_BYTES:
         raise ValueError("completion producer_id exceeds the IPC metadata limit")
+
+
+def _validate_public_metadata(
+    *,
+    contract_version: int,
+    operation: str,
+    sequence: int,
+    stream_id: int,
+    producer_id: str,
+    ipc_handle: bytes,
+) -> None:
+    """Validate IPC receipt metadata without interpreting the event handle."""
+    _validate_receipt_metadata(
+        contract_version=contract_version,
+        operation=operation,
+        sequence=sequence,
+        stream_id=stream_id,
+        producer_id=producer_id,
+    )
     if (
         not isinstance(ipc_handle, bytes)
         or not 0 < len(ipc_handle) <= MAX_COMPLETION_IPC_HANDLE_BYTES
@@ -179,8 +197,21 @@ def publication_receipt(
     *,
     sequence: int,
 ) -> CompletionTokenProtocol:
-    """Return the backend operation receipt at an ingress publication sequence."""
+    """Normalize a waited producer receipt for ingress publication.
+
+    Producer packages can implement the public structural protocol without
+    inheriting from this package's concrete classes. Ingress has already waited
+    on that protocol before writing, so preserve its public metadata in the
+    local immediate receipt rather than coupling the contract to a backend type.
+    """
     publication_sequence = int(sequence)
+    _validate_receipt_metadata(
+        contract_version=completion.contract_version,
+        operation=completion.operation,
+        sequence=completion.sequence,
+        stream_id=completion.stream_id,
+        producer_id=completion.producer_id,
+    )
     if isinstance(completion, EventCompletion):
         return EventCompletion(
             contract_version=completion.contract_version,
@@ -190,15 +221,13 @@ def publication_receipt(
             producer_id=completion.producer_id,
             event=completion.event,
         )
-    if isinstance(completion, ImmediateCompletion):
-        return ImmediateCompletion(
-            contract_version=completion.contract_version,
-            operation=completion.operation,
-            sequence=publication_sequence,
-            stream_id=completion.stream_id,
-            producer_id=completion.producer_id,
-        )
-    raise TypeError("ingress publication requires the producer's public concrete receipt")
+    return ImmediateCompletion(
+        contract_version=completion.contract_version,
+        operation=completion.operation,
+        sequence=publication_sequence,
+        stream_id=completion.stream_id,
+        producer_id=completion.producer_id,
+    )
 
 
 def import_shared_completion(

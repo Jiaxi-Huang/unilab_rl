@@ -829,6 +829,247 @@ def test_tensor_collector_reports_bounded_inference_scheduling_diagnostics(
     assert inference_request_queue.get_nowait() == 0
 
 
+def test_tensor_collector_snapshots_transition_source_before_persistent_carrier_update(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Replay must receive obs[t], even when autoreset reuses obs[t+1] storage."""
+    stop_event = threading.Event()
+    metrics_queue: queue.Queue[dict] = queue.Queue(maxsize=4)
+    replay_calls: list[tuple[tuple[torch.Tensor, ...], dict[str, object]]] = []
+    persistent_obs = torch.zeros((2, 2), dtype=torch.float32)
+    persistent_critic = torch.full((2, 3), 5.0, dtype=torch.float32)
+
+    class _Env:
+        state = SimpleNamespace(
+            obs={"obs": persistent_obs, "critic": persistent_critic},
+            reward=torch.ones(2),
+            terminated=torch.tensor([False, True]),
+            truncated=torch.zeros(2, dtype=torch.bool),
+            final_observation=None,
+            info={"timing": {}},
+        )
+
+        def step(self, actions):
+            torch.testing.assert_close(actions, torch.zeros((2, 2)))
+            stop_event.set()
+            persistent_obs.fill_(7.0)
+            persistent_critic.fill_(11.0)
+            return SimpleNamespace(
+                obs=self.state.obs,
+                reward=torch.ones(2),
+                terminated=self.state.terminated,
+                truncated=self.state.truncated,
+                final_observation={
+                    "obs": torch.full((2, 2), 9.0),
+                    "critic": torch.full((2, 3), 13.0),
+                },
+                info={"timing": {}},
+            )
+
+        def close(self):
+            return None
+
+    class _ReplayBuffer:
+        trace_recorder = None
+        trace_thread_time = False
+        size = torch.zeros(1, dtype=torch.int64)
+
+        def attach_stop_event(self, stop) -> None:
+            del stop
+
+        def add(self, *args, **kwargs) -> None:
+            del args, kwargs
+
+        def add_batch(self, *args, **kwargs) -> bool:
+            replay_calls.append((args, kwargs))
+            return True
+
+        def release_ipc(self) -> None:
+            return None
+
+    monkeypatch.setattr(worker_module, "apply_torch_thread_runtime", lambda *a, **kw: None)
+    monkeypatch.setattr(worker_module, "apply_training_seed", lambda *a, **kw: None)
+    ring = SharedInferenceRing(2, 2, 2, capacity=2)
+
+    def serve_learner_action(
+        coordination_queue,
+        tick_id,
+        stop,
+        **kwargs,
+    ):
+        del coordination_queue, stop, kwargs
+        ring.copy_observation_to(
+            tick_id=tick_id,
+            observations=torch.empty((2, 2)),
+            dones=torch.empty(2),
+            epoch=0,
+        )
+        ring.publish_action(
+            tick_id=tick_id,
+            policy_version=0,
+            actions=torch.zeros((2, 2)),
+            epoch=0,
+        )
+        return True
+
+    monkeypatch.setattr(worker_module, "_wait_for_inference_tick", serve_learner_action)
+    original_consume_action = ring.consume_action
+
+    def consume_tensor_action(**kwargs):
+        actions, policy_version = original_consume_action(**kwargs)
+        if isinstance(actions, np.ndarray):
+            actions = torch.from_numpy(actions)
+        return actions, policy_version
+
+    ring.consume_action = consume_tensor_action
+
+    worker_module._run_collector(
+        stop_event=stop_event,
+        env_factory=lambda num_envs, env_cfg_override=None: _Env(),
+        num_envs=2,
+        replay_buffer=_ReplayBuffer(),
+        inference_slot=ring,
+        inference_request_queue=queue.Queue(),
+        inference_response_queue=queue.Queue(),
+        algo_type="sac",
+        actor_adapter_modules=None,
+        metrics_queue=metrics_queue,
+        inference_transport="legacy_tensor",
+        sim_backend="mujoco",
+        backend_device=None,
+        env_cfg_override=None,
+        inference_epoch=0,
+        collector_metrics_interval=1,
+        seed=1,
+        trace_enabled=False,
+        trace_thread_time=False,
+    )
+
+    assert len(replay_calls) == 1
+    replay_args, replay_kwargs = replay_calls[0]
+    torch.testing.assert_close(replay_args[0], torch.zeros((2, 2)))
+    torch.testing.assert_close(replay_kwargs["critic"], torch.full((2, 3), 5.0))
+    torch.testing.assert_close(replay_args[3], torch.full((2, 2), 7.0))
+    torch.testing.assert_close(replay_kwargs["next_critic"], torch.full((2, 3), 11.0))
+
+
+def test_numpy_collector_snapshots_transition_source_before_persistent_carrier_update(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The NumPy collector path preserves obs[t] through carrier reuse."""
+    stop_event = threading.Event()
+    metrics_queue: queue.Queue[dict] = queue.Queue(maxsize=4)
+    replay_calls: list[tuple[tuple[torch.Tensor, ...], dict[str, object]]] = []
+    persistent_obs = np.zeros((2, 2), dtype=np.float32)
+    persistent_critic = np.full((2, 3), 5.0, dtype=np.float32)
+
+    class _Env:
+        state = SimpleNamespace(
+            obs={"obs": persistent_obs, "critic": persistent_critic},
+            reward=np.ones(2, dtype=np.float32),
+            terminated=np.array([False, True]),
+            truncated=np.zeros(2, dtype=bool),
+            final_observation=None,
+            info={"timing": {}},
+        )
+
+        def step(self, actions):
+            np.testing.assert_array_equal(actions, np.zeros((2, 2), dtype=np.float32))
+            stop_event.set()
+            persistent_obs.fill(7.0)
+            persistent_critic.fill(11.0)
+            return SimpleNamespace(
+                obs=self.state.obs,
+                reward=np.ones(2, dtype=np.float32),
+                terminated=self.state.terminated,
+                truncated=self.state.truncated,
+                final_observation={
+                    "obs": np.full((2, 2), 9.0, dtype=np.float32),
+                    "critic": np.full((2, 3), 13.0, dtype=np.float32),
+                },
+                info={"timing": {}},
+            )
+
+        def close(self):
+            return None
+
+    class _ReplayBuffer:
+        trace_recorder = None
+        trace_thread_time = False
+        size = torch.zeros(1, dtype=torch.int64)
+
+        def attach_stop_event(self, stop) -> None:
+            del stop
+
+        def add(self, *args, **kwargs) -> None:
+            del args, kwargs
+
+        def add_batch(self, *args, **kwargs) -> bool:
+            replay_calls.append((args, kwargs))
+            return True
+
+        def release_ipc(self) -> None:
+            return None
+
+    monkeypatch.setattr(worker_module, "apply_torch_thread_runtime", lambda *a, **kw: None)
+    monkeypatch.setattr(worker_module, "apply_training_seed", lambda *a, **kw: None)
+    ring = SharedInferenceRing(2, 2, 2, capacity=2)
+
+    def serve_learner_action(
+        coordination_queue,
+        tick_id,
+        stop,
+        **kwargs,
+    ):
+        del coordination_queue, stop, kwargs
+        ring.copy_observation_to(
+            tick_id=tick_id,
+            observations=torch.empty((2, 2), dtype=torch.float32),
+            dones=torch.empty(2, dtype=torch.float32),
+            epoch=0,
+        )
+        ring.publish_action(
+            tick_id=tick_id,
+            policy_version=0,
+            actions=torch.zeros((2, 2), dtype=torch.float32),
+            epoch=0,
+        )
+        return True
+
+    monkeypatch.setattr(worker_module, "_wait_for_inference_tick", serve_learner_action)
+
+    worker_module._run_collector(
+        stop_event=stop_event,
+        env_factory=lambda num_envs, env_cfg_override=None: _Env(),
+        num_envs=2,
+        replay_buffer=_ReplayBuffer(),
+        inference_slot=ring,
+        inference_request_queue=queue.Queue(),
+        inference_response_queue=queue.Queue(),
+        algo_type="sac",
+        actor_adapter_modules=None,
+        metrics_queue=metrics_queue,
+        inference_transport="cpu",
+        sim_backend="mujoco",
+        backend_device=None,
+        env_cfg_override=None,
+        inference_epoch=0,
+        collector_metrics_interval=1,
+        seed=1,
+        trace_enabled=False,
+        trace_thread_time=False,
+    )
+
+    assert len(replay_calls) == 1
+    replay_args, replay_kwargs = replay_calls[0]
+    assert isinstance(replay_args[0], torch.Tensor)
+    assert isinstance(replay_kwargs["critic"], torch.Tensor)
+    torch.testing.assert_close(replay_args[0], torch.zeros((2, 2)))
+    torch.testing.assert_close(replay_kwargs["critic"], torch.full((2, 3), 5.0))
+    torch.testing.assert_close(replay_args[3], torch.full((2, 2), 7.0))
+    torch.testing.assert_close(replay_kwargs["next_critic"], torch.full((2, 3), 11.0))
+
+
 def test_tensor_collector_preserves_interval_reward_component_means(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

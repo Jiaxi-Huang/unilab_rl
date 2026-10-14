@@ -24,6 +24,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   its first transition-source read or copy, instead of enqueueing the wait
   after the ingress copies. Unexpected CUDA IPC handle export failures also
   fail closed rather than silently marking receipt metadata unavailable.
+- Replay publication now accepts any validated structural completion-v2
+  producer receipt, rather than requiring a `uni_rl` concrete token class, and
+  localizes the waited metadata at the ingress publication boundary.
+- Off-policy collectors preserve the pre-action observation and critic sources
+  in persistent staging carriers. Persistent environment carriers and autoreset
+  can no longer overwrite `obs[t]` before replay publishes transition `t`.
 
 ## [1.4.14] - 2026-10-14
 

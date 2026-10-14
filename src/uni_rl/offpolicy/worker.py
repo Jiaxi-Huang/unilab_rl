@@ -610,8 +610,12 @@ def _run_collector(
     action_host: torch.Tensor | None = None
     obs_t: torch.Tensor | None = None
     critic_t: torch.Tensor | None = None
+    source_obs_t: torch.Tensor | None = None
+    source_critic_t: torch.Tensor | None = None
     obs_np: np.ndarray | None = None
     critic_np: np.ndarray | None = None
+    source_obs_np: np.ndarray | None = None
+    source_critic_np: np.ndarray | None = None
     next_obs_t: torch.Tensor | None = None
     next_critic_t: torch.Tensor | None = None
     rewards_t: torch.Tensor | None = None
@@ -628,10 +632,14 @@ def _run_collector(
     terminal_contract: Any | None = None
     if tensor_collector:
         obs_t, critic_t = cast(tuple[torch.Tensor, torch.Tensor], split_obs_dict(state.obs))
+        source_obs_t = obs_t.clone()
+        source_critic_t = critic_t.clone()
     else:
         obs_np, critic_np = split_obs_dict(state.obs)
         obs_np = np.asarray(obs_np, dtype=np.float32)
         critic_np = np.asarray(critic_np, dtype=np.float32)
+        source_obs_np = np.empty_like(obs_np)
+        source_critic_np = np.empty_like(critic_np)
     info_dict = state.info
     prev_dones_np = np.zeros(num_envs, dtype=np.float32)
     prev_dones_t = torch.zeros(num_envs, dtype=torch.float32, device=state.obs["obs"].device)
@@ -803,6 +811,23 @@ def _run_collector(
 
             # Step environment
             _env_ns = _time.perf_counter_ns()
+            # Persistent environment carriers may be updated in place. Preserve
+            # the pre-action transition source without allocating on the hot
+            # path; autoreset can otherwise overwrite obs[t] before replay sees it.
+            if tensor_collector:
+                assert obs_t is not None
+                assert critic_t is not None
+                assert source_obs_t is not None
+                assert source_critic_t is not None
+                source_obs_t.copy_(obs_t)
+                source_critic_t.copy_(critic_t)
+            else:
+                assert obs_np is not None
+                assert critic_np is not None
+                assert source_obs_np is not None
+                assert source_critic_np is not None
+                source_obs_np[...] = obs_np
+                source_critic_np[...] = critic_np
             # TorchEnv has a tensor-only public action contract even when the
             # inference ring is CPU. Reuse one persistent host staging tensor
             # for this explicit ring->env boundary rather than allocating or
@@ -881,8 +906,8 @@ def _run_collector(
                     truncated=truncated_np,
                 )
             if tensor_collector:
-                assert obs_t is not None
-                assert critic_t is not None
+                assert source_obs_t is not None
+                assert source_critic_t is not None
                 assert next_obs_t is not None
                 assert next_critic_t is not None
                 assert rewards_t is not None
@@ -915,7 +940,7 @@ def _run_collector(
                 assert truncated_t is not None
                 assert done_mask_t is not None
                 published = replay_add(
-                    obs_t,
+                    source_obs_t,
                     actions.to(dtype=torch.float32),
                     rewards_t,
                     next_obs_t,
@@ -923,7 +948,7 @@ def _run_collector(
                     truncated_t,
                     terminal_mask=done_mask_t,
                     terminal_next_obs=terminal_obs_t,
-                    critic=critic_t,
+                    critic=source_critic_t,
                     next_critic=next_critic_t,
                     terminal_next_critic=terminal_critic_t,
                     completion=state.info.get("completion"),
@@ -931,8 +956,8 @@ def _run_collector(
                 if not published and not stop_event.is_set():
                     raise RuntimeError("replay ingress closed before collector shutdown")
             else:
-                assert obs_np is not None
-                assert critic_np is not None
+                assert source_obs_np is not None
+                assert source_critic_np is not None
                 assert next_obs_np is not None
                 assert next_critic_np is not None
                 assert actions_np is not None
@@ -941,7 +966,7 @@ def _run_collector(
                 assert truncated_np is not None
                 assert terminal_contract is not None
                 published = replay_add(
-                    torch.from_numpy(obs_np),
+                    torch.from_numpy(source_obs_np),
                     torch.from_numpy(actions_np),
                     torch.from_numpy(rewards_np),
                     torch.from_numpy(next_obs_np),
@@ -953,7 +978,7 @@ def _run_collector(
                         if terminal_contract.terminal_obs is not None
                         else None
                     ),
-                    critic=torch.from_numpy(critic_np),
+                    critic=torch.from_numpy(source_critic_np),
                     next_critic=torch.from_numpy(next_critic_np),
                     terminal_next_critic=(
                         torch.from_numpy(terminal_contract.terminal_critic)

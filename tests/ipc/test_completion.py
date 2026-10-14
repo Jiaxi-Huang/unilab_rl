@@ -11,6 +11,7 @@ from uni_rl.ipc.completion import (
     EventCompletion,
     ImmediateCompletion,
     import_shared_completion,
+    publication_receipt,
     record_ingress_publication,
     wait_completion,
 )
@@ -82,6 +83,65 @@ def test_ingress_publication_preserves_cpu_receipt() -> None:
     completion = ImmediateCompletion(producer_id="producer-cpu")
 
     assert record_ingress_publication(completion, stream=None) is completion
+
+
+def test_publication_receipt_accepts_foreign_structural_producer() -> None:
+    class ForeignImmediateCompletion:
+        def __init__(self, **overrides: object) -> None:
+            self.contract_version: int = 2
+            self.operation: str = "mask_reset"
+            self.sequence: int = 17
+            self.stream_id: int = 5
+            self.producer_id: str = "producer-foreign"
+            for name, value in overrides.items():
+                setattr(self, name, value)
+
+        def wait_before_read(self, stream=None) -> None:
+            del stream
+
+        def ipc_handle(self) -> bytes:
+            raise NotImplementedError
+
+    token = ForeignImmediateCompletion()
+    assert not isinstance(token, ImmediateCompletion)
+
+    published = publication_receipt(token, sequence=19)
+
+    assert isinstance(published, ImmediateCompletion)
+    assert published is not None
+    assert published.contract_version == 2
+    assert published.operation == "mask_reset"
+    assert published.sequence == 19
+    assert published.stream_id == 5
+    assert published.producer_id == "producer-foreign"
+
+
+@pytest.mark.parametrize(
+    ("field", "expected"),
+    (
+        ({"contract_version": 1}, "contract"),
+        ({"operation": "whole_collector"}, "operation"),
+        ({"sequence": True}, "sequence"),
+        ({"stream_id": True}, "stream"),
+        ({"producer_id": " "}, "producer"),
+    ),
+)
+def test_publication_receipt_rejects_malformed_foreign_metadata(field: dict, expected: str) -> None:
+    class ForeignImmediateCompletion:
+        contract_version = field.get("contract_version", 2)
+        operation = field.get("operation", "step")
+        sequence = field.get("sequence", 1)
+        stream_id = field.get("stream_id", 0)
+        producer_id = field.get("producer_id", "producer-foreign")
+
+        def wait_before_read(self, stream=None) -> None:
+            del stream
+
+        def ipc_handle(self) -> bytes:
+            raise NotImplementedError
+
+    with pytest.raises((TypeError, ValueError), match=expected):
+        publication_receipt(ForeignImmediateCompletion(), sequence=1)
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")

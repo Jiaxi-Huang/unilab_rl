@@ -486,6 +486,58 @@ def test_ingress_publication_receipt_preserves_backend_operation() -> None:
     buf.close()
 
 
+def test_ingress_accepts_foreign_structural_completion_producer(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    events: list[str] = []
+
+    class ForeignImmediateCompletion:
+        contract_version = 2
+        operation = "step"
+        sequence = 3
+        stream_id = 1
+        producer_id = "producer-foreign"
+
+        def wait_before_read(self, stream=None) -> None:
+            events.append("wait")
+
+        def ipc_handle(self) -> bytes:
+            raise NotImplementedError
+
+    buf = _make_buf(slot_rows=4)
+    batch = _random_batch(4)
+    original_write = buf._write_transition_rows
+    original_patch = buf._patch_terminal_next_observations
+
+    def record_write(*args, **kwargs):
+        events.append("read")
+        return original_write(*args, **kwargs)
+
+    def record_patch(*args, **kwargs):
+        events.append("patch")
+        return original_patch(*args, **kwargs)
+
+    monkeypatch.setattr(buf, "_write_transition_rows", record_write)
+    monkeypatch.setattr(buf, "_patch_terminal_next_observations", record_patch)
+
+    try:
+        token = ForeignImmediateCompletion()
+        assert buf.add(*batch, completion=token)
+        completion = buf.last_completion
+        assert completion is not None
+        assert completion is not token
+        assert isinstance(completion, ImmediateCompletion)
+        assert completion.operation == "step"
+        assert completion.sequence == 3
+        assert completion.producer_id == "producer-foreign"
+        _, _, packed = _take_and_commit(buf)
+        torch.testing.assert_close(packed[:, buf._obs_sl], batch[0])
+        torch.testing.assert_close(packed[:, buf._act_sl], batch[1])
+        assert events == ["wait", "read", "patch"]
+    finally:
+        buf.close()
+
+
 def test_ingress_writes_packed_columns_without_cat(monkeypatch: pytest.MonkeyPatch):
     buf = ReplayBuffer(
         capacity=8,
