@@ -7,6 +7,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.4.14] - 2026-10-14
+
+### Added
+
+- Added neutral collector graph-mode negotiation and public whole-collector-tick
+  completion evidence for the integration-only K=1 collector graph
+  (Motphys/UniLab#2311): replay ingress validates operation, capture identity,
+  monotonic sequence, and collector invalidation manifests; spawned CUDA
+  collectors transport fixed-width terminal and ingress receipt state; and
+  runtime manifests record the negotiated backend lifecycle and replay/fallback
+  evidence fail-closed.
+- Restored collector timing component means and fixed CUDA spawn collector
+  metric publication (Motphys/UniLab#2311).
+
+### Fixed
+
+- CUDA replay ingress submission is now single-owner. The replay sync daemon is
+  the sole consumer of published ingress tokens, learner progress no longer
+  races it, and H2D copies wait on the collector receipt using the matching
+  `collector_tick` operation without producer-stream synchronization
+  (Motphys/UniLab#2312).
+
 ## [1.4.13] - 2026-10-13
 
 ### Added
