@@ -7,7 +7,9 @@ from typing import Any, Protocol, runtime_checkable
 
 MAX_GRAPH_IPC_HANDLE_BYTES = 256
 MAX_GRAPH_CAPTURE_ID_BYTES = 256
-GRAPH_COMPLETION_OPERATIONS = frozenset({"step", "selected_reset", "mask_reset", "collector_tick"})
+GRAPH_COMPLETION_OPERATIONS = frozenset(
+    {"step", "selected_reset", "mask_reset", "collector_tick", "env_update"}
+)
 
 
 def _validate_public_metadata(

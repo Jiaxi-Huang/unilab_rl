@@ -390,10 +390,11 @@ class GPUResidentReplayPipeline:
 
         if self._device.type == "cuda":
             with torch.cuda.device(self._device), torch.cuda.stream(self._sync_stream):
+                completion = self._replay_buffer.last_graph_completion
                 wait_graph_completion(
-                    self._replay_buffer.last_graph_completion,
+                    completion,
                     stream=self._sync_stream,
-                    operation="collector_tick",
+                    operation=completion.operation if completion is not None else "step",
                     capture_id=self._replay_buffer.graph_capture_id,
                     last_sequence=self._replay_buffer.graph_completion_sequence,
                 )

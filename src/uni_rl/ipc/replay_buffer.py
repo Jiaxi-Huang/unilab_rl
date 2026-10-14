@@ -564,6 +564,9 @@ class ReplayBuffer(SharedBufferBase):
             completion = wait_graph_completion(
                 completion,
                 stream=self._ingress_read_stream(),
+                operation="env_update"
+                if completion is not None and completion.operation == "env_update"
+                else "step",
                 capture_id=self._graph_capture_id,
                 last_sequence=self._graph_completion_sequence,
             )
