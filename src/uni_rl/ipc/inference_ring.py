@@ -2,8 +2,11 @@
 
 The ring keeps the successful single-slot ownership model but adds explicit
 capacity, epochs, contiguous tick validation, and fail-closed backpressure.
-CUDA publications use per-slot interprocess events rather than synchronizing the
-complete producer stream before every CPU-ready flag.
+The collector/learner boundary is Torch-tensor-only on every platform: both
+CPU and CUDA rings return cloned tensor actions, and observation publication
+rejects non-tensor inputs. CUDA publications use per-slot interprocess events
+rather than synchronizing the complete producer stream before every CPU-ready
+flag.
 """
 
 from __future__ import annotations
@@ -11,7 +14,6 @@ from __future__ import annotations
 import multiprocessing as mp
 from typing import Any, cast
 
-import numpy as np
 import torch
 
 _SPAWN_CTX = mp.get_context("spawn")
@@ -211,8 +213,8 @@ class SharedInferenceRing:
         self,
         *,
         tick_id: int,
-        observations: np.ndarray | torch.Tensor,
-        dones: np.ndarray | torch.Tensor,
+        observations: torch.Tensor,
+        dones: torch.Tensor,
         epoch: int | None = None,
         timeout_sec: float | None = None,
     ) -> None:
@@ -229,8 +231,8 @@ class SharedInferenceRing:
         self,
         *,
         tick_id: int,
-        observations: np.ndarray | torch.Tensor,
-        dones: np.ndarray | torch.Tensor,
+        observations: torch.Tensor,
+        dones: torch.Tensor,
         epoch: int | None = None,
         timeout_sec: float | None = None,
     ) -> bool:
@@ -378,7 +380,7 @@ class SharedInferenceRing:
         tick_id: int,
         epoch: int | None = None,
         timeout_sec: float | None = None,
-    ) -> tuple[np.ndarray | torch.Tensor, int]:
+    ) -> tuple[torch.Tensor, int]:
         result = self.try_consume_action(tick_id=tick_id, epoch=epoch, timeout_sec=timeout_sec)
         if result is None:
             raise TimeoutError(f"inference action wait timed out at tick {tick_id}")
@@ -390,7 +392,7 @@ class SharedInferenceRing:
         tick_id: int,
         epoch: int | None = None,
         timeout_sec: float | None = None,
-    ) -> tuple[np.ndarray | torch.Tensor, int] | None:
+    ) -> tuple[torch.Tensor, int] | None:
         with self._action_lock:
             self._require_open()
             self._require_epoch(epoch)
@@ -407,11 +409,7 @@ class SharedInferenceRing:
                 )
             if self.device.type == "cuda":
                 self._action_event(slot).wait(torch.cuda.current_stream(self.device))
-            actions = (
-                self._clone_action(slot)
-                if self.device.type == "cuda"
-                else self.actions[slot].detach().cpu().numpy().copy()
-            )
+            actions = self._clone_action(slot)
             if self.device.type == "cuda":
                 self._consumer_done_event(slot).record(torch.cuda.current_stream(self.device))
                 self._consumer_done_ticks[slot] = int(tick_id)
@@ -465,36 +463,24 @@ class SharedInferenceRing:
         return int(tick_id) % self.capacity
 
     def _clone_action(self, slot: int) -> torch.Tensor:
-        """Clone CUDA action storage on the consumer's current stream."""
+        """Clone the slot's action storage (on the consumer's stream for CUDA)."""
         return self.actions[slot].clone()
 
     def _observation_inputs(
-        self, observations: np.ndarray | torch.Tensor, dones: np.ndarray | torch.Tensor
+        self, observations: torch.Tensor, dones: torch.Tensor
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        if isinstance(observations, torch.Tensor):
-            if not isinstance(dones, torch.Tensor):
-                raise TypeError("inference observations and dones must both be tensors")
-            observation_tensor = observations.to(dtype=torch.float32)
-            done_tensor = dones.to(dtype=torch.float32).reshape(-1)
-            if self.device.type == "cuda" and (
-                observation_tensor.device != self.device or done_tensor.device != self.device
-            ):
-                raise ValueError("CUDA inference rings require tensors on the ring device")
-            if self.device.type == "cpu" and (
-                observation_tensor.device.type != "cpu" or done_tensor.device.type != "cpu"
-            ):
-                raise ValueError("CPU inference rings require CPU tensor observations")
-        elif isinstance(observations, np.ndarray):
-            if not isinstance(dones, np.ndarray):
-                raise TypeError("inference observations and dones must both be arrays")
-            observation_tensor = torch.from_numpy(
-                np.ascontiguousarray(observations, dtype=np.float32)
-            ).to(device=self.device)
-            done_tensor = torch.from_numpy(
-                np.ascontiguousarray(dones, dtype=np.float32).reshape(-1)
-            ).to(device=self.device)
-        else:
-            raise TypeError("inference observations must be a NumPy array or Torch tensor")
+        if not isinstance(observations, torch.Tensor) or not isinstance(dones, torch.Tensor):
+            raise TypeError("inference observations and dones must be Torch tensors")
+        observation_tensor = observations.to(dtype=torch.float32)
+        done_tensor = dones.to(dtype=torch.float32).reshape(-1)
+        if self.device.type == "cuda" and (
+            observation_tensor.device != self.device or done_tensor.device != self.device
+        ):
+            raise ValueError("CUDA inference rings require tensors on the ring device")
+        if self.device.type == "cpu" and (
+            observation_tensor.device.type != "cpu" or done_tensor.device.type != "cpu"
+        ):
+            raise ValueError("CPU inference rings require CPU tensor observations")
         if tuple(observation_tensor.shape) != (self.num_envs, self.obs_dim):
             raise ValueError(
                 f"Inference observation shape must be {(self.num_envs, self.obs_dim)}, "

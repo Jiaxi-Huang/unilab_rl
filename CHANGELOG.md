@@ -16,6 +16,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   accepted at CUDA replay ingress without a receipt; undeclared envs default to
   `True` (receipt required — fail-closed direction unchanged).
 
+### Changed
+
+- The mujoco + CUDA-learner off-policy topology now resolves to the CUDA
+  tensor ring by default (UniLab #2365). Driven by UniLab's
+  `training.collector_tensor_device=auto` (collector env tensors follow the
+  learner device), the probe reports CUDA-native observations and, with no
+  explicit transport config, placement resolution selects the CUDA tensor ring
+  (`cuda_no_host_boundary` staging, replay ingress on the learner device, no
+  host action staging). On CUDA platforms the CPU transport is no longer
+  reachable for tensor-native envs; the CPU ring path remains for CPU-only and
+  Apple Silicon `torch.mps` (Metal Performance Shaders) learners.
+
 ### Removed
 
 - Shrunk the replay completion surface to the minimal async step-only event
@@ -45,9 +57,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `resolve_offpolicy_actor_priv_info`, and the NumPy terminal-observation
   contract helper (`uni_rl.utils.final_observation`) are removed. The
   collector runtime manifest no longer reports a `tensor_native_env` mode.
-  CPU inference rings may still return NumPy actions, which are staged into a
-  persistent Torch tensor before `TorchEnv.step()`; privileged actor adapters
-  (`resolve_priv_info`) fail closed at collector startup.
+  Privileged actor adapters (`resolve_priv_info`) fail closed at collector
+  startup.
+
+- Removed the NumPy seam from the off-policy inference hot path (UniLab #2365).
+  `SharedInferenceRing` action egress is a cloned Torch tensor on every
+  platform (the CPU `actions.numpy().copy()` path is gone), so the
+  collector↔learner boundary is Torch-tensor-only and the collector-side
+  NumPy→tensor restage before `TorchEnv.step()` is removed.
+  `SharedInferenceRing.publish_observation` accepts only Torch tensors and
+  fails closed with a `TypeError` on NumPy input. The dead single-slot
+  `SharedInferenceSlot` exchange and its tests are deleted.
+
+### Fixed
+
+- The CPU-ring inference staging policy no longer labels non-CUDA accelerator
+  learners (e.g. Apple Metal Performance Shaders, `torch.mps`) as
+  `cpu_no_device_transfer`; they now report
+  `cpu_ring_explicit_learner_device_copy` because the ring `copy_` boundary
+  still crosses devices (UniLab #2365).
 
 ## [2.0.0] - 2026-10-15
 

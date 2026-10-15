@@ -68,6 +68,7 @@ from uni_rl.utils.tensor_runtime import (
     InferencePlacement,
     InferenceTransport,
     TensorRuntimeSettings,
+    cpu_ring_staging_policy,
 )
 
 # Terminal/W&B display names for the off-policy algo types. Keep these
@@ -312,11 +313,7 @@ class DoubleBufferOffPolicyRunner(OffPolicyRunner):
                 staging_policy=(
                     "cuda_no_host_boundary"
                     if collector_tensor_native
-                    else (
-                        "cpu_ring_explicit_learner_actor_h2d_action_d2h"
-                        if torch.device(str(kwargs["device"])).type == "cuda"
-                        else "cpu_no_device_transfer"
-                    )
+                    else cpu_ring_staging_policy(str(kwargs["device"]))
                 ),
             )
             warnings.warn(
@@ -332,11 +329,7 @@ class DoubleBufferOffPolicyRunner(OffPolicyRunner):
                 ring_device="cpu",
                 learner_device=str(kwargs["device"]),
                 collector_tensor_native=False,
-                staging_policy=(
-                    "cpu_ring_explicit_learner_actor_h2d_action_d2h"
-                    if torch.device(str(kwargs["device"])).type == "cuda"
-                    else "cpu_no_device_transfer"
-                ),
+                staging_policy=cpu_ring_staging_policy(str(kwargs["device"])),
             )
         if not isinstance(inference_placement, InferencePlacement):
             raise TypeError(
@@ -455,7 +448,9 @@ class DoubleBufferOffPolicyRunner(OffPolicyRunner):
                 f"got {placement.ring_device!r}"
             )
         if placement.collector_tensor_native:
-            raise ValueError("CPU inference transport requires NumPy collector transitions")
+            raise ValueError(
+                "CPU inference transport requires non-tensor-native collector transitions"
+            )
         if torch.device(placement.env_device).type != "cpu":
             raise ValueError(
                 "CPU inference transport requires CPU env public tensors; "
@@ -1165,9 +1160,10 @@ class DoubleBufferOffPolicyRunner(OffPolicyRunner):
         if cuda_forward_events is not None:
             cuda_forward_events[1].record(torch.cuda.current_stream(device))
         elif device.type == "mps":
-            # MPS has no public timing-event equivalent.  Preserve the
-            # existing measurement boundary there; CUDA relies on the
-            # following blocking D2H copy and reads elapsed event time after it.
+            # torch.mps (Metal Performance Shaders) has no public timing-event
+            # equivalent.  Preserve the existing measurement boundary there;
+            # CUDA relies on the following blocking D2H copy and reads elapsed
+            # event time after it.
             torch.mps.synchronize()
         forward_end_ns = time.perf_counter_ns()
 
@@ -2181,9 +2177,10 @@ class DoubleBufferOffPolicyRunner(OffPolicyRunner):
                         torch.cuda.current_stream(device).synchronize()
                     elif device.type == "mps" and not phase_ordered_metrics:
                         torch.mps.synchronize()
-                    # MPS preserves same-queue ordering: the next inference's
-                    # action D2H waits behind optimizer/target updates, while
-                    # replay events govern ingress visibility and slot reuse.
+                    # torch.mps (Metal Performance Shaders) preserves
+                    # same-queue ordering: the next inference's action D2H
+                    # waits behind optimizer/target updates, while replay
+                    # events govern ingress visibility and slot reuse.
                     # A global synchronize here would only drain unrelated
                     # queued work and recreate a per-iteration GPU idle gap.
                     if trace_recorder:

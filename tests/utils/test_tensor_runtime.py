@@ -278,6 +278,26 @@ def test_default_owner_config_resolves_cpu_transport_with_explicit_cuda_learner(
     }
 
 
+def test_cpu_transport_labels_non_cuda_accelerator_learners_with_device_copy() -> None:
+    # torch.mps (Apple Metal Performance Shaders) learners still cross devices
+    # at the CPU-ring copy_ boundary; they must not claim cpu_no_device_transfer.
+    placement = resolve_inference_transport(_cfg(), device="mps", algo_name="SAC")
+
+    assert placement.mode is InferenceTransport.CPU
+    assert placement.env_device == "cpu"
+    assert placement.ring_device == "cpu"
+    assert placement.learner_device == "mps"
+    assert placement.collector_tensor_native is False
+    assert placement.staging_policy == "cpu_ring_explicit_learner_device_copy"
+
+
+def test_cpu_transport_cpu_learner_reports_no_device_transfer() -> None:
+    placement = resolve_inference_transport(_cfg(), device="cpu", algo_name="SAC")
+
+    assert placement.mode is InferenceTransport.CPU
+    assert placement.staging_policy == "cpu_no_device_transfer"
+
+
 def test_legacy_tensor_runtime_resolves_one_cuda_transport_device() -> None:
     placement = resolve_inference_transport(
         _cfg(env={"tensor_runtime": True}),
