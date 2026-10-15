@@ -1,4 +1,18 @@
-"""Unit tests for shared off-policy runner contracts."""
+"""Unit tests for shared off-policy runner contracts.
+
+Off-policy inference transport matrix (UniLab #2365):
+
+- CPU-only learner + CPU env: historical default (CPU ring, no device
+  transfer); covered by the ungated tests in this module.
+- CPU env + CUDA learner: CPU ring with explicit actor H2D / action D2H
+  (``cpu_ring_explicit_learner_actor_h2d_action_d2h``).
+- CPU env + torch.mps (Metal Performance Shaders) learner: CPU ring with
+  explicit cross-device copies (``cpu_ring_explicit_learner_device_copy``).
+  The torch.mps-gated tests below require an Apple Silicon runner and skip
+  elsewhere; this CI gap is declared in the #2365 PR.
+- Tensor-native CUDA env + CUDA learner: CUDA tensor ring with no host
+  boundary (``cuda_no_host_boundary``), the Wave 2 default topology.
+"""
 
 from __future__ import annotations
 
@@ -1410,6 +1424,166 @@ def test_mujoco_cuda_carrier_resolves_cuda_tensor_ring_by_default(
         "staging_policy": "cuda_no_host_boundary",
     }
     assert _FakePipeline.close_calls == 1
+
+
+_MPS_SKIP_REASON = "torch.mps (Metal Performance Shaders) runtime required"
+
+
+@pytest.mark.skipif(not torch.backends.mps.is_available(), reason=_MPS_SKIP_REASON)
+def test_mps_learner_cpu_env_resolves_cpu_ring_with_device_copy_staging(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path,
+):
+    """CPU env + torch.mps learner cell: CPU transport with explicit copies.
+
+    The probe reports host (non-tensor-native) observations, so placement
+    keeps the CPU ring; the mps learner owns the replay device while ingress
+    stays on the host and the torch-copy transfer backend crosses to mps.
+    """
+    _FakePipeline.close_calls = 0
+    monkeypatch.setattr(device_runner_module, "ReplayBuffer", _FakeReplayBuffer)
+    monkeypatch.setattr(device_runner_module, "GPUResidentReplayPipeline", _FakePipeline)
+    monkeypatch.setattr(device_runner_module, "OffPolicyLogger", _FakeLogger)
+    monkeypatch.setattr(device_runner_module.torch, "save", lambda *args, **kwargs: None)
+    monkeypatch.setattr(device_runner_module.time, "sleep", lambda seconds: None)
+
+    placement = resolve_inference_placement(
+        learner_device="mps",
+        env_tensor_native=False,
+        algo_name="TestRunner",
+    )
+    assert placement.mode is InferenceTransport.CPU
+    assert placement.env_device == "cpu"
+    assert placement.ring_device == "cpu"
+    assert placement.staging_policy == "cpu_ring_explicit_learner_device_copy"
+
+    runner = _make_device_runner(
+        monkeypatch,
+        _Learner(),
+        device="mps",
+        sim_backend="mujoco",
+        inference_placement=placement,
+        produces_completion_receipts=False,
+    )
+    collector_kwargs = {}
+
+    def capture_collector(*, target_fn, kwargs):
+        del target_fn
+        collector_kwargs.update(kwargs)
+
+    monkeypatch.setattr(runner, "_start_collector", capture_collector)
+    runner.learn(max_iterations=0, save_interval=0, log_dir=str(tmp_path))
+
+    # The replay buffer lives on the mps learner device; the CPU-env ingress
+    # stays on the host and crosses devices inside the replay pipeline.
+    assert _FakeReplayBuffer.last_kwargs["device"] == "mps"
+    assert _FakeReplayBuffer.last_kwargs["ingress_device"] == "cpu"
+    assert _FakeReplayBuffer.last_kwargs["require_completion_receipt"] is False
+    assert collector_kwargs["inference_transport"] == "cpu"
+    assert collector_kwargs["inference_slot"].device.type == "cpu"
+    manifest = runner.runtime_manifest
+    assert manifest["collector_tensor_native"] is False
+    assert manifest["inference_staging_policy"] == "cpu_ring_explicit_learner_device_copy"
+    assert manifest["inference_action_host_staging"] is True
+    assert manifest["inference_learner_scratch_device"] == "mps"
+    assert manifest["inference_transport"] == {
+        "mode": "cpu",
+        "env_device": "cpu",
+        "ring_device": "cpu",
+        "learner_device": "mps",
+        "staging_policy": "cpu_ring_explicit_learner_device_copy",
+    }
+    assert _FakePipeline.close_calls == 1
+
+
+@pytest.mark.skipif(not torch.backends.mps.is_available(), reason=_MPS_SKIP_REASON)
+def test_mps_learner_serves_cpu_ring_inference_with_device_copy(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Serving path for the CPU env + torch.mps learner cell.
+
+    Ring observations stay on the host, the actor forward runs on mps behind
+    the torch.mps.synchronize() timing boundary (torch.mps has no CUDA-event
+    equivalent), and actions cross back through the persistent host staging
+    tensor into the CPU ring.
+    """
+    import uni_rl.offpolicy.actor_adapter as actor_adapter_module
+
+    class _DummyMpsActor:
+        def explore(
+            self,
+            obs: torch.Tensor,
+            priv_info: torch.Tensor,
+            deterministic: bool = False,
+        ) -> torch.Tensor:
+            assert obs.device.type == "mps"
+            assert priv_info.device.type == "mps"
+            assert not deterministic
+            return obs[:, :2] + priv_info
+
+    monkeypatch.setitem(
+        actor_adapter_module._ADAPTERS,
+        "dummy_mps_sac",
+        actor_adapter_module.OffPolicyActorAdapter(
+            algo_type="dummy_mps_sac",
+            sample_actions=lambda actor, obs, dones, priv: actor.explore(
+                obs, priv, deterministic=False
+            ),
+            actor_context_from_obs=lambda obs_device, obs_dim: obs_device[:, obs_dim:],
+        ),
+    )
+
+    actor = _DummyMpsActor()
+    actor_input = torch.arange(10, dtype=torch.float32).reshape(2, 5) / 10.0
+    dones = torch.zeros(2)
+    expected = actor_input[:, :2] + actor_input[:, 3:]
+
+    runner = object.__new__(device_runner_module.DoubleBufferOffPolicyRunner)
+    runner.device = "mps"
+    runner.obs_dim = 3
+    runner.obs_normalization = False
+    runner.algo_type = "dummy_mps_sac"
+    runner.learner = SimpleNamespace(actor=actor)
+    runner.inference_epoch = 0
+    runner.inference_placement = InferencePlacement(
+        mode=InferenceTransport.CPU,
+        env_device="cpu",
+        ring_device="cpu",
+        learner_device="mps",
+        collector_tensor_native=False,
+        staging_policy="cpu_ring_explicit_learner_device_copy",
+    )
+
+    synchronize_calls = 0
+    real_synchronize = torch.mps.synchronize
+
+    def spying_synchronize() -> None:
+        nonlocal synchronize_calls
+        synchronize_calls += 1
+        real_synchronize()
+
+    monkeypatch.setattr(torch.mps, "synchronize", spying_synchronize)
+
+    slot = SharedInferenceRing(2, 5, 2)
+    slot.publish_observation(tick_id=0, observations=actor_input, dones=dones, epoch=0)
+    timings = runner._serve_learner_inference(
+        slot,
+        tick_id=0,
+        policy_version=10,
+        obs_device=torch.empty(2, 5),
+        dones_device=torch.empty(2),
+        actor_obs_device=torch.empty(2, 5, device="mps"),
+        actor_dones_device=torch.empty(2, device="mps"),
+        actions_host=torch.empty(2, 2),
+        trace_recorder=None,
+    )
+    actual, policy_version = slot.consume_action(tick_id=0, epoch=0)
+
+    assert synchronize_calls == 1
+    assert actual.device.type == "cpu"
+    assert policy_version == 10
+    assert timings["inference_forward_time"] > 0.0
+    torch.testing.assert_close(actual, expected)
 
 
 def test_cuda_inference_budget_fails_before_resource_allocation(
