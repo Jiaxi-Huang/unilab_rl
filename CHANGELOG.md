@@ -5,6 +5,23 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Removed
+
+- Removed the NumPy observation runtime from the off-policy collector with no
+  compatibility layer (#119). Collector initialization now fails closed with a
+  `TypeError` unless the actor (`obs`) and critic observation groups are Torch
+  tensors; the `tensor_collector` branch, the NumPy
+  observation/critic/reward/done/truncation transition carriers, the
+  `torch.from_numpy` replay bridge, `_collector_action_numpy`,
+  `resolve_offpolicy_actor_priv_info`, and the NumPy terminal-observation
+  contract helper (`uni_rl.utils.final_observation`) are removed. The
+  collector runtime manifest no longer reports a `tensor_native_env` mode.
+  CPU inference rings may still return NumPy actions, which are staged into a
+  persistent Torch tensor before `TorchEnv.step()`; privileged actor adapters
+  (`resolve_priv_info`) fail closed at collector startup.
+
 ## [2.0.0] - 2026-10-15
 
 ### Removed

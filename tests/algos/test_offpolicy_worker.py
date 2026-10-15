@@ -18,31 +18,11 @@ from uni_rl.logging.metrics_drain import RewardComponentWindow, drain_collector_
 from uni_rl.logging.offpolicy import OffPolicyLogger
 from uni_rl.offpolicy.tensor_metrics import TensorCollectorMetrics
 from uni_rl.offpolicy.worker import (
-    _collector_action_numpy,
     _publish_collector_ready,
     _publish_inference_tick,
     _wait_for_inference_tick,
-    resolve_offpolicy_actor_priv_info,
     sample_offpolicy_actions,
 )
-
-
-@pytest.mark.parametrize("actions_is_tensor", [False, True])
-def test_cpu_collector_action_conversion_preserves_legacy_contract(
-    actions_is_tensor: bool,
-) -> None:
-    values = [[1.0, 2.0], [3.0, 4.0]]
-    actions = (
-        torch.tensor(values, dtype=torch.float32)
-        if actions_is_tensor
-        else np.asarray(values, dtype=np.float32)
-    )
-
-    converted = _collector_action_numpy(actions)
-
-    assert isinstance(converted, np.ndarray)
-    assert converted.dtype == np.float32
-    np.testing.assert_array_equal(converted, values)
 
 
 def test_tensor_collector_metrics_resets_done_episodes_and_flushes_one_transfer(
@@ -953,42 +933,38 @@ def test_tensor_collector_snapshots_transition_source_before_persistent_carrier_
     torch.testing.assert_close(replay_kwargs["next_critic"], torch.full((2, 3), 11.0))
 
 
-def test_numpy_collector_snapshots_transition_source_before_persistent_carrier_update(
+def test_tensor_collector_stages_numpy_ring_actions_before_env_step(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """The NumPy collector path preserves obs[t] through carrier reuse."""
+    """A CPU inference ring may return NumPy actions; ``env.step`` still gets Torch."""
     stop_event = threading.Event()
     metrics_queue: queue.Queue[dict] = queue.Queue(maxsize=4)
     replay_calls: list[tuple[tuple[torch.Tensor, ...], dict[str, object]]] = []
-    persistent_obs = np.zeros((2, 2), dtype=np.float32)
-    persistent_critic = np.full((2, 3), 5.0, dtype=np.float32)
 
     class _Env:
         state = SimpleNamespace(
-            obs={"obs": persistent_obs, "critic": persistent_critic},
-            reward=np.ones(2, dtype=np.float32),
-            terminated=np.array([False, True]),
-            truncated=np.zeros(2, dtype=bool),
+            obs={"obs": torch.zeros((2, 2), dtype=torch.float32)},
+            reward=torch.ones(2),
+            terminated=torch.zeros(2, dtype=torch.bool),
+            truncated=torch.zeros(2, dtype=torch.bool),
             final_observation=None,
             info={"timing": {}},
         )
 
         def step(self, actions):
-            np.testing.assert_array_equal(actions, np.zeros((2, 2), dtype=np.float32))
+            assert isinstance(actions, torch.Tensor)
+            assert actions.dtype == torch.float32
+            torch.testing.assert_close(actions, torch.zeros((2, 2)))
             stop_event.set()
-            persistent_obs.fill(7.0)
-            persistent_critic.fill(11.0)
-            return SimpleNamespace(
-                obs=self.state.obs,
-                reward=np.ones(2, dtype=np.float32),
-                terminated=self.state.terminated,
-                truncated=self.state.truncated,
-                final_observation={
-                    "obs": np.full((2, 2), 9.0, dtype=np.float32),
-                    "critic": np.full((2, 3), 13.0, dtype=np.float32),
-                },
+            self.state = SimpleNamespace(
+                obs={"obs": torch.ones((2, 2), dtype=torch.float32)},
+                reward=torch.ones(2),
+                terminated=torch.zeros(2, dtype=torch.bool),
+                truncated=torch.zeros(2, dtype=torch.bool),
+                final_observation=None,
                 info={"timing": {}},
             )
+            return self.state
 
         def close(self):
             return None
@@ -1001,9 +977,6 @@ def test_numpy_collector_snapshots_transition_source_before_persistent_carrier_u
         def attach_stop_event(self, stop) -> None:
             del stop
 
-        def add(self, *args, **kwargs) -> None:
-            del args, kwargs
-
         def add_batch(self, *args, **kwargs) -> bool:
             replay_calls.append((args, kwargs))
             return True
@@ -1015,12 +988,7 @@ def test_numpy_collector_snapshots_transition_source_before_persistent_carrier_u
     monkeypatch.setattr(worker_module, "apply_training_seed", lambda *a, **kw: None)
     ring = SharedInferenceRing(2, 2, 2, capacity=2)
 
-    def serve_learner_action(
-        coordination_queue,
-        tick_id,
-        stop,
-        **kwargs,
-    ):
+    def serve_learner_action(coordination_queue, tick_id, stop, **kwargs):
         del coordination_queue, stop, kwargs
         ring.copy_observation_to(
             tick_id=tick_id,
@@ -1061,13 +1029,84 @@ def test_numpy_collector_snapshots_transition_source_before_persistent_carrier_u
     )
 
     assert len(replay_calls) == 1
-    replay_args, replay_kwargs = replay_calls[0]
-    assert isinstance(replay_args[0], torch.Tensor)
-    assert isinstance(replay_kwargs["critic"], torch.Tensor)
-    torch.testing.assert_close(replay_args[0], torch.zeros((2, 2)))
-    torch.testing.assert_close(replay_kwargs["critic"], torch.full((2, 3), 5.0))
-    torch.testing.assert_close(replay_args[3], torch.full((2, 2), 7.0))
-    torch.testing.assert_close(replay_kwargs["next_critic"], torch.full((2, 3), 11.0))
+    replay_args, _ = replay_calls[0]
+    assert isinstance(replay_args[1], torch.Tensor)
+    assert replay_args[1].dtype == torch.float32
+
+
+def test_collector_fails_closed_on_numpy_actor_observation() -> None:
+    """NumPy actor observations are rejected at init with no conversion."""
+    stop_event = threading.Event()
+
+    class _Env:
+        state = SimpleNamespace(
+            obs={"obs": np.zeros((2, 2), dtype=np.float32)},
+            info={},
+        )
+
+    with pytest.raises(TypeError, match="requires Torch tensor observations"):
+        worker_module._run_collector(
+            stop_event=stop_event,
+            env_factory=lambda num_envs, env_cfg_override=None: _Env(),
+            num_envs=2,
+            replay_buffer=SimpleNamespace(
+                trace_recorder=None,
+                trace_thread_time=False,
+                attach_stop_event=lambda stop: None,
+            ),
+            inference_slot=None,
+            inference_request_queue=queue.Queue(),
+            inference_response_queue=queue.Queue(),
+            algo_type="sac",
+            actor_adapter_modules=None,
+            metrics_queue=queue.Queue(),
+            inference_transport="legacy_tensor",
+            sim_backend="mujoco",
+            backend_device=None,
+            env_cfg_override=None,
+            seed=None,
+            trace_enabled=False,
+            trace_thread_time=False,
+        )
+
+
+def test_collector_fails_closed_on_numpy_critic_observation() -> None:
+    """A NumPy critic group is rejected even when the actor group is a tensor."""
+    stop_event = threading.Event()
+
+    class _Env:
+        state = SimpleNamespace(
+            obs={
+                "obs": torch.zeros((2, 2), dtype=torch.float32),
+                "critic": np.zeros((2, 3), dtype=np.float32),
+            },
+            info={},
+        )
+
+    with pytest.raises(TypeError, match="requires Torch tensor observations"):
+        worker_module._run_collector(
+            stop_event=stop_event,
+            env_factory=lambda num_envs, env_cfg_override=None: _Env(),
+            num_envs=2,
+            replay_buffer=SimpleNamespace(
+                trace_recorder=None,
+                trace_thread_time=False,
+                attach_stop_event=lambda stop: None,
+            ),
+            inference_slot=None,
+            inference_request_queue=queue.Queue(),
+            inference_response_queue=queue.Queue(),
+            algo_type="sac",
+            actor_adapter_modules=None,
+            metrics_queue=queue.Queue(),
+            inference_transport="legacy_tensor",
+            sim_backend="mujoco",
+            backend_device=None,
+            env_cfg_override=None,
+            seed=None,
+            trace_enabled=False,
+            trace_thread_time=False,
+        )
 
 
 def test_tensor_collector_preserves_interval_reward_component_means(
@@ -1289,7 +1328,8 @@ def test_worker_shutdown_flushes_partial_metrics_before_abnormal_cleanup(
             trace_thread_time=False,
         )
 
-    assert metrics_queue.get_nowait()["runtime_manifest"]["tensor_native_env"] is True
+    manifest = metrics_queue.get_nowait()["runtime_manifest"]
+    assert "tensor_native_env" not in manifest
     final_message = metrics_queue.get_nowait()
     assert final_message["metric_flush"] == "final"
     assert final_message["total_steps"] == 2
@@ -1302,7 +1342,7 @@ def test_worker_shutdown_flushes_partial_metrics_before_abnormal_cleanup(
     logger = OffPolicyLogger(log_backend="none")
     # Requeue the captured messages so the shared drain under test sees the
     # exact worker publication sequence.
-    metrics_queue.put_nowait({"runtime_manifest": {"tensor_native_env": True}})
+    metrics_queue.put_nowait({"runtime_manifest": {}})
     metrics_queue.put_nowait(final_message)
     drain_collector_metrics(
         metrics_queue,
@@ -1583,60 +1623,6 @@ def test_sample_offpolicy_actions_uses_adapter_sample_actions(
     assert actions.shape == (4, 3)
     assert len(actor.calls) == 1
     torch.testing.assert_close(actor.calls[0][1], priv_info)
-
-
-def test_resolve_offpolicy_actor_priv_info_prefers_explicit_info(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    import numpy as np
-
-    _register_dummy_priv_adapter(monkeypatch)
-    obs = np.zeros((2, 3), dtype=np.float32)
-    critic_tail = np.ones((2, 2), dtype=np.float32)
-    critic = np.concatenate([obs, critic_tail], axis=1)
-    explicit = np.full((2, 2), 7.0, dtype=np.float32)
-
-    resolved = resolve_offpolicy_actor_priv_info(
-        algo_type="dummy_priv_sac",
-        obs_np=obs,
-        critic_np=critic,
-        info={"critic_info": explicit},
-    )
-
-    np.testing.assert_allclose(resolved, explicit)
-
-
-def test_resolve_offpolicy_actor_priv_info_uses_critic_tail(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    import numpy as np
-
-    _register_dummy_priv_adapter(monkeypatch)
-    obs = np.zeros((2, 3), dtype=np.float32)
-    critic_tail = np.arange(4, dtype=np.float32).reshape(2, 2)
-    critic = np.concatenate([obs, critic_tail], axis=1)
-
-    resolved = resolve_offpolicy_actor_priv_info(
-        algo_type="dummy_priv_sac",
-        obs_np=obs,
-        critic_np=critic,
-        info={},
-    )
-
-    np.testing.assert_allclose(resolved, critic_tail)
-
-
-def test_resolve_offpolicy_actor_priv_info_returns_none_without_adapter() -> None:
-    import numpy as np
-
-    resolved = resolve_offpolicy_actor_priv_info(
-        algo_type="sac",
-        obs_np=np.zeros((2, 3), dtype=np.float32),
-        critic_np=np.zeros((2, 5), dtype=np.float32),
-        info=None,
-    )
-
-    assert resolved is None
 
 
 def test_collector_rejects_transport_metadata_in_env_override() -> None:
