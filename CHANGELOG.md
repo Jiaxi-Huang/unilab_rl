@@ -7,6 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- `env_contract.SupportsCompletionReceiptsProtocol` and
+  `get_produces_completion_receipts()` (Motphys/UniLab#2363): envs may declare
+  `produces_completion_receipts: bool`. Envs that declare `False` (synchronous
+  producers that never emit step receipts, e.g. host-bridge backends) are
+  accepted at CUDA replay ingress without a receipt; undeclared envs default to
+  `True` (receipt required — fail-closed direction unchanged).
+
 ### Removed
 
 - Shrunk the replay completion surface to the minimal async step-only event
