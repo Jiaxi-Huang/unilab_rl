@@ -284,14 +284,10 @@ class TestMPSIngressEventLifecycle:
             contract_version = COMPLETION_CONTRACT_VERSION
             operation = "env_update"
             sequence = 1
-            stream_id = 0
             producer_id = "producer-update"
 
             def wait_before_read(self, stream=None):
                 del stream
-
-            def ipc_handle(self):
-                return b"x"
 
         class Replay:
             last_completion = InvalidCompletion()

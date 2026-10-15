@@ -6,9 +6,8 @@ from dataclasses import dataclass
 from typing import Any, Protocol, runtime_checkable
 
 COMPLETION_CONTRACT_VERSION = 2
-MAX_COMPLETION_IPC_HANDLE_BYTES = 256
 MAX_COMPLETION_PRODUCER_ID_BYTES = 256
-COMPLETION_OPERATIONS = frozenset({"step", "selected_reset", "mask_reset"})
+COMPLETION_OPERATIONS = frozenset({"step"})
 
 
 def _validate_receipt_metadata(
@@ -16,7 +15,6 @@ def _validate_receipt_metadata(
     contract_version: int,
     operation: str,
     sequence: int,
-    stream_id: int,
     producer_id: str,
 ) -> None:
     """Validate the neutral public receipt fields."""
@@ -28,36 +26,10 @@ def _validate_receipt_metadata(
         raise ValueError(f"unsupported completion operation {operation!r}")
     if not isinstance(sequence, int) or isinstance(sequence, bool) or sequence < 0:
         raise TypeError("completion sequence must be a non-negative integer")
-    if not isinstance(stream_id, int) or isinstance(stream_id, bool) or stream_id < 0:
-        raise TypeError("completion stream_id must be a non-negative integer")
     if not isinstance(producer_id, str) or not producer_id.strip():
         raise TypeError("completion producer_id must be a non-empty string")
     if len(producer_id.encode("utf-8")) > MAX_COMPLETION_PRODUCER_ID_BYTES:
         raise ValueError("completion producer_id exceeds the IPC metadata limit")
-
-
-def _validate_public_metadata(
-    *,
-    contract_version: int,
-    operation: str,
-    sequence: int,
-    stream_id: int,
-    producer_id: str,
-    ipc_handle: bytes,
-) -> None:
-    """Validate IPC receipt metadata without interpreting the event handle."""
-    _validate_receipt_metadata(
-        contract_version=contract_version,
-        operation=operation,
-        sequence=sequence,
-        stream_id=stream_id,
-        producer_id=producer_id,
-    )
-    if (
-        not isinstance(ipc_handle, bytes)
-        or not 0 < len(ipc_handle) <= MAX_COMPLETION_IPC_HANDLE_BYTES
-    ):
-        raise TypeError("completion ipc_handle must be non-empty bounded bytes")
 
 
 @runtime_checkable
@@ -74,16 +46,11 @@ class CompletionTokenProtocol(Protocol):
     def sequence(self) -> int: ...
 
     @property
-    def stream_id(self) -> int: ...
-
-    @property
     def producer_id(self) -> str: ...
 
     def wait_before_read(self, stream: Any | None = None) -> None:
         """Make the completed producer prefix visible before this read."""
         ...
-
-    def ipc_handle(self) -> bytes: ...
 
 
 def wait_completion(
@@ -111,8 +78,6 @@ def wait_completion(
         )
     if isinstance(completion.sequence, bool) or not isinstance(completion.sequence, int):
         raise TypeError("completion sequence must be an integer")
-    if isinstance(completion.stream_id, bool) or not isinstance(completion.stream_id, int):
-        raise TypeError("completion stream_id must be an integer")
     if not isinstance(completion.producer_id, str) or not completion.producer_id.strip():
         raise TypeError("completion producer_id must be a non-empty string")
     if completion.sequence < last_sequence:
@@ -131,24 +96,19 @@ class ImmediateCompletion:
     contract_version: int = COMPLETION_CONTRACT_VERSION
     operation: str = "step"
     sequence: int = 0
-    stream_id: int = 0
     producer_id: str = "host-producer"
 
     def wait_before_read(self, stream: Any | None = None) -> None:
         del stream
 
-    def ipc_handle(self) -> bytes:
-        raise NotImplementedError("this completion receipt has no IPC transport")
-
 
 @dataclass
 class EventCompletion:
-    """Consumer-local receipt reconstructed from a public CUDA IPC event."""
+    """Replay-owned ingress publication receipt backed by a recorded CUDA event."""
 
     contract_version: int
     operation: str
     sequence: int
-    stream_id: int
     producer_id: str
     event: Any
 
@@ -158,27 +118,22 @@ class EventCompletion:
         else:
             self.event.wait(stream)
 
-    def ipc_handle(self) -> bytes:
-        return bytes(self.event.ipc_handle())
-
 
 def record_ingress_publication(
     completion: CompletionTokenProtocol,
     *,
     stream: Any | None,
 ) -> CompletionTokenProtocol:
-    """Record a publication receipt after ingress writes are enqueued."""
+    """Record a replay-owned publication receipt after ingress writes are enqueued."""
     if stream is None or getattr(stream.device, "type", None) != "cuda":
         return completion
     import torch
 
-    _validate_public_metadata(
+    _validate_receipt_metadata(
         contract_version=completion.contract_version,
         operation=completion.operation,
         sequence=completion.sequence,
-        stream_id=completion.stream_id,
         producer_id=completion.producer_id,
-        ipc_handle=b"metadata-only",
     )
     event = torch.cuda.Event(interprocess=True)
     event.record(stream)
@@ -186,7 +141,6 @@ def record_ingress_publication(
         contract_version=completion.contract_version,
         operation=completion.operation,
         sequence=completion.sequence,
-        stream_id=completion.stream_id,
         producer_id=completion.producer_id,
         event=event,
     )
@@ -209,7 +163,6 @@ def publication_receipt(
         contract_version=completion.contract_version,
         operation=completion.operation,
         sequence=completion.sequence,
-        stream_id=completion.stream_id,
         producer_id=completion.producer_id,
     )
     if isinstance(completion, EventCompletion):
@@ -217,7 +170,6 @@ def publication_receipt(
             contract_version=completion.contract_version,
             operation=completion.operation,
             sequence=publication_sequence,
-            stream_id=completion.stream_id,
             producer_id=completion.producer_id,
             event=completion.event,
         )
@@ -225,38 +177,5 @@ def publication_receipt(
         contract_version=completion.contract_version,
         operation=completion.operation,
         sequence=publication_sequence,
-        stream_id=completion.stream_id,
         producer_id=completion.producer_id,
-    )
-
-
-def import_shared_completion(
-    *,
-    contract_version: int,
-    operation: str,
-    sequence: int,
-    stream_id: int,
-    producer_id: str,
-    ipc_handle: bytes,
-    device: Any,
-) -> EventCompletion:
-    """Reconstruct a neutral receipt from its public CUDA IPC descriptor."""
-    import torch
-
-    _validate_public_metadata(
-        contract_version=contract_version,
-        operation=operation,
-        sequence=sequence,
-        stream_id=stream_id,
-        producer_id=producer_id,
-        ipc_handle=ipc_handle,
-    )
-    event = torch.cuda.Event.from_ipc_handle(device, ipc_handle)
-    return EventCompletion(
-        contract_version=contract_version,
-        operation=operation,
-        sequence=sequence,
-        stream_id=stream_id,
-        producer_id=producer_id,
-        event=event,
     )

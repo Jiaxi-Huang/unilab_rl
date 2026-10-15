@@ -8,8 +8,9 @@ import numpy as np
 import torch
 
 from uni_rl.ipc.completion import (
+    COMPLETION_CONTRACT_VERSION,
     CompletionTokenProtocol,
-    import_shared_completion,
+    EventCompletion,
     publication_receipt,
     record_ingress_publication,
     wait_completion,
@@ -140,9 +141,6 @@ class ReplayBuffer(SharedBufferBase):
         self._completion_metadata_sequence = torch.zeros(
             1, dtype=torch.int64, device="cpu"
         ).share_memory_()
-        self._completion_metadata_stream_id = torch.zeros(
-            1, dtype=torch.uint64, device="cpu"
-        ).share_memory_()
         self._completion_metadata_available = torch.zeros(
             1, dtype=torch.bool, device="cpu"
         ).share_memory_()
@@ -157,12 +155,6 @@ class ReplayBuffer(SharedBufferBase):
         ).share_memory_()
         self._completion_metadata_producer_size = torch.zeros(
             1, dtype=torch.int64, device="cpu"
-        ).share_memory_()
-        self._completion_metadata_operation_size = torch.zeros(
-            1, dtype=torch.int64, device="cpu"
-        ).share_memory_()
-        self._completion_metadata_operation = torch.zeros(
-            32, dtype=torch.int8, device="cpu"
         ).share_memory_()
         self._completion_metadata_local_version = 0
 
@@ -259,7 +251,7 @@ class ReplayBuffer(SharedBufferBase):
 
     @property
     def last_completion(self) -> CompletionTokenProtocol | None:
-        """Return the receipt guarding the newest published ingress slot."""
+        """Return the replay-owned receipt guarding the newest published ingress slot."""
         return self._last_completion
 
     @property
@@ -273,16 +265,18 @@ class ReplayBuffer(SharedBufferBase):
         return self._completion_producer_id
 
     def _publish_completion_metadata(self, completion: Any) -> None:
-        """Publish neutral receipt metadata for the learner-local process copy."""
-        try:
-            handle = bytes(completion.ipc_handle())
-        except NotImplementedError:
-            # Receipts such as eager host-bridge completions legitimately do
-            # not declare an interprocess transport. Driver and IPC export
-            # failures must fail closed instead of becoming a missing receipt.
+        """Publish the replay-owned ingress publication event for the learner copy.
+
+        Only ``EventCompletion`` receipts recorded by ``record_ingress_publication``
+        after the ingress writes carry an interprocess event. Host-path receipts
+        have no device event to export; host slot ordering is carried by the
+        ingress semaphores. Driver and IPC export failures must fail closed
+        instead of becoming a missing receipt.
+        """
+        if not isinstance(completion, EventCompletion):
             return
+        handle = bytes(completion.event.ipc_handle())
         producer = completion.producer_id.encode("utf-8")
-        operation = completion.operation.encode("ascii")
         if (
             len(handle) > self._completion_metadata_handle.shape[1]
             or len(producer) > (self._completion_metadata_producer.shape[1])
@@ -290,10 +284,8 @@ class ReplayBuffer(SharedBufferBase):
             raise ValueError("completion IPC metadata exceeds ingress limits")
         self._completion_metadata_contract[0] = int(completion.contract_version)
         self._completion_metadata_sequence[0] = int(completion.sequence)
-        self._completion_metadata_stream_id[0] = int(completion.stream_id)
         self._completion_metadata_handle_size[0] = len(handle)
         self._completion_metadata_producer_size[0] = len(producer)
-        self._completion_metadata_operation_size[0] = len(operation)
         self._completion_metadata_handle.zero_()
         self._completion_metadata_handle[0, : len(handle)] = torch.from_numpy(
             np.frombuffer(handle, dtype=np.uint8).copy()
@@ -302,46 +294,46 @@ class ReplayBuffer(SharedBufferBase):
         self._completion_metadata_producer[0, : len(producer)] = torch.from_numpy(
             np.frombuffer(producer, dtype=np.uint8).copy()
         )
-        self._completion_metadata_operation.zero_()
-        operation_tensor = torch.from_numpy(np.frombuffer(operation, dtype=np.int8).copy())
-        self._completion_metadata_operation[: operation_tensor.numel()] = operation_tensor
         self._completion_metadata_available[0] = True
         self._completion_metadata_version[0] += 1
 
-    def _import_shared_completion(self) -> CompletionTokenProtocol | None:
-        """Import the newest collector-recorded receipt on the learner copy."""
+    def _import_ingress_publication(self) -> CompletionTokenProtocol | None:
+        """Import the newest replay-owned ingress publication event on the learner copy."""
         if not bool(self._completion_metadata_available[0]):
             return None
         handle_size = int(self._completion_metadata_handle_size[0])
         producer_size = int(self._completion_metadata_producer_size[0])
-        operation_size = int(self._completion_metadata_operation_size[0])
+        if not 0 < handle_size <= self._completion_metadata_handle.shape[1]:
+            raise TypeError("ingress publication event handle must be non-empty bounded bytes")
         handle_bytes = bytes(self._completion_metadata_handle[0, :handle_size].numpy().tobytes())
-        producer_bytes = bytes(
+        producer_id = bytes(
             self._completion_metadata_producer[0, :producer_size].numpy().tobytes()
-        )
-        operation_bytes = bytes(
-            self._completion_metadata_operation[:operation_size].numpy().tobytes()
-        )
-        imported = import_shared_completion(
-            contract_version=int(self._completion_metadata_contract[0]),
-            operation=operation_bytes.decode("ascii"),
-            sequence=int(self._completion_metadata_sequence[0]),
-            stream_id=int(self._completion_metadata_stream_id[0]),
-            producer_id=producer_bytes.decode("utf-8"),
-            ipc_handle=handle_bytes,
-            device=self._ingress_device,
+        ).decode("utf-8")
+        contract_version = int(self._completion_metadata_contract[0])
+        sequence = int(self._completion_metadata_sequence[0])
+        if contract_version != COMPLETION_CONTRACT_VERSION:
+            raise ValueError(f"unsupported completion contract {contract_version}")
+        if not producer_id.strip():
+            raise TypeError("completion producer_id must be a non-empty string")
+        event = torch.cuda.Event.from_ipc_handle(self._ingress_device, handle_bytes)
+        imported = EventCompletion(
+            contract_version=contract_version,
+            operation="step",
+            sequence=sequence,
+            producer_id=producer_id,
+            event=event,
         )
         self._completion_sequence = imported.sequence
         self._completion_producer_id = imported.producer_id
         self._last_completion = imported
         return imported
 
-    def import_shared_completion(self) -> CompletionTokenProtocol | None:
-        """Import collector receipt metadata once per new shared version."""
+    def import_ingress_publication(self) -> CompletionTokenProtocol | None:
+        """Import the replay-owned publication receipt once per new shared version."""
         version = int(self._completion_metadata_version[0])
         if version == self._completion_metadata_local_version:
             return self._last_completion
-        imported = self._import_shared_completion()
+        imported = self._import_ingress_publication()
         self._completion_metadata_local_version = version
         return imported
 

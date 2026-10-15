@@ -9,6 +9,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Removed
 
+- Shrunk the replay completion surface to the minimal async step-only event
+  contract (Motphys/UniLab#2363). `COMPLETION_OPERATIONS` is now step-only;
+  `selected_reset`/`mask_reset` (and any other removed operation) receipts are
+  rejected fail-closed. The `stream_id` receipt field and the
+  `CompletionTokenProtocol.ipc_handle` transport hook are deleted, and the
+  generic backend-token IPC reconstruction (`import_shared_completion`,
+  `EventCompletion.ipc_handle`) is removed. The shared-memory completion
+  metadata now carries only the replay-owned ingress publication event handle
+  plus `contract_version`/`sequence`/`producer_id` for validation; the learner
+  imports and waits that replay-owned event (`ReplayBuffer.import_ingress_publication`,
+  replacing `import_shared_completion`) before its H2D span copies. Read-before-copy
+  gating, the replay-owned publication event recorded after ingress writes,
+  stale-sequence rejection, producer/operation binding, and fail-closed CUDA
+  ingress without a receipt are unchanged.
+
 - Removed the NumPy observation runtime from the off-policy collector with no
   compatibility layer (#119). Collector initialization now fails closed with a
   `TypeError` unless the actor (`obs`) and critic observation groups are Torch

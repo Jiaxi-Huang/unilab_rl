@@ -6,10 +6,11 @@ import multiprocessing as mp
 import threading
 import time
 
+import numpy as np
 import pytest
 import torch
 
-from uni_rl.ipc.completion import ImmediateCompletion, wait_completion
+from uni_rl.ipc.completion import EventCompletion, ImmediateCompletion, wait_completion
 from uni_rl.ipc.replay_buffer import ReplayBuffer
 
 _SPAWN_CTX = mp.get_context("spawn")
@@ -298,9 +299,17 @@ def test_ingress_waits_before_transition_source_reads(monkeypatch: pytest.Monkey
 
 
 def test_completion_ipc_export_failure_fails_closed() -> None:
-    class FailingExportCompletion(ImmediateCompletion):
+    class FailingEvent:
         def ipc_handle(self) -> bytes:
             raise RuntimeError("CUDA IPC export failed")
+
+    failing = EventCompletion(
+        contract_version=2,
+        operation="step",
+        sequence=1,
+        producer_id="producer-a",
+        event=FailingEvent(),
+    )
 
     buf = ReplayBuffer(
         capacity=8,
@@ -312,8 +321,47 @@ def test_completion_ipc_export_failure_fails_closed() -> None:
 
     try:
         with pytest.raises(RuntimeError, match="CUDA IPC export failed"):
-            buf._publish_completion_metadata(FailingExportCompletion())
+            buf._publish_completion_metadata(failing)
         assert not bool(buf._completion_metadata_available[0])
+    finally:
+        buf.close()
+
+
+def test_host_publication_receipt_exports_no_event_metadata() -> None:
+    buf = _make_buf()
+
+    try:
+        buf._publish_completion_metadata(ImmediateCompletion(sequence=1))
+        assert not bool(buf._completion_metadata_available[0])
+    finally:
+        buf.close()
+
+
+def test_import_ingress_publication_rejects_malformed_metadata() -> None:
+    buf = _make_buf()
+
+    try:
+        buf._completion_metadata_handle_size[0] = 8
+        buf._completion_metadata_producer_size[0] = len(b"producer-a")
+        buf._completion_metadata_producer[0, : len(b"producer-a")] = torch.from_numpy(
+            np.frombuffer(b"producer-a", dtype=np.uint8).copy()
+        )
+        buf._completion_metadata_sequence[0] = 1
+        buf._completion_metadata_available[0] = True
+
+        buf._completion_metadata_contract[0] = 1
+        with pytest.raises(ValueError, match="unsupported completion contract"):
+            buf._import_ingress_publication()
+
+        buf._completion_metadata_contract[0] = 2
+        buf._completion_metadata_producer_size[0] = 0
+        with pytest.raises(TypeError, match="producer_id"):
+            buf._import_ingress_publication()
+
+        buf._completion_metadata_producer_size[0] = len(b"producer-a")
+        buf._completion_metadata_handle_size[0] = 0
+        with pytest.raises(TypeError, match="handle"):
+            buf._import_ingress_publication()
     finally:
         buf.close()
 
@@ -469,7 +517,7 @@ def test_ingress_rejects_stale_completion_within_one_buffer() -> None:
     buf.close()
 
 
-def test_ingress_publication_receipt_preserves_backend_operation() -> None:
+def test_ingress_publication_receipt_preserves_step_metadata() -> None:
     buf = _make_buf()
 
     assert buf.add(
@@ -495,14 +543,10 @@ def test_ingress_accepts_foreign_structural_completion_producer(
         contract_version = 2
         operation = "step"
         sequence = 3
-        stream_id = 1
         producer_id = "producer-foreign"
 
         def wait_before_read(self, stream=None) -> None:
             events.append("wait")
-
-        def ipc_handle(self) -> bytes:
-            raise NotImplementedError
 
     buf = _make_buf(slot_rows=4)
     batch = _random_batch(4)
@@ -771,7 +815,7 @@ def test_spawned_collector_transports_ingress_completion_to_learner_copy() -> No
         deadline = time.monotonic() + 15.0
         while buf.published_ptr == 0 and time.monotonic() < deadline:
             time.sleep(0.001)
-        imported = buf.import_shared_completion()
+        imported = buf.import_ingress_publication()
         assert imported is not None
         assert imported.producer_id == "producer-cross-process"
         assert imported.sequence == 1
