@@ -466,6 +466,7 @@ def _make_device_runner(
     batch_size: int = 4,
     updates_per_step: int = 2,
     produces_completion_receipts: bool = True,
+    inference_placement: InferencePlacement | None = None,
 ):
     monkeypatch.setattr(
         device_runner_module, "require_offpolicy_replay_device", lambda value: value
@@ -480,8 +481,8 @@ def _make_device_runner(
             produces_completion_receipts=produces_completion_receipts,
         ),
     )
-    placement = None
-    if collector_tensor_native is not None:
+    placement = inference_placement
+    if placement is None and collector_tensor_native is not None:
         placement = resolve_inference_placement(
             learner_device=device,
             tensor_runtime=collector_tensor_native,
@@ -1342,6 +1343,72 @@ def test_runner_relaxes_receipt_gate_for_sync_declared_env(
 
     assert _FakeReplayBuffer.last_kwargs["require_completion_receipt"] is False
     assert _FakeReplayBuffer.last_kwargs["ingress_device"] == "cuda"
+    assert _FakePipeline.close_calls == 1
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+def test_mujoco_cuda_carrier_resolves_cuda_tensor_ring_by_default(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path,
+):
+    """Pin the Wave 2 default topology: a mujoco env presenting CUDA obs.
+
+    With the probe reporting tensor-native CUDA observations, a CUDA learner,
+    and no explicit transport config, resolution must select the CUDA tensor
+    ring with no host staging, replay ingress on the learner device, and a
+    relaxed receipt gate for the sync-declared (no completion receipts) env.
+    """
+    _FakePipeline.close_calls = 0
+    monkeypatch.setattr(device_runner_module, "ReplayBuffer", _FakeReplayBuffer)
+    monkeypatch.setattr(device_runner_module, "GPUResidentReplayPipeline", _FakePipeline)
+    monkeypatch.setattr(device_runner_module, "OffPolicyLogger", _FakeLogger)
+    monkeypatch.setattr(device_runner_module.torch, "save", lambda *args, **kwargs: None)
+    monkeypatch.setattr(device_runner_module.time, "sleep", lambda seconds: None)
+
+    learner_device = f"cuda:{torch.cuda.current_device()}"
+    # Probe-driven resolution: env obs arrive as CUDA tensors and the owner
+    # config carries no explicit inference transport request.
+    placement = resolve_inference_placement(
+        learner_device=learner_device,
+        env_tensor_native=True,
+        algo_name="TestRunner",
+    )
+    assert placement.mode is InferenceTransport.CUDA
+    assert placement.staging_policy == "cuda_no_host_boundary"
+
+    runner = _make_device_runner(
+        monkeypatch,
+        _Learner(),
+        device=learner_device,
+        sim_backend="mujoco",
+        inference_placement=placement,
+        produces_completion_receipts=False,
+    )
+    assert runner.produces_completion_receipts is False
+    collector_kwargs = {}
+
+    def capture_collector(*, target_fn, kwargs):
+        del target_fn
+        collector_kwargs.update(kwargs)
+
+    monkeypatch.setattr(runner, "_start_collector", capture_collector)
+    runner.learn(max_iterations=0, save_interval=0, log_dir=str(tmp_path))
+
+    assert _FakeReplayBuffer.last_kwargs["ingress_device"] == learner_device
+    assert _FakeReplayBuffer.last_kwargs["require_completion_receipt"] is False
+    assert collector_kwargs["inference_transport"] == "cuda"
+    assert collector_kwargs["inference_slot"].device == torch.device(learner_device)
+    manifest = runner.runtime_manifest
+    assert manifest["collector_tensor_native"] is True
+    assert manifest["inference_staging_policy"] == "cuda_no_host_boundary"
+    assert manifest["inference_action_host_staging"] is False
+    assert manifest["inference_transport"] == {
+        "mode": "cuda",
+        "env_device": learner_device,
+        "ring_device": learner_device,
+        "learner_device": learner_device,
+        "staging_policy": "cuda_no_host_boundary",
+    }
     assert _FakePipeline.close_calls == 1
 
 
