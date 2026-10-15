@@ -729,15 +729,6 @@ def test_tensor_collector_reports_bounded_inference_scheduling_diagnostics(
         return True
 
     monkeypatch.setattr(worker_module, "_wait_for_inference_tick", serve_learner_action)
-    original_consume_action = ring.consume_action
-
-    def consume_tensor_action(**kwargs):
-        actions, policy_version = original_consume_action(**kwargs)
-        if isinstance(actions, np.ndarray):
-            actions = torch.from_numpy(actions)
-        return actions, policy_version
-
-    ring.consume_action = consume_tensor_action
 
     worker_module._run_collector(
         stop_event=stop_event,
@@ -896,15 +887,6 @@ def test_tensor_collector_passes_env_observations_to_replay_without_snapshot(
         return True
 
     monkeypatch.setattr(worker_module, "_wait_for_inference_tick", serve_learner_action)
-    original_consume_action = ring.consume_action
-
-    def consume_tensor_action(**kwargs):
-        actions, policy_version = original_consume_action(**kwargs)
-        if isinstance(actions, np.ndarray):
-            actions = torch.from_numpy(actions)
-        return actions, policy_version
-
-    ring.consume_action = consume_tensor_action
 
     worker_module._run_collector(
         stop_event=stop_event,
@@ -937,13 +919,15 @@ def test_tensor_collector_passes_env_observations_to_replay_without_snapshot(
     assert replay_args[0].data_ptr() == initial_obs.data_ptr()
 
 
-def test_tensor_collector_stages_numpy_ring_actions_before_env_step(
+def test_tensor_collector_steps_env_with_ring_tensor_actions(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """A CPU inference ring may return NumPy actions; ``env.step`` still gets Torch."""
+    """env.step receives the ring's cloned Torch action tensor without restaging."""
     stop_event = threading.Event()
     metrics_queue: queue.Queue[dict] = queue.Queue(maxsize=4)
     replay_calls: list[tuple[tuple[torch.Tensor, ...], dict[str, object]]] = []
+    step_actions: list[torch.Tensor] = []
+    consumed_actions: list[torch.Tensor] = []
 
     class _Env:
         state = SimpleNamespace(
@@ -956,6 +940,7 @@ def test_tensor_collector_stages_numpy_ring_actions_before_env_step(
         )
 
         def step(self, actions):
+            step_actions.append(actions)
             assert isinstance(actions, torch.Tensor)
             assert actions.dtype == torch.float32
             torch.testing.assert_close(actions, torch.zeros((2, 2)))
@@ -1009,6 +994,14 @@ def test_tensor_collector_stages_numpy_ring_actions_before_env_step(
         return True
 
     monkeypatch.setattr(worker_module, "_wait_for_inference_tick", serve_learner_action)
+    original_consume_action = ring.consume_action
+
+    def capture_consumed_action(**kwargs):
+        actions, policy_version = original_consume_action(**kwargs)
+        consumed_actions.append(actions)
+        return actions, policy_version
+
+    ring.consume_action = capture_consumed_action
 
     worker_module._run_collector(
         stop_event=stop_event,
@@ -1032,6 +1025,8 @@ def test_tensor_collector_stages_numpy_ring_actions_before_env_step(
         trace_thread_time=False,
     )
 
+    assert len(step_actions) == 1
+    assert step_actions[0] is consumed_actions[0]
     assert len(replay_calls) == 1
     replay_args, _ = replay_calls[0]
     assert isinstance(replay_args[1], torch.Tensor)
@@ -1299,15 +1294,6 @@ def test_worker_shutdown_flushes_partial_metrics_before_abnormal_cleanup(
         return True
 
     monkeypatch.setattr(worker_module, "_wait_for_inference_tick", serve_learner_action)
-    original_consume_action = ring.consume_action
-
-    def consume_tensor_action(**kwargs):
-        actions, policy_version = original_consume_action(**kwargs)
-        if isinstance(actions, np.ndarray):
-            actions = torch.from_numpy(actions)
-        return actions, policy_version
-
-    ring.consume_action = consume_tensor_action
 
     with pytest.raises(RuntimeError, match="abnormal shutdown after partial window"):
         worker_module._run_collector(

@@ -5,7 +5,6 @@ import sys
 import time
 from typing import Any, cast
 
-import numpy as np
 import torch
 
 from uni_rl.algos.common.collector_timing import extract_env_step_breakdown_timing_ms
@@ -590,7 +589,6 @@ def _run_collector(
         except Exception as exc:
             print(f"[OffPolicyWorker] final tensor metric flush error: {exc}", file=sys.stderr)
 
-    action_host: torch.Tensor | None = None
     obs_t: torch.Tensor | None = None
     critic_t: torch.Tensor | None = None
     next_obs_t: torch.Tensor | None = None
@@ -744,19 +742,13 @@ def _run_collector(
             )
             inference_tick += 1
 
-            # Step environment
+            # Step environment. The inference ring returns a Torch action
+            # tensor on every platform; fail closed if that ever regresses.
             _env_ns = _time.perf_counter_ns()
-            # TorchEnv has a tensor-only public action contract even when the
-            # inference ring is CPU. Reuse one persistent host staging tensor
-            # for this explicit ring->env boundary rather than allocating or
-            # silently converting inside the env.
-            if isinstance(actions, np.ndarray):
-                if action_host is None:
-                    action_host = torch.empty(
-                        actions.shape, dtype=torch.float32, device=torch.device("cpu")
-                    )
-                action_host.copy_(torch.from_numpy(np.ascontiguousarray(actions, dtype=np.float32)))
-                actions = action_host
+            if not isinstance(actions, torch.Tensor):
+                raise TypeError(
+                    f"inference ring actions must be a Torch tensor, got {type(actions).__name__}"
+                )
             state = env.step(actions)
             if trace_recorder:
                 trace_recorder.add_slice(
