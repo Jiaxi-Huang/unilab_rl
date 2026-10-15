@@ -22,7 +22,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   replacing `import_shared_completion`) before its H2D span copies. Read-before-copy
   gating, the replay-owned publication event recorded after ingress writes,
   stale-sequence rejection, producer/operation binding, and fail-closed CUDA
-  ingress without a receipt are unchanged.
+  ingress without a receipt are unchanged. `COMPLETION_CONTRACT_VERSION` is
+  bumped to 3 to track the unisim completion-token contract v3 (token fields are
+  exactly `contract_version`/`operation`/`sequence`/`producer_id`, step-only);
+  v2 receipts fail closed.
 
 - Removed the NumPy observation runtime from the off-policy collector with no
   compatibility layer (#119). Collector initialization now fails closed with a

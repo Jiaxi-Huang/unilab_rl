@@ -304,7 +304,7 @@ def test_completion_ipc_export_failure_fails_closed() -> None:
             raise RuntimeError("CUDA IPC export failed")
 
     failing = EventCompletion(
-        contract_version=2,
+        contract_version=3,
         operation="step",
         sequence=1,
         producer_id="producer-a",
@@ -353,7 +353,7 @@ def test_import_ingress_publication_rejects_malformed_metadata() -> None:
         with pytest.raises(ValueError, match="unsupported completion contract"):
             buf._import_ingress_publication()
 
-        buf._completion_metadata_contract[0] = 2
+        buf._completion_metadata_contract[0] = 3
         buf._completion_metadata_producer_size[0] = 0
         with pytest.raises(TypeError, match="producer_id"):
             buf._import_ingress_publication()
@@ -540,7 +540,7 @@ def test_ingress_accepts_foreign_structural_completion_producer(
     events: list[str] = []
 
     class ForeignImmediateCompletion:
-        contract_version = 2
+        contract_version = 3
         operation = "step"
         sequence = 3
         producer_id = "producer-foreign"

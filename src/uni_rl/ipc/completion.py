@@ -5,7 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any, Protocol, runtime_checkable
 
-COMPLETION_CONTRACT_VERSION = 2
+COMPLETION_CONTRACT_VERSION = 3
 MAX_COMPLETION_PRODUCER_ID_BYTES = 256
 COMPLETION_OPERATIONS = frozenset({"step"})
 

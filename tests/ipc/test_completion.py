@@ -78,7 +78,7 @@ def test_ingress_publication_preserves_cpu_receipt() -> None:
 def test_publication_receipt_accepts_foreign_structural_producer() -> None:
     class ForeignImmediateCompletion:
         def __init__(self, **overrides: object) -> None:
-            self.contract_version: int = 2
+            self.contract_version: int = 3
             self.operation: str = "step"
             self.sequence: int = 17
             self.producer_id: str = "producer-foreign"
@@ -95,7 +95,7 @@ def test_publication_receipt_accepts_foreign_structural_producer() -> None:
 
     assert isinstance(published, ImmediateCompletion)
     assert published is not None
-    assert published.contract_version == 2
+    assert published.contract_version == 3
     assert published.operation == "step"
     assert published.sequence == 19
     assert published.producer_id == "producer-foreign"
@@ -114,7 +114,7 @@ def test_publication_receipt_accepts_foreign_structural_producer() -> None:
 )
 def test_publication_receipt_rejects_malformed_foreign_metadata(field: dict, expected: str) -> None:
     class ForeignImmediateCompletion:
-        contract_version = field.get("contract_version", 2)
+        contract_version = field.get("contract_version", 3)
         operation = field.get("operation", "step")
         sequence = field.get("sequence", 1)
         producer_id = field.get("producer_id", "producer-foreign")
