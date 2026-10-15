@@ -8,7 +8,6 @@ import threading
 from collections import deque
 from types import SimpleNamespace
 
-import numpy as np
 import pytest
 import torch
 
@@ -2265,12 +2264,12 @@ def test_learner_inference_matches_existing_actor_exploration(algo_type: str) ->
 
         actor = FlashSACActor(num_blocks=1, input_dim=3, hidden_dim=8, action_dim=2)
     expected_actor = copy.deepcopy(actor)
-    observations = np.arange(6, dtype=np.float32).reshape(2, 3) / 10.0
-    dones = np.array([0.0, 1.0], dtype=np.float32)
+    observations = torch.arange(6, dtype=torch.float32).reshape(2, 3) / 10.0
+    dones = torch.tensor([0.0, 1.0], dtype=torch.float32)
     torch.manual_seed(17)
     expected = expected_actor.explore(
-        torch.from_numpy(observations),
-        dones=torch.from_numpy(dones),
+        observations,
+        dones=dones,
         deterministic=False,
     )
 
@@ -2305,7 +2304,7 @@ def test_learner_inference_matches_existing_actor_exploration(algo_type: str) ->
     )
     actual, policy_version = slot.consume_action(tick_id=0, epoch=0)
 
-    torch.testing.assert_close(torch.from_numpy(actual), expected)
+    torch.testing.assert_close(actual, expected)
     assert policy_version == 9
     if algo_type == "flashsac":
         torch.testing.assert_close(actor._noise, expected_actor._noise)
@@ -2341,11 +2340,11 @@ def test_adapter_learner_inference_uses_actor_context(
     )
 
     actor = _DummyPrivInfoActor()
-    observations = np.arange(6, dtype=np.float32).reshape(2, 3) / 10.0
-    priv_info = np.arange(4, dtype=np.float32).reshape(2, 2) / 10.0
-    actor_input = np.concatenate((observations, priv_info), axis=1)
-    dones = np.zeros(2, dtype=np.float32)
-    expected = actor.explore(torch.from_numpy(observations), torch.from_numpy(priv_info))
+    observations = torch.arange(6, dtype=torch.float32).reshape(2, 3) / 10.0
+    priv_info = torch.arange(4, dtype=torch.float32).reshape(2, 2) / 10.0
+    actor_input = torch.cat((observations, priv_info), dim=1)
+    dones = torch.zeros(2)
+    expected = actor.explore(observations, priv_info)
 
     runner = object.__new__(device_runner_module.DoubleBufferOffPolicyRunner)
     runner.device = "cpu"
@@ -2377,7 +2376,7 @@ def test_adapter_learner_inference_uses_actor_context(
     )
     actual, policy_version = slot.consume_action(tick_id=0, epoch=0)
 
-    torch.testing.assert_close(torch.from_numpy(actual), expected)
+    torch.testing.assert_close(actual, expected)
     assert policy_version == 10
 
 

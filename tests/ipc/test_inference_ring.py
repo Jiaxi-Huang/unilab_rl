@@ -13,12 +13,12 @@ from uni_rl.ipc import inference_ring as inference_ring_module
 from uni_rl.ipc.inference_ring import SharedInferenceRing
 
 
-def _observations(tick: int) -> np.ndarray:
-    return np.arange(6, dtype=np.float32).reshape(2, 3) + tick
+def _observations(tick: int) -> torch.Tensor:
+    return torch.arange(6, dtype=torch.float32).reshape(2, 3) + tick
 
 
-def _dones(tick: int) -> np.ndarray:
-    return np.asarray([tick % 2, (tick + 1) % 2], dtype=np.float32)
+def _dones(tick: int) -> torch.Tensor:
+    return torch.tensor([tick % 2, (tick + 1) % 2], dtype=torch.float32)
 
 
 def _actions(tick: int) -> torch.Tensor:
@@ -55,12 +55,9 @@ def _roundtrip_one(ring: SharedInferenceRing, tick: int, policy_version: int) ->
         epoch=0,
     )
 
-    np.testing.assert_array_equal(observation_destination.numpy(), observations)
-    np.testing.assert_array_equal(done_destination.numpy(), dones)
-    if ring.device.type == "cuda":
-        torch.testing.assert_close(received_actions, actions)
-    else:
-        np.testing.assert_array_equal(received_actions, actions.numpy())
+    torch.testing.assert_close(observation_destination, observations)
+    torch.testing.assert_close(done_destination, dones)
+    torch.testing.assert_close(received_actions, actions)
     assert received_version == policy_version
 
 
@@ -96,15 +93,15 @@ def test_inference_ring_starts_at_tick_zero() -> None:
     with pytest.raises(RuntimeError, match="publication tick mismatch: expected 0, got 1"):
         ring.publish_observation(
             tick_id=1,
-            observations=np.zeros((1, 1), dtype=np.float32),
-            dones=np.zeros(1, dtype=np.float32),
+            observations=torch.zeros((1, 1)),
+            dones=torch.zeros(1),
         )
 
 
 def test_inference_ring_rejects_duplicate_and_skipped_publication() -> None:
     ring = SharedInferenceRing(num_envs=1, obs_dim=1, action_dim=1, capacity=2)
-    observations = np.zeros((1, 1), dtype=np.float32)
-    dones = np.zeros(1, dtype=np.float32)
+    observations = torch.zeros((1, 1))
+    dones = torch.zeros(1)
     ring.publish_observation(tick_id=0, observations=observations, dones=dones)
 
     with pytest.raises(RuntimeError, match="publication tick mismatch: expected 1, got 0"):
@@ -115,8 +112,8 @@ def test_inference_ring_rejects_duplicate_and_skipped_publication() -> None:
 
 def test_inference_ring_rejects_response_before_observation_and_stale_actions() -> None:
     ring = SharedInferenceRing(num_envs=1, obs_dim=1, action_dim=1, capacity=2)
-    observations = np.zeros((1, 1), dtype=np.float32)
-    dones = np.zeros(1, dtype=np.float32)
+    observations = torch.zeros((1, 1))
+    dones = torch.zeros(1)
     ring.publish_observation(tick_id=0, observations=observations, dones=dones)
 
     with pytest.raises(RuntimeError, match="action publication tick mismatch"):
@@ -139,7 +136,7 @@ def test_inference_ring_rejects_response_before_observation_and_stale_actions() 
         dones=torch.empty(1),
     )
     actions, policy_version = ring.consume_action(tick_id=0)
-    np.testing.assert_array_equal(actions, [[1.0]])
+    torch.testing.assert_close(actions, torch.ones((1, 1)))
     assert policy_version == 3
 
     with pytest.raises(RuntimeError, match="action consumption tick mismatch: expected 1, got 0"):
@@ -149,8 +146,8 @@ def test_inference_ring_rejects_response_before_observation_and_stale_actions() 
 
 def test_inference_ring_rejects_duplicate_action_publication() -> None:
     ring = SharedInferenceRing(num_envs=1, obs_dim=1, action_dim=1)
-    observations = np.zeros((1, 1), dtype=np.float32)
-    dones = np.zeros(1, dtype=np.float32)
+    observations = torch.zeros((1, 1))
+    dones = torch.zeros(1)
     ring.publish_observation(tick_id=0, observations=observations, dones=dones)
     ring.copy_observation_to(
         tick_id=0,
@@ -171,7 +168,7 @@ def test_inference_ring_rejects_duplicate_action_publication() -> None:
         )
 
     actions, policy_version = ring.consume_action(tick_id=0)
-    np.testing.assert_array_equal(actions, [[7.0]])
+    torch.testing.assert_close(actions, torch.full((1, 1), 7.0))
     assert policy_version == 4
     ring.publish_observation(tick_id=1, observations=observations, dones=dones)
     ring.copy_observation_to(
@@ -185,14 +182,14 @@ def test_inference_ring_rejects_duplicate_action_publication() -> None:
         actions=torch.full((1, 1), 11.0),
     )
     actions, policy_version = ring.consume_action(tick_id=1)
-    np.testing.assert_array_equal(actions, [[11.0]])
+    torch.testing.assert_close(actions, torch.full((1, 1), 11.0))
     assert policy_version == 6
 
 
 def test_inference_ring_rejects_out_of_order_observation_and_action_headers() -> None:
     ring = SharedInferenceRing(num_envs=1, obs_dim=1, action_dim=1, capacity=2)
-    observations = np.zeros((1, 1), dtype=np.float32)
-    dones = np.zeros(1, dtype=np.float32)
+    observations = torch.zeros((1, 1))
+    dones = torch.zeros(1)
     ring.publish_observation(tick_id=0, observations=observations, dones=dones)
 
     with pytest.raises(
@@ -224,14 +221,14 @@ def test_inference_ring_epoch_is_fail_closed() -> None:
     with pytest.raises(RuntimeError, match="Inference epoch mismatch: expected 7, got 6"):
         ring.publish_observation(
             tick_id=0,
-            observations=np.zeros((1, 1), dtype=np.float32),
-            dones=np.zeros(1, dtype=np.float32),
+            observations=torch.zeros((1, 1)),
+            dones=torch.zeros(1),
             epoch=6,
         )
     ring.publish_observation(
         tick_id=0,
-        observations=np.zeros((1, 1), dtype=np.float32),
-        dones=np.zeros(1, dtype=np.float32),
+        observations=torch.zeros((1, 1)),
+        dones=torch.zeros(1),
         epoch=7,
     )
     with pytest.raises(RuntimeError, match="Inference epoch mismatch: expected 7, got 8"):
@@ -245,8 +242,8 @@ def test_inference_ring_epoch_is_fail_closed() -> None:
 
 def test_inference_ring_backpressure_releases_after_action_consumption() -> None:
     ring = SharedInferenceRing(num_envs=1, obs_dim=1, action_dim=1, capacity=1)
-    observations = np.zeros((1, 1), dtype=np.float32)
-    dones = np.zeros(1, dtype=np.float32)
+    observations = torch.zeros((1, 1))
+    dones = torch.zeros(1)
     ring.publish_observation(tick_id=0, observations=observations, dones=dones)
 
     assert (
@@ -315,7 +312,7 @@ def test_inference_ring_supports_bounded_multi_tick_observation_flight() -> None
             observations=observations,
             dones=dones,
         )
-        torch.testing.assert_close(observations, torch.tensor(_observations(tick)))
+        torch.testing.assert_close(observations, _observations(tick))
         ring.publish_action(
             tick_id=tick,
             policy_version=tick + 1,
@@ -324,7 +321,7 @@ def test_inference_ring_supports_bounded_multi_tick_observation_flight() -> None
 
     for tick in range(4):
         actions, policy_version = ring.consume_action(tick_id=tick)
-        np.testing.assert_array_equal(actions, _actions(tick).numpy())
+        torch.testing.assert_close(actions, _actions(tick))
         assert policy_version == tick + 1
 
     assert ring.diagnostics["published_tick"] == 3
@@ -373,8 +370,8 @@ def test_inference_ring_close_is_idempotent_and_keeps_diagnostics() -> None:
     with pytest.raises(RuntimeError, match="inference ring is closed"):
         ring.publish_observation(
             tick_id=0,
-            observations=np.zeros((2, 3), dtype=np.float32),
-            dones=np.zeros(2, dtype=np.float32),
+            observations=torch.zeros((2, 3)),
+            dones=torch.zeros(2),
         )
 
 
@@ -392,11 +389,17 @@ def test_inference_ring_validates_constructor_and_payload_contract() -> None:
     with pytest.raises(ValueError, match="observation shape must be"):
         ring.publish_observation(
             tick_id=0,
-            observations=np.zeros((1, 3), dtype=np.float32),
+            observations=torch.zeros((1, 3)),
+            dones=torch.zeros(1),
+        )
+    with pytest.raises(TypeError, match="observations and dones must be Torch tensors"):
+        ring.publish_observation(tick_id=0, observations=None, dones=torch.zeros(1))
+    with pytest.raises(TypeError, match="observations and dones must be Torch tensors"):
+        ring.publish_observation(
+            tick_id=0,
+            observations=np.zeros((1, 2), dtype=np.float32),
             dones=np.zeros(1, dtype=np.float32),
         )
-    with pytest.raises(TypeError, match="observations must be a NumPy array or Torch tensor"):
-        ring.publish_observation(tick_id=0, observations=None, dones=np.zeros(1))
     with pytest.raises(TypeError, match="observation destinations must be Torch tensors"):
         ring.copy_observation_to(
             tick_id=0,
