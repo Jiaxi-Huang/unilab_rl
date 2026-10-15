@@ -418,6 +418,56 @@ def test_cuda_ingress_publication_requires_completion_read_gate(
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+def test_cuda_ingress_accepts_sync_producer_without_receipt(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A producer declared synchronous emits no receipt; ingress must not wait.
+
+    ``require_completion_receipt=False`` is the buffer-side projection of the
+    env contract declaration ``produces_completion_receipts = False``: the
+    producer's step outputs are already ordered at return, so a missing
+    receipt is accepted and no read gate runs.
+    """
+    wait_calls: list[object] = []
+
+    def record_ingress_wait(completion, **kwargs) -> object:
+        wait_calls.append(completion)
+        return completion
+
+    monkeypatch.setattr(
+        "uni_rl.ipc.replay_buffer.wait_completion",
+        record_ingress_wait,
+    )
+    buf = ReplayBuffer(
+        capacity=16,
+        obs_dim=_OBS_DIM,
+        action_dim=_ACTION_DIM,
+        device="cuda",
+        ingress_slot_rows=4,
+        ingress_device="cuda",
+        require_completion_receipt=False,
+    )
+    try:
+        batch = tuple(tensor.to("cuda") for tensor in _random_batch(4))
+        assert buf.add(*batch) is True
+        # The only gate invocation observed a None receipt: no wait happened.
+        assert wait_calls == [None]
+        assert buf.last_completion is None
+        assert buf.completion_sequence == 0
+        assert buf.published_ptr == 4
+
+        ingress = buf.take_published_ingress()
+        assert ingress is not None
+        slot, start, count, packed = ingress
+        buf.commit_ingress(slot=slot, start=start, count=count)
+        assert (start, count) == (0, 4)
+        torch.testing.assert_close(packed[:, buf._obs_sl], batch[0])
+        torch.testing.assert_close(packed[:, buf._act_sl], batch[1])
+    finally:
+        buf.close()
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
 def test_cuda_add_batch_reuses_one_completion_gate_for_each_chunk(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

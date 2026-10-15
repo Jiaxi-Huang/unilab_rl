@@ -1544,6 +1544,7 @@ class DoubleBufferOffPolicyRunner(OffPolicyRunner):
             ingress_depth=self.replay_ingress_depth,
             ingress_device=self.device if gpu_centric_collector else "cpu",
             # CPU transport still owns a CUDA replay device and CPU ingress.
+            require_completion_receipt=self.produces_completion_receipts,
         )
         self._active_replay_buffer = replay_buffer
         self._shared_resources.append(replay_buffer)

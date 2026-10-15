@@ -40,11 +40,13 @@ class ReplayBuffer(SharedBufferBase):
         critic_dim: int = 0,
         ingress_depth: int = DEFAULT_INGRESS_DEPTH,
         ingress_device: str | torch.device = "cpu",
+        require_completion_receipt: bool = True,
     ):
         super().__init__(capacity, device, defer_gpu=True)
         self._obs_dim = obs_dim
         self._action_dim = action_dim
         self._critic_dim = critic_dim
+        self._require_completion_receipt = bool(require_completion_receipt)
         self.last_incremental_h2d_time_s = 0.0
         self.trace_recorder: Any | None = None
         self.trace_thread_time = False
@@ -582,9 +584,12 @@ class ReplayBuffer(SharedBufferBase):
                 self._publish_completion_metadata(completion)
             if self._ingress_device.type == "cuda":
                 # A CUDA slot is unreadable without a negotiated completion
-                # receipt. Fail closed instead of synchronizing the producer
-                # stream or publishing a race against the learner's copy.
-                if completion is None:
+                # receipt unless the producer explicitly declared synchronous
+                # no-receipt steps (uni_rl env contract
+                # ``produces_completion_receipts = False``). Fail closed
+                # instead of synchronizing the producer stream or publishing
+                # a race against the learner's copy.
+                if completion is None and self._require_completion_receipt:
                     raise RuntimeError(
                         "CUDA replay ingress publication requires a completion receipt"
                     )

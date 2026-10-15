@@ -29,6 +29,12 @@ Contract summary (tensor-native, autoresetting vectorized env):
   physics backend replays a CUDA graph) are collected through
   :func:`get_backend_runtime_diagnostics` on cold paths and published into
   the off-policy runtime manifest.
+- Optional completion-receipt semantics: an env whose synchronous producer
+  never publishes ``info["completion"]`` receipts declares
+  ``produces_completion_receipts = False`` (see
+  :func:`get_produces_completion_receipts`). Envs without the declaration are
+  treated as receipt producers, so CUDA replay ingress keeps failing closed
+  on a missing receipt; only an explicit synchronous declaration relaxes it.
 
 Because collectors run in ``multiprocessing`` spawn subprocesses, an
 ``EnvFactory`` must be picklable by reference — use a top-level function or
@@ -128,6 +134,23 @@ class SupportsBackendDiagnosticsProtocol(Protocol):
 
 
 @runtime_checkable
+class SupportsCompletionReceiptsProtocol(Protocol):
+    """Optional provider protocol: envs declare step completion-receipt semantics."""
+
+    @property
+    def produces_completion_receipts(self) -> bool:
+        """Whether every step publishes an event-backed completion receipt.
+
+        ``True`` for asynchronous event-backed producers whose
+        ``info["completion"]`` receipt gates consumer reads. ``False`` for
+        synchronous producers whose step outputs are already ordered at
+        return and never emit a receipt; consumers must accept a missing
+        receipt without waiting.
+        """
+        ...
+
+
+@runtime_checkable
 class EnvProtocol(Protocol):
     """Vectorized tensor env consumed by uni_rl runners and collectors."""
 
@@ -209,6 +232,25 @@ def get_backend_runtime_diagnostics(env: Any) -> Mapping[str, Any] | None:
     return None
 
 
+def get_produces_completion_receipts(env: Any) -> bool:
+    """Return whether the env publishes event-backed step completion receipts.
+
+    Cold paths only (runner dimension probes). Envs that do not implement
+    :class:`SupportsCompletionReceiptsProtocol` default to ``True`` — the
+    safe direction, where CUDA replay ingress fails closed on a missing
+    receipt. Only an env that explicitly declares synchronous no-receipt
+    steps gets the relaxed path.
+    """
+    if isinstance(env, SupportsCompletionReceiptsProtocol):
+        declared = env.produces_completion_receipts
+        if not isinstance(declared, bool):
+            raise TypeError(
+                f"produces_completion_receipts must be a bool, got {type(declared).__name__}"
+            )
+        return declared
+    return True
+
+
 __all__ = [
     "EnvAlgoCapabilities",
     "EnvAlgoCapabilitiesProtocol",
@@ -218,6 +260,8 @@ __all__ = [
     "EnvStateProtocol",
     "SupportsAlgoCapabilitiesProtocol",
     "SupportsBackendDiagnosticsProtocol",
+    "SupportsCompletionReceiptsProtocol",
     "get_algo_capabilities",
     "get_backend_runtime_diagnostics",
+    "get_produces_completion_receipts",
 ]
