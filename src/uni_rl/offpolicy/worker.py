@@ -326,6 +326,12 @@ def _run_collector(
     configured_backend_device = configure_backend_process_device(
         sim_backend, backend_device, bind_device=backend_device_binder
     )
+    # The collector consumes only Python `random` and NumPy RNG (host-side env
+    # physics/DR); inference is learner-owned, so no torch CPU/CUDA RNG is
+    # consumed on this path. Tensor-native collectors only copy env-provided
+    # CUDA obs into the ring (a deterministic copy), and mjwarp device
+    # randomness is Warp-owned via the backend device binding above — so
+    # skipping torch/CUDA seeding here remains correct.
     apply_training_seed(seed, torch_runtime=False, cuda=False)
 
     trace_recorder = None

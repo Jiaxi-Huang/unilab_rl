@@ -178,7 +178,7 @@ class InferencePlacement:
     ``staging_policy`` is one of ``cuda_no_host_boundary`` (CUDA transport),
     ``cpu_ring_explicit_learner_actor_h2d_action_d2h`` (CPU ring, CUDA learner),
     ``cpu_ring_explicit_learner_device_copy`` (CPU ring, non-CUDA accelerator
-    learner such as Apple Metal Performance Shaders / ``torch.mps``), or
+    learner such as ``torch.mps`` (Metal Performance Shaders)), or
     ``cpu_no_device_transfer`` (CPU ring, CPU learner).
     """
 
@@ -227,8 +227,8 @@ def cpu_ring_staging_policy(learner_device: str) -> str:
         return "cpu_no_device_transfer"
     if device_type == "cuda":
         return "cpu_ring_explicit_learner_actor_h2d_action_d2h"
-    # Other accelerators (e.g. Apple Metal Performance Shaders / torch.mps)
-    # still cross devices at the CPU-ring copy_ boundary.
+    # Other accelerators (e.g. torch.mps (Metal Performance Shaders)) still
+    # cross devices at the CPU-ring copy_ boundary.
     return "cpu_ring_explicit_learner_device_copy"
 
 

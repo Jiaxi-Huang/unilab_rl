@@ -448,7 +448,9 @@ class DoubleBufferOffPolicyRunner(OffPolicyRunner):
                 f"got {placement.ring_device!r}"
             )
         if placement.collector_tensor_native:
-            raise ValueError("CPU inference transport requires NumPy collector transitions")
+            raise ValueError(
+                "CPU inference transport requires non-tensor-native collector transitions"
+            )
         if torch.device(placement.env_device).type != "cpu":
             raise ValueError(
                 "CPU inference transport requires CPU env public tensors; "
@@ -1158,9 +1160,10 @@ class DoubleBufferOffPolicyRunner(OffPolicyRunner):
         if cuda_forward_events is not None:
             cuda_forward_events[1].record(torch.cuda.current_stream(device))
         elif device.type == "mps":
-            # MPS has no public timing-event equivalent.  Preserve the
-            # existing measurement boundary there; CUDA relies on the
-            # following blocking D2H copy and reads elapsed event time after it.
+            # torch.mps (Metal Performance Shaders) has no public timing-event
+            # equivalent.  Preserve the existing measurement boundary there;
+            # CUDA relies on the following blocking D2H copy and reads elapsed
+            # event time after it.
             torch.mps.synchronize()
         forward_end_ns = time.perf_counter_ns()
 
@@ -2174,9 +2177,10 @@ class DoubleBufferOffPolicyRunner(OffPolicyRunner):
                         torch.cuda.current_stream(device).synchronize()
                     elif device.type == "mps" and not phase_ordered_metrics:
                         torch.mps.synchronize()
-                    # MPS preserves same-queue ordering: the next inference's
-                    # action D2H waits behind optimizer/target updates, while
-                    # replay events govern ingress visibility and slot reuse.
+                    # torch.mps (Metal Performance Shaders) preserves
+                    # same-queue ordering: the next inference's action D2H
+                    # waits behind optimizer/target updates, while replay
+                    # events govern ingress visibility and slot reuse.
                     # A global synchronize here would only drain unrelated
                     # queued work and recreate a per-iteration GPU idle gap.
                     if trace_recorder:
