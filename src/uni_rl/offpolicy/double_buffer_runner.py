@@ -68,6 +68,7 @@ from uni_rl.utils.tensor_runtime import (
     InferencePlacement,
     InferenceTransport,
     TensorRuntimeSettings,
+    cpu_ring_staging_policy,
 )
 
 # Terminal/W&B display names for the off-policy algo types. Keep these
@@ -312,11 +313,7 @@ class DoubleBufferOffPolicyRunner(OffPolicyRunner):
                 staging_policy=(
                     "cuda_no_host_boundary"
                     if collector_tensor_native
-                    else (
-                        "cpu_ring_explicit_learner_actor_h2d_action_d2h"
-                        if torch.device(str(kwargs["device"])).type == "cuda"
-                        else "cpu_no_device_transfer"
-                    )
+                    else cpu_ring_staging_policy(str(kwargs["device"]))
                 ),
             )
             warnings.warn(
@@ -332,11 +329,7 @@ class DoubleBufferOffPolicyRunner(OffPolicyRunner):
                 ring_device="cpu",
                 learner_device=str(kwargs["device"]),
                 collector_tensor_native=False,
-                staging_policy=(
-                    "cpu_ring_explicit_learner_actor_h2d_action_d2h"
-                    if torch.device(str(kwargs["device"])).type == "cuda"
-                    else "cpu_no_device_transfer"
-                ),
+                staging_policy=cpu_ring_staging_policy(str(kwargs["device"])),
             )
         if not isinstance(inference_placement, InferencePlacement):
             raise TypeError(

@@ -173,7 +173,14 @@ class InferenceTransport(str, Enum):
 
 @dataclass(frozen=True)
 class InferencePlacement:
-    """Resolved collector/ring/env/learner placement before spawn."""
+    """Resolved collector/ring/env/learner placement before spawn.
+
+    ``staging_policy`` is one of ``cuda_no_host_boundary`` (CUDA transport),
+    ``cpu_ring_explicit_learner_actor_h2d_action_d2h`` (CPU ring, CUDA learner),
+    ``cpu_ring_explicit_learner_device_copy`` (CPU ring, non-CUDA accelerator
+    learner such as Apple Metal Performance Shaders / ``torch.mps``), or
+    ``cpu_no_device_transfer`` (CPU ring, CPU learner).
+    """
 
     mode: InferenceTransport
     env_device: str
@@ -213,6 +220,18 @@ def _device_requires_cuda(device: str) -> bool:
     return str(torch.device(device).type) == "cuda"
 
 
+def cpu_ring_staging_policy(learner_device: str) -> str:
+    """Return the CPU-ring staging policy for one canonical learner device."""
+    device_type = torch.device(learner_device).type
+    if device_type == "cpu":
+        return "cpu_no_device_transfer"
+    if device_type == "cuda":
+        return "cpu_ring_explicit_learner_actor_h2d_action_d2h"
+    # Other accelerators (e.g. Apple Metal Performance Shaders / torch.mps)
+    # still cross devices at the CPU-ring copy_ boundary.
+    return "cpu_ring_explicit_learner_device_copy"
+
+
 def resolve_inference_placement(
     *,
     learner_device: str,
@@ -228,7 +247,8 @@ def resolve_inference_placement(
     legacy Manager request for CUDA public tensors; combining it with CPU
     transport is incoherent and fails closed. The explicit
     ``tensor_runtime_device`` and legacy implicit ``learner_device`` requests
-    must also agree when both are present.
+    must also agree when both are present. CPU-transport staging policies are
+    selected by ``cpu_ring_staging_policy`` from the learner device type.
     """
     learner = _canonical_device(learner_device, label="learner device", algo_name=algo_name)
     if tensor_runtime_device is not None and not isinstance(tensor_runtime_device, str):
@@ -299,11 +319,7 @@ def resolve_inference_placement(
         ring_device="cpu",
         learner_device=learner,
         collector_tensor_native=False,
-        staging_policy=(
-            "cpu_ring_explicit_learner_actor_h2d_action_d2h"
-            if _device_requires_cuda(learner)
-            else "cpu_no_device_transfer"
-        ),
+        staging_policy=cpu_ring_staging_policy(learner),
     )
 
 
