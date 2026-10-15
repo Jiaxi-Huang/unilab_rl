@@ -25,7 +25,7 @@ from typing import Any, Dict, List, Tuple, cast
 
 import torch
 
-from uni_rl.ipc.graph_completion import wait_graph_completion
+from uni_rl.ipc.completion import wait_completion
 from uni_rl.ipc.replay_buffer import ReplayBuffer
 from uni_rl.ipc.replay_pipelines.base import ReplayTickMetadata
 from uni_rl.ipc.replay_pipelines.transfer import build_replay_transfer_backend
@@ -346,7 +346,7 @@ class GPUResidentReplayPipeline:
         with self._submission_lock:
             submitted = False
             while True:
-                self._replay_buffer.import_shared_graph_completion()
+                self._replay_buffer.import_ingress_publication()
                 ingress = self._replay_buffer.take_published_ingress()
                 if ingress is None:
                     return submitted
@@ -390,13 +390,13 @@ class GPUResidentReplayPipeline:
 
         if self._device.type == "cuda":
             with torch.cuda.device(self._device), torch.cuda.stream(self._sync_stream):
-                completion = self._replay_buffer.last_graph_completion
-                wait_graph_completion(
+                completion = self._replay_buffer.last_completion
+                wait_completion(
                     completion,
                     stream=self._sync_stream,
                     operation=completion.operation if completion is not None else "step",
-                    capture_id=self._replay_buffer.graph_capture_id,
-                    last_sequence=self._replay_buffer.graph_completion_sequence,
+                    producer_id=self._replay_buffer.completion_producer_id,
+                    last_sequence=self._replay_buffer.completion_sequence,
                 )
                 if record_cuda:
                     start_event = cast(Any, torch.cuda.Event(enable_timing=True))

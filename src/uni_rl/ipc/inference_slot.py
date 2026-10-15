@@ -131,8 +131,9 @@ class SharedInferenceSlot:
             raise ValueError("Learner action shape mismatch")
         with self._lock:
             self._require_state(_OBS_READY, tick_id, self._request_tick, "observation")
-            # A CPU slot is the legacy bridge for a NumPy collector while the
-            # learner may still own its actor on CUDA. Preserve that implicit
+            # A CPU slot returns NumPy actions that the tensor collector
+            # restages into a persistent host tensor, while the learner may
+            # still own its actor on CUDA. Preserve that implicit
             # synchronization boundary; CUDA IPC slots remain exact-device.
             if actions.device != self.actions.device and not (
                 self.device.type == "cpu" and actions.device.type == "cuda"

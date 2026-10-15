@@ -77,7 +77,7 @@ def test_completed_manifest_allows_null_backend_device() -> None:
     ("mutation", "message"),
     [
         (lambda manifest: manifest.pop("schema_version"), "schema_version must be an integer"),
-        (lambda manifest: manifest.update(schema_version=2), "unsupported runtime_manifest"),
+        (lambda manifest: manifest.update(schema_version=3), "unsupported runtime_manifest"),
         (
             lambda manifest: manifest.update(schema_version=True),
             "schema_version must be an integer",
@@ -221,92 +221,17 @@ def test_backend_diagnostics_rejects_non_mapping_section() -> None:
         validate_runtime_manifest(manifest, completed=True)
 
 
-def test_graph_lifecycle_section_fails_closed() -> None:
-    valid = {
-        "contract_version": 1,
-        "state": "ready",
-        "capture_id": "capture-a",
-        "replay_count": 2,
-        "fallback_count": 0,
-        "disable_reason": None,
-        "backend_diagnostics": {"requested": True, "enabled": True, "disable_reason": None},
-    }
+def test_previous_runtime_manifest_schema_is_rejected() -> None:
     manifest = _manifest()
-    manifest["graph_lifecycle"] = dict(valid)
-    validate_runtime_manifest(manifest, completed=True)
+    manifest["schema_version"] = 1
 
-    for mutation in (
-        lambda section: section.pop("contract_version"),
-        lambda section: section.update(contract_version=True),
-        lambda section: section.update(backend_diagnostics="cuda"),
-        lambda section: section.update(backend_diagnostics={"requested": True, "enabled": "true"}),
-        lambda section: section.pop("capture_id"),
-        lambda section: section.update(disable_reason="stale reason"),
-        lambda section: section.update(state="capturing"),
-        lambda section: section.update(replay_count=True),
-    ):
-        malformed = _manifest()
-        malformed["graph_lifecycle"] = {**valid}
-        mutation(malformed["graph_lifecycle"])
-        with pytest.raises(ValueError, match="graph_lifecycle"):
-            validate_runtime_manifest(malformed, completed=True)
-
-
-def test_collector_graph_section_fails_closed() -> None:
-    valid = {
-        "mode": "eager",
-        "requested": False,
-        "enabled": False,
-        "state": "eager",
-        "capture_id": None,
-        "invalidation_reason": None,
-        "disable_reason": "explicit eager collector execution",
-    }
-    manifest = _manifest()
-    manifest["collector_graph"] = dict(valid)
-    validate_runtime_manifest(manifest, completed=True)
-
-    for mutation, message in (
-        (lambda section: section.pop("mode"), "collector_graph.mode"),
-        (lambda section: section.update(mode="capture"), "collector_graph.mode"),
-        (lambda section: section.update(requested="false"), "requested/enabled"),
-        (lambda section: section.update(enabled=True), "requested READY graph"),
-        (lambda section: section.update(state="capturing"), "collector_graph.state"),
-        (lambda section: section.update(capture_id="capture-a"), "must not declare capture_id"),
-        (lambda section: section.update(disable_reason=None), "non-empty disable_reason"),
-        (
-            lambda section: section.update(invalidation_reason="capture_failed"),
-            "only an invalidated collector_graph",
-        ),
-        (
-            lambda section: section.update(invalidation_reason="unsupported"),
-            "invalidation_reason",
-        ),
-    ):
-        malformed = _manifest()
-        malformed["collector_graph"] = {**valid}
-        mutation(malformed["collector_graph"])
-        with pytest.raises(ValueError, match=message):
-            validate_runtime_manifest(malformed, completed=True)
-
-
-def test_collector_graph_ready_evidence_requires_capture_identity() -> None:
-    manifest = _manifest()
-    manifest["collector_graph"] = {
-        "mode": "graph",
-        "requested": True,
-        "enabled": True,
-        "state": "ready",
-        "capture_id": "collector-capture-a",
-        "invalidation_reason": None,
-        "disable_reason": None,
-    }
-    validate_runtime_manifest(manifest, completed=True)
+    with pytest.raises(ValueError, match="unsupported runtime_manifest"):
+        validate_runtime_manifest(manifest, completed=True)
 
 
 def test_metric_schema_version_is_separate_from_runtime_manifest_version() -> None:
     assert METRIC_SCHEMA_VERSION == 1
-    assert RUNTIME_MANIFEST_SCHEMA_VERSION == 1
+    assert RUNTIME_MANIFEST_SCHEMA_VERSION == 2
     assert METRIC_SCHEMA_VERSION != "1"
 
 
@@ -318,4 +243,4 @@ def test_logger_rejects_manifest_schema_version_changes(monkeypatch: pytest.Monk
     logger.update_runtime_manifest({"collector_tensor_native": True})
 
     with pytest.raises(ValueError, match="unsupported runtime_manifest.schema_version"):
-        logger.update_runtime_manifest({"schema_version": 2})
+        logger.update_runtime_manifest({"schema_version": 3})

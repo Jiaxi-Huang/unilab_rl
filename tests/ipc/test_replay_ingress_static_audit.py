@@ -1,4 +1,4 @@
-"""Static audit for replay ingress graph-candidate publication ordering."""
+"""Static audit for replay ingress publication ordering."""
 
 from __future__ import annotations
 

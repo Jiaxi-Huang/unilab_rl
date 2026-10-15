@@ -8,7 +8,7 @@ from functools import partial
 from typing import TYPE_CHECKING, Any
 
 import torch
-from omegaconf import DictConfig, OmegaConf
+from omegaconf import DictConfig
 
 from uni_rl.algos.flash_sac.learner import FlashSACLearner
 from uni_rl.algos.flash_sac.replay import AgeBiasedReplayPipeline
@@ -183,9 +183,6 @@ def build_flashsac_double_buffer_runner(
         backend_device_binder=backend_device_binder,
         inference_placement=inference_placement,
         tensor_runtime_settings=tensor_runtime_settings,
-        collector_graph_mode=str(
-            OmegaConf.select(cfg, "training.collector_graph", default="disabled")
-        ),
         log_interval=int(cfg.training.log_interval),
         replay_pipeline_factory=partial(
             AgeBiasedReplayPipeline,

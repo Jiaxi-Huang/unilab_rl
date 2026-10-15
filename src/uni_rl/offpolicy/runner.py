@@ -5,7 +5,7 @@ from __future__ import annotations
 from collections.abc import Iterable
 from typing import Any, Callable
 
-from uni_rl.algos.common.device import get_env_dims
+from uni_rl.algos.common.device import probe_env_contract
 from uni_rl.env_contract import EnvFactory
 from uni_rl.ipc.async_runner import AsyncRunner
 from uni_rl.logging import OffPolicyLogger
@@ -170,10 +170,17 @@ class OffPolicyRunner(AsyncRunner):
         import_actor_adapter_modules(self.actor_adapter_modules)
 
         apply_training_seed(self.seed, torch_runtime=True, cuda=True)
-        self.obs_dim, self.action_dim, self.critic_obs_dim = get_env_dims(
+        probe = probe_env_contract(
             self.env_factory,
             self.env_cfg_override,
         )
+        self.obs_dim = probe.obs_dim
+        self.action_dim = probe.action_dim
+        self.critic_obs_dim = probe.critic_obs_dim
+        # Producer-declared receipt semantics: synchronous producers that
+        # never emit receipts relax the CUDA ingress fail-closed gate; the
+        # undeclared default keeps requiring a receipt.
+        self.produces_completion_receipts = probe.produces_completion_receipts
 
     def _get_default_device(self) -> str:
         return get_default_device()

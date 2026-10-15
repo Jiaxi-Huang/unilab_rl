@@ -37,8 +37,10 @@ class OffPolicyActorAdapter:
             priv_info_torch) -> actions`` exploration sampling hook used by
             learner-side inference.
         resolve_priv_info: ``(obs_np, critic_np, info) -> priv_info_np | None``
-            hook that extracts the actor's privileged context from env
-            observations on the collector side.
+            NumPy-based hook that extracts the actor's privileged context from
+            env observations. The tensor-only collector fails closed at
+            startup when an adapter provides it; registering it is only
+            meaningful for external runtimes that own their own collector.
         actor_context_from_obs: ``(obs_device, obs_dim) -> context | None``
             hook that slices the packed learner-side inference observation into
             the actor's extra context (e.g. the privileged tail).

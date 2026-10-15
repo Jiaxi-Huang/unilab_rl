@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import numpy as np
+import pytest
 import torch
 from conftest import FakeVecEnv, _FakePlayCapabilities, _FakeSpace
 
@@ -12,7 +13,9 @@ from uni_rl.env_contract import (
     EnvProtocol,
     EnvStateProtocol,
     SupportsAlgoCapabilitiesProtocol,
+    SupportsCompletionReceiptsProtocol,
     get_algo_capabilities,
+    get_produces_completion_receipts,
 )
 
 
@@ -31,6 +34,35 @@ def test_get_algo_capabilities_default_when_env_does_not_provide():
     assert caps.action_low is None
     assert caps.action_high is None
     assert caps.joint_names is None
+
+
+def test_get_produces_completion_receipts_defaults_to_fail_closed():
+    env = _make_env()
+    assert not isinstance(env, SupportsCompletionReceiptsProtocol)
+    # Undeclared envs keep the safe direction: CUDA ingress requires a receipt.
+    assert get_produces_completion_receipts(env) is True
+
+
+def test_get_produces_completion_receipts_honors_sync_declaration():
+    class _SyncEnv:
+        produces_completion_receipts = False
+
+    class _AsyncEnv:
+        @property
+        def produces_completion_receipts(self):
+            return True
+
+    assert isinstance(_SyncEnv(), SupportsCompletionReceiptsProtocol)
+    assert get_produces_completion_receipts(_SyncEnv()) is False
+    assert get_produces_completion_receipts(_AsyncEnv()) is True
+
+
+def test_get_produces_completion_receipts_rejects_non_bool_declaration():
+    class _BadEnv:
+        produces_completion_receipts = "no"
+
+    with pytest.raises(TypeError, match="produces_completion_receipts"):
+        get_produces_completion_receipts(_BadEnv())
 
 
 def test_get_algo_capabilities_returns_provided_values():

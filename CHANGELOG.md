@@ -7,6 +7,77 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- `env_contract.SupportsCompletionReceiptsProtocol` and
+  `get_produces_completion_receipts()` (Motphys/UniLab#2363): envs may declare
+  `produces_completion_receipts: bool`. Envs that declare `False` (synchronous
+  producers that never emit step receipts, e.g. host-bridge backends) are
+  accepted at CUDA replay ingress without a receipt; undeclared envs default to
+  `True` (receipt required — fail-closed direction unchanged).
+
+### Removed
+
+- Shrunk the replay completion surface to the minimal async step-only event
+  contract (Motphys/UniLab#2363). `COMPLETION_OPERATIONS` is now step-only;
+  `selected_reset`/`mask_reset` (and any other removed operation) receipts are
+  rejected fail-closed. The `stream_id` receipt field and the
+  `CompletionTokenProtocol.ipc_handle` transport hook are deleted, and the
+  generic backend-token IPC reconstruction (`import_shared_completion`,
+  `EventCompletion.ipc_handle`) is removed. The shared-memory completion
+  metadata now carries only the replay-owned ingress publication event handle
+  plus `contract_version`/`sequence`/`producer_id` for validation; the learner
+  imports and waits that replay-owned event (`ReplayBuffer.import_ingress_publication`,
+  replacing `import_shared_completion`) before its H2D span copies. Read-before-copy
+  gating, the replay-owned publication event recorded after ingress writes,
+  stale-sequence rejection, producer/operation binding, and fail-closed CUDA
+  ingress without a receipt are unchanged. `COMPLETION_CONTRACT_VERSION` is
+  bumped to 3 to track the unisim completion-token contract v3 (token fields are
+  exactly `contract_version`/`operation`/`sequence`/`producer_id`, step-only);
+  v2 receipts fail closed.
+
+- Removed the NumPy observation runtime from the off-policy collector with no
+  compatibility layer (#119). Collector initialization now fails closed with a
+  `TypeError` unless the actor (`obs`) and critic observation groups are Torch
+  tensors; the `tensor_collector` branch, the NumPy
+  observation/critic/reward/done/truncation transition carriers, the
+  `torch.from_numpy` replay bridge, `_collector_action_numpy`,
+  `resolve_offpolicy_actor_priv_info`, and the NumPy terminal-observation
+  contract helper (`uni_rl.utils.final_observation`) are removed. The
+  collector runtime manifest no longer reports a `tensor_native_env` mode.
+  CPU inference rings may still return NumPy actions, which are staged into a
+  persistent Torch tensor before `TorchEnv.step()`; privileged actor adapters
+  (`resolve_priv_info`) fail closed at collector startup.
+
+## [2.0.0] - 2026-10-15
+
+### Removed
+
+- Removed the collector graph protocol, configuration, runner state, public
+  lifecycle manifest, and whole-collector completion operation with no
+  compatibility path (Motphys/UniLab#2358 and Motphys/UniLab#2359). Replay ingress now uses
+  the neutral v2 completion contract: `CompletionTokenProtocol`,
+  `wait_completion`, `import_shared_completion`, top-level env `completion`
+  receipts, `producer_id`, and publication-sequence metadata. Backend physics
+  graphs and FlashSAC learner CUDA graphs are unchanged. Runtime manifests use
+  schema version 2 so v1 collector-graph manifests fail closed.
+
+### Fixed
+
+- Replay ingress now validates and waits for the producer completion before
+  its first transition-source read or copy, instead of enqueueing the wait
+  after the ingress copies. Unexpected CUDA IPC handle export failures also
+  fail closed rather than silently marking receipt metadata unavailable.
+- Replay publication now accepts any validated structural completion-v2
+  producer receipt, rather than requiring a `uni_rl` concrete token class, and
+  localizes the waited metadata at the ingress publication boundary.
+- Off-policy collectors previously preserved the pre-action observation and
+  critic sources in persistent staging carriers so autoreset could not
+  overwrite `obs[t]` before replay published transition `t`. After the
+  env-side observation-ownership fix (UniLab #2362), public observation
+  tensors are caller-owned, so this collector-side staging workaround has
+  been removed again; replay now receives the env-provided tensors directly.
+
 ## [1.4.14] - 2026-10-14
 
 ### Added

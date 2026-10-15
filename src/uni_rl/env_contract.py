@@ -29,6 +29,12 @@ Contract summary (tensor-native, autoresetting vectorized env):
   physics backend replays a CUDA graph) are collected through
   :func:`get_backend_runtime_diagnostics` on cold paths and published into
   the off-policy runtime manifest.
+- Optional completion-receipt semantics: an env whose synchronous producer
+  never publishes ``info["completion"]`` receipts declares
+  ``produces_completion_receipts = False`` (see
+  :func:`get_produces_completion_receipts`). Envs without the declaration are
+  treated as receipt producers, so CUDA replay ingress keeps failing closed
+  on a missing receipt; only an explicit synchronous declaration relaxes it.
 
 Because collectors run in ``multiprocessing`` spawn subprocesses, an
 ``EnvFactory`` must be picklable by reference — use a top-level function or
@@ -128,81 +134,20 @@ class SupportsBackendDiagnosticsProtocol(Protocol):
 
 
 @runtime_checkable
-class SupportsCollectorGraphModeProtocol(Protocol):
-    """Optional provider protocol: envs negotiate collector graph execution.
+class SupportsCompletionReceiptsProtocol(Protocol):
+    """Optional provider protocol: envs declare step completion-receipt semantics."""
 
-    This is a cold-path owner contract. A collector may request a mode after
-    env initialization and before its first control tick; it must never call
-    the negotiation method inside ``step``/``reset``. ``disabled`` and
-    ``eager`` are independent explicit modes: backend physics graph state, or
-    a backend ``UNAVAILABLE`` graph lifecycle, must never be interpreted as
-    collector mode selection.
-    """
+    @property
+    def produces_completion_receipts(self) -> bool:
+        """Whether every step publishes an event-backed completion receipt.
 
-    def configure_collector_graph(
-        self,
-        mode: str,
-        *,
-        allow_eager_fallback: bool = False,
-    ) -> None:
-        """Negotiate ``disabled``, ``eager``, or ``graph`` execution.
-
-        Unsupported graph negotiation fails closed by default. If the owner
-        explicitly allows fallback, the returned manifest alone records the
-        eager mode, reason, and fallback count.
+        ``True`` for asynchronous event-backed producers whose
+        ``info["completion"]`` receipt gates consumer reads. ``False`` for
+        synchronous producers whose step outputs are already ordered at
+        return and never emit a receipt; consumers must accept a missing
+        receipt without waiting.
         """
         ...
-
-    def get_collector_graph_manifest(self) -> Mapping[str, Any]:
-        """Return requested/enabled/state/reason/counter evidence."""
-        ...
-
-
-@dataclass(frozen=True)
-class CollectorGraphNegotiation:
-    """Result of the neutral collector mode negotiation."""
-
-    mode: str = "disabled"
-    manifest: Mapping[str, Any] | None = None
-
-
-COLLECTOR_GRAPH_MODES = frozenset({"disabled", "eager", "graph"})
-
-
-def negotiate_collector_graph(
-    env: Any,
-    mode: str,
-    *,
-    allow_eager_fallback: bool = False,
-) -> CollectorGraphNegotiation:
-    """Negotiate collector execution through the optional env protocol.
-
-    All modes fail closed when an env does not implement the public protocol;
-    there is no implicit graph/eager inference from backend state. The call is
-    cold-path only and returns a JSON-safe manifest snapshot.
-    """
-    if not isinstance(mode, str):
-        raise TypeError(f"collector graph mode must be a string, got {type(mode).__name__}")
-    normalized = mode.strip().lower()
-    if normalized not in COLLECTOR_GRAPH_MODES:
-        choices = ", ".join(sorted(COLLECTOR_GRAPH_MODES))
-        raise ValueError(f"collector graph mode must be one of {choices}; got {mode!r}")
-    provider = env if isinstance(env, SupportsCollectorGraphModeProtocol) else None
-    if provider is None:
-        if normalized == "disabled":
-            return CollectorGraphNegotiation(mode="disabled")
-        raise NotImplementedError("env does not implement the public collector graph mode protocol")
-    provider.configure_collector_graph(
-        normalized,
-        allow_eager_fallback=allow_eager_fallback,
-    )
-    manifest = provider.get_collector_graph_manifest()
-    if not isinstance(manifest, Mapping):
-        raise TypeError("collector graph manifest must be a mapping")
-    negotiated = str(manifest.get("mode", normalized))
-    if negotiated not in COLLECTOR_GRAPH_MODES:
-        raise ValueError(f"env returned unsupported collector graph mode {negotiated!r}")
-    return CollectorGraphNegotiation(mode=negotiated, manifest=manifest)
 
 
 @runtime_checkable
@@ -287,6 +232,25 @@ def get_backend_runtime_diagnostics(env: Any) -> Mapping[str, Any] | None:
     return None
 
 
+def get_produces_completion_receipts(env: Any) -> bool:
+    """Return whether the env publishes event-backed step completion receipts.
+
+    Cold paths only (runner dimension probes). Envs that do not implement
+    :class:`SupportsCompletionReceiptsProtocol` default to ``True`` — the
+    safe direction, where CUDA replay ingress fails closed on a missing
+    receipt. Only an env that explicitly declares synchronous no-receipt
+    steps gets the relaxed path.
+    """
+    if isinstance(env, SupportsCompletionReceiptsProtocol):
+        declared = env.produces_completion_receipts
+        if not isinstance(declared, bool):
+            raise TypeError(
+                f"produces_completion_receipts must be a bool, got {type(declared).__name__}"
+            )
+        return declared
+    return True
+
+
 __all__ = [
     "EnvAlgoCapabilities",
     "EnvAlgoCapabilitiesProtocol",
@@ -294,12 +258,10 @@ __all__ = [
     "EnvPlayCapabilitiesProtocol",
     "EnvProtocol",
     "EnvStateProtocol",
-    "COLLECTOR_GRAPH_MODES",
-    "CollectorGraphNegotiation",
     "SupportsAlgoCapabilitiesProtocol",
     "SupportsBackendDiagnosticsProtocol",
-    "SupportsCollectorGraphModeProtocol",
+    "SupportsCompletionReceiptsProtocol",
     "get_algo_capabilities",
     "get_backend_runtime_diagnostics",
-    "negotiate_collector_graph",
+    "get_produces_completion_receipts",
 ]

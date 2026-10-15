@@ -12,7 +12,7 @@ import math
 from collections.abc import Mapping
 from typing import Any
 
-RUNTIME_MANIFEST_SCHEMA_VERSION = 1
+RUNTIME_MANIFEST_SCHEMA_VERSION = 2
 
 _STABLE_NONNEGATIVE_INT_FIELDS = (
     ("inference_flight", "queue_depth"),
@@ -32,13 +32,6 @@ _STABLE_NONNEGATIVE_INT_FIELDS = (
     ("replay_ingress", "stop_returns"),
     ("inference_memory_budget", "ipc_event_count"),
 )
-_GRAPH_LIFECYCLE_NONNEGATIVE_INT_FIELDS = (("graph_lifecycle", "contract_version"),)
-_GRAPH_LIFECYCLE_STATES = frozenset({"unavailable", "ready", "invalidated"})
-_COLLECTOR_GRAPH_MODES = frozenset({"disabled", "eager", "graph"})
-_COLLECTOR_GRAPH_STATES = frozenset({"unavailable", "eager", "ready", "invalidated"})
-_COLLECTOR_GRAPH_INVALIDATION_REASONS = frozenset(
-    {"model", "data", "view", "capacity", "policy_io", "stream_event", "capture_failed"}
-)
 _COMPLETED_REQUIRED_SECTIONS = (
     "inference_flight",
     "replay_ingress",
@@ -50,10 +43,10 @@ def validate_runtime_manifest(
     *,
     completed: bool = False,
 ) -> None:
-    """Validate the stable v1 contract without constraining diagnostics.
+    """Validate the stable v2 contract without constraining diagnostics.
 
     Fields not declared here remain producer diagnostics and carry no cross-run
-    compatibility promise.  ``shutdown`` is intentionally opaque in v1.  A
+    compatibility promise.  ``shutdown`` is intentionally opaque in v2.  A
     missing stable lifecycle section is allowed only for early failure
     summaries; pass ``completed=True`` for normal final summaries.
     """
@@ -112,8 +105,6 @@ def validate_runtime_manifest(
             )
 
     _validate_backend_diagnostics(manifest)
-    _validate_graph_lifecycle(manifest)
-    _validate_collector_graph(manifest)
 
 
 def _validate_backend_diagnostics(manifest: Mapping[str, Any]) -> None:
@@ -171,118 +162,6 @@ def _validate_backend_diagnostics(manifest: Mapping[str, Any]) -> None:
             isinstance(disable_reason, str) and disable_reason.strip()
         ):
             raise ValueError(f"{label} is disabled and must declare a disable reason")
-
-
-def _validate_graph_lifecycle(manifest: Mapping[str, Any]) -> None:
-    """Validate the optional graph lifecycle producer section."""
-    section = manifest.get("graph_lifecycle")
-    if section is None:
-        return
-    if not isinstance(section, Mapping):
-        raise ValueError("runtime_manifest.graph_lifecycle must be a mapping")
-    for section_name, field_name in _GRAPH_LIFECYCLE_NONNEGATIVE_INT_FIELDS:
-        value = section.get(field_name)
-        if value is None:
-            raise ValueError(f"runtime_manifest.{section_name}.{field_name} is required")
-        _require_nonnegative_int(
-            value,
-            f"runtime_manifest.{section_name}.{field_name}",
-        )
-    for field_name in ("replay_count", "fallback_count"):
-        value = section.get(field_name)
-        if value is not None:
-            _require_nonnegative_int(
-                value,
-                f"runtime_manifest.graph_lifecycle.{field_name}",
-            )
-    state = section.get("state")
-    if state is not None and state not in _GRAPH_LIFECYCLE_STATES:
-        raise ValueError(
-            "runtime_manifest.graph_lifecycle.state must be "
-            f"one of {sorted(_GRAPH_LIFECYCLE_STATES)}"
-        )
-    if state == "ready":
-        capture_id = section.get("capture_id")
-        if not isinstance(capture_id, str) or not capture_id.strip():
-            raise ValueError(
-                "runtime_manifest.graph_lifecycle.capture_id is required when state is ready"
-            )
-        if section.get("disable_reason") is not None:
-            raise ValueError(
-                "runtime_manifest.graph_lifecycle.disable_reason must be null when state is ready"
-            )
-    elif state is not None and not (
-        isinstance(section.get("disable_reason"), str) and section["disable_reason"].strip()
-    ):
-        raise ValueError(
-            "runtime_manifest.graph_lifecycle.disable_reason is required when state is not ready"
-        )
-    entry = section.get("backend_diagnostics")
-    if entry is not None:
-        if not isinstance(entry, Mapping):
-            raise ValueError(
-                "runtime_manifest.graph_lifecycle.backend_diagnostics must be a mapping or null"
-            )
-        for field in ("requested", "enabled"):
-            if not isinstance(entry.get(field), bool):
-                raise ValueError(
-                    f"runtime_manifest.graph_lifecycle.backend_diagnostics.{field} must be a bool"
-                )
-
-
-def _validate_collector_graph(manifest: Mapping[str, Any]) -> None:
-    """Validate the optional owner-controlled collector execution section."""
-    section = manifest.get("collector_graph")
-    if section is None:
-        return
-    if not isinstance(section, Mapping):
-        raise ValueError("runtime_manifest.collector_graph must be a mapping")
-    mode = section.get("mode")
-    if mode not in _COLLECTOR_GRAPH_MODES:
-        raise ValueError(
-            f"runtime_manifest.collector_graph.mode must be one of {sorted(_COLLECTOR_GRAPH_MODES)}"
-        )
-    requested = section.get("requested")
-    enabled = section.get("enabled")
-    if not isinstance(requested, bool) or not isinstance(enabled, bool):
-        raise ValueError("runtime_manifest.collector_graph requested/enabled must be bools")
-    state = section.get("state")
-    if state is not None and state not in _COLLECTOR_GRAPH_STATES:
-        raise ValueError(
-            "runtime_manifest.collector_graph.state must be "
-            f"one of {sorted(_COLLECTOR_GRAPH_STATES)}"
-        )
-    capture_id = section.get("capture_id")
-    reason = section.get("disable_reason")
-    invalidation_reason = section.get("invalidation_reason")
-    if invalidation_reason is not None and (
-        not isinstance(invalidation_reason, str)
-        or invalidation_reason not in _COLLECTOR_GRAPH_INVALIDATION_REASONS
-    ):
-        raise ValueError(
-            "runtime_manifest.collector_graph.invalidation_reason must be one of "
-            f"{sorted(_COLLECTOR_GRAPH_INVALIDATION_REASONS)} or null"
-        )
-    if enabled:
-        if mode != "graph" or not requested or state != "ready":
-            raise ValueError("an enabled collector_graph must be requested READY graph mode")
-        if not isinstance(capture_id, str) or not capture_id.strip():
-            raise ValueError("an enabled collector_graph requires a non-empty capture_id")
-        if reason is not None:
-            raise ValueError("an enabled collector_graph must not declare disable_reason")
-        if invalidation_reason is not None:
-            raise ValueError("an enabled collector_graph must not declare invalidation_reason")
-    elif state is not None:
-        if capture_id is not None:
-            raise ValueError("a disabled collector_graph must not declare capture_id")
-        if not isinstance(reason, str) or not reason.strip():
-            raise ValueError("a disabled collector_graph requires a non-empty disable_reason")
-        if state == "invalidated" and invalidation_reason is None:
-            raise ValueError("an invalidated collector_graph requires invalidation_reason")
-        if state != "invalidated" and invalidation_reason is not None:
-            raise ValueError("only an invalidated collector_graph may declare invalidation_reason")
-    elif not isinstance(reason, str) or not reason.strip():
-        raise ValueError("runtime_manifest.collector_graph.disable_reason is required")
 
 
 def _validate_positive_int(

@@ -13,7 +13,6 @@ from uni_rl.env_contract import (
     EnvFactory,
     get_algo_capabilities,
     get_backend_runtime_diagnostics,
-    negotiate_collector_graph,
 )
 from uni_rl.offpolicy.actor_adapter import get_offpolicy_actor_adapter, import_actor_adapter_modules
 from uni_rl.offpolicy.coordination import (
@@ -24,7 +23,6 @@ from uni_rl.offpolicy.coordination import (
 from uni_rl.offpolicy.tensor_metrics import TensorCollectorMetrics, TensorMetricFlush
 from uni_rl.offpolicy.thread_budget import apply_torch_thread_runtime
 from uni_rl.utils.device import configure_backend_process_device
-from uni_rl.utils.final_observation import resolve_terminal_observation_contract
 from uni_rl.utils.observations import split_obs_dict
 from uni_rl.utils.seed import apply_training_seed
 
@@ -92,20 +90,6 @@ def sample_offpolicy_actions(
         "register_offpolicy_actor_adapter() or list their registration module in "
         "actor_adapter_modules."
     )
-
-
-def resolve_offpolicy_actor_priv_info(
-    *,
-    algo_type: str,
-    obs_np: np.ndarray,
-    critic_np: np.ndarray,
-    info: dict | None,
-) -> np.ndarray | None:
-    """Resolve optional actor context for privileged off-policy actors."""
-    adapter = get_offpolicy_actor_adapter(algo_type)
-    if adapter is None or adapter.resolve_priv_info is None:
-        return None
-    return adapter.resolve_priv_info(obs_np, critic_np, info)
 
 
 def _record_timing_ms(timing_accum_ms, timing_counts, key: str, value: float) -> None:
@@ -227,13 +211,6 @@ def _wait_for_inference_tick(
     return False
 
 
-def _collector_action_numpy(actions: np.ndarray | torch.Tensor) -> np.ndarray:
-    """Return the legacy NumPy action contract for CPU collectors."""
-    if isinstance(actions, torch.Tensor):
-        return actions.detach().cpu().numpy()
-    return np.asarray(actions, dtype=np.float32)
-
-
 def _merge_reward_component_means(
     left: dict[str, float] | None,
     right: dict[str, float] | None,
@@ -253,22 +230,6 @@ def _merge_reward_component_means(
         / max(total, 1)
         for key in left.keys() | right.keys()
     }
-
-
-def _graph_lifecycle_manifest(env: Any) -> dict[str, Any]:
-    """Snapshot optional graph lifecycle evidence without backend probing."""
-    diagnostics = get_backend_runtime_diagnostics(env)
-    entry = None
-    if diagnostics is not None:
-        entries = diagnostics.get("diagnostics")
-        if isinstance(entries, dict):
-            entry = entries.get("cuda_graph")
-    snapshot = getattr(env, "get_graph_lifecycle_manifest", None)
-    if callable(snapshot):
-        values = snapshot()
-        if isinstance(values, dict):
-            return {str(key): value for key, value in values.items()}
-    return {"contract_version": 1, "backend_diagnostics": entry}
 
 
 def off_policy_collector_fn(
@@ -297,7 +258,6 @@ def off_policy_collector_fn(
     backend_device_binder=None,
     learner_coordination: LearnerCoordinationState | None = None,
     learner_pid: int | None = None,
-    collector_graph_mode: str = "disabled",
 ):
     """Entry point for the off-policy collector subprocess.
 
@@ -330,7 +290,6 @@ def off_policy_collector_fn(
         backend_device_binder=backend_device_binder,
         learner_coordination=learner_coordination,
         learner_pid=learner_pid,
-        collector_graph_mode=collector_graph_mode,
     )
 
 
@@ -360,7 +319,6 @@ def _run_collector(
     backend_device_binder=None,
     learner_coordination=None,
     learner_pid=None,
-    collector_graph_mode="disabled",
 ):
     # Spawn subprocesses do not inherit the parent's adapter registrations;
     # import the configured modules so registration side effects run here too.
@@ -388,11 +346,6 @@ def _run_collector(
         )
     if "inference_transport" in (env_cfg_override or {}):
         raise ValueError("Collector env override must not set inference_transport")
-    collector_graph_negotiation = negotiate_collector_graph(
-        env,
-        collector_graph_mode,
-        allow_eager_fallback=True,
-    )
     tensor_runtime_requested = requested_transport == "cuda"
     if tensor_runtime_requested:
         if inference_slot is None or inference_slot.device.type != "cuda":
@@ -433,44 +386,49 @@ def _run_collector(
     ep_lengths: deque[int] = deque(maxlen=100)
     state = env.state
     assert state is not None
-    tensor_collector = isinstance(state.obs.get("obs"), torch.Tensor)
+    # Fail closed on the observation contract: the collector runtime is
+    # tensor-only. NumPy environment observations are never converted or
+    # carried through the collector; NumPy remains valid only at explicit
+    # non-environment boundaries (host diagnostics, serialization, tests).
     actor_observation = state.obs.get("obs")
-    observed_env_device = (
-        actor_observation.device
-        if isinstance(actor_observation, torch.Tensor)
-        else torch.device("cpu")
-    )
+    critic_observation = state.obs.get("critic", actor_observation)
+    if not isinstance(actor_observation, torch.Tensor) or not isinstance(
+        critic_observation, torch.Tensor
+    ):
+        raise TypeError(
+            "Off-policy collector requires Torch tensor observations for the "
+            "actor and critic observation groups; NumPy environment "
+            "observations are not a supported collector runtime "
+            f"(obs={type(actor_observation).__name__}, "
+            f"critic={type(critic_observation).__name__})"
+        )
+    observed_env_device = actor_observation.device
     inference_ring_device = (
         inference_slot.device if inference_slot is not None else torch.device("cpu")
     )
     if tensor_runtime_requested:
-        if not tensor_collector:
-            raise ValueError(
-                "CUDA inference transport requires tensor observations from the "
-                f"environment; env={observed_env_device}, ring={inference_ring_device}"
-            )
         if observed_env_device != inference_ring_device:
             raise ValueError(
                 "CUDA inference transport requires env observations on the ring device: "
                 f"env={observed_env_device}, ring={inference_ring_device}"
             )
-    elif requested_transport == "cpu" and tensor_collector and observed_env_device.type == "cuda":
+    elif requested_transport == "cpu" and observed_env_device.type == "cuda":
         raise ValueError(
             "CPU inference transport received CUDA tensor observations from the "
             f"environment; env={observed_env_device}, ring={inference_ring_device}"
         )
-    current_ep_rewards = np.zeros(num_envs, dtype=np.float32)
-    current_ep_lengths = np.zeros(num_envs, dtype=np.int32)
-    reward_component_names = get_algo_capabilities(env).reward_component_names or ()
-    tensor_metrics = (
-        TensorCollectorMetrics(
-            num_envs,
-            interval=collector_metrics_interval,
-            device=state.obs["obs"].device,
-            reward_component_names=reward_component_names,
+    adapter = get_offpolicy_actor_adapter(algo_type)
+    if adapter is not None and adapter.resolve_priv_info is not None:
+        raise ValueError(
+            "The tensor-only off-policy collector does not support privileged "
+            "actor adapters (resolve_priv_info)"
         )
-        if tensor_collector
-        else None
+    reward_component_names = get_algo_capabilities(env).reward_component_names or ()
+    tensor_metrics: TensorCollectorMetrics | None = TensorCollectorMetrics(
+        num_envs,
+        interval=collector_metrics_interval,
+        device=actor_observation.device,
+        reward_component_names=reward_component_names,
     )
 
     ep_reward_components = defaultdict(list)
@@ -635,8 +593,6 @@ def _run_collector(
     action_host: torch.Tensor | None = None
     obs_t: torch.Tensor | None = None
     critic_t: torch.Tensor | None = None
-    obs_np: np.ndarray | None = None
-    critic_np: np.ndarray | None = None
     next_obs_t: torch.Tensor | None = None
     next_critic_t: torch.Tensor | None = None
     rewards_t: torch.Tensor | None = None
@@ -645,21 +601,10 @@ def _run_collector(
     done_mask_t: torch.Tensor | None = None
     terminal_obs_t: torch.Tensor | None = None
     terminal_critic_t: torch.Tensor | None = None
-    next_obs_np: np.ndarray | None = None
-    next_critic_np: np.ndarray | None = None
-    rewards_np: np.ndarray | None = None
-    truncated_np: np.ndarray | None = None
-    combined_dones: np.ndarray | None = None
-    terminal_contract: Any | None = None
-    if tensor_collector:
-        obs_t, critic_t = cast(tuple[torch.Tensor, torch.Tensor], split_obs_dict(state.obs))
-    else:
-        obs_np, critic_np = split_obs_dict(state.obs)
-        obs_np = np.asarray(obs_np, dtype=np.float32)
-        critic_np = np.asarray(critic_np, dtype=np.float32)
-    info_dict = state.info
-    prev_dones_np = np.zeros(num_envs, dtype=np.float32)
-    prev_dones_t = torch.zeros(num_envs, dtype=torch.float32, device=state.obs["obs"].device)
+    obs_t, critic_t = split_obs_dict(state.obs)
+    assert obs_t is not None
+    assert critic_t is not None
+    prev_dones_t = torch.zeros(num_envs, dtype=torch.float32, device=actor_observation.device)
     import time as _time
 
     backend_diagnostics = get_backend_runtime_diagnostics(env)
@@ -676,21 +621,12 @@ def _run_collector(
         "collector_accelerator_context": configured_backend_device is not None,
         "collector_backend_device": configured_backend_device,
         "cuda_context_initialized": bool(torch.cuda.is_initialized()),
-        "tensor_native_env": tensor_collector,
         "inference_slot_device": getattr(inference_slot, "device", torch.device("cpu")),
         "inference_queue_capacity": int(getattr(inference_slot, "capacity", 0)),
         "inference_scheduling_policy": INFERENCE_SCHEDULING_POLICY,
         "inference_legal_max_in_flight": 1,
         "inference_dependency_graph": dict(INFERENCE_DEPENDENCY_GRAPH),
         "backend_diagnostics": dict(backend_diagnostics),
-        "graph_lifecycle": _graph_lifecycle_manifest(env),
-        "collector_graph": collector_graph_negotiation.manifest
-        or {
-            "mode": collector_graph_negotiation.mode,
-            "requested": False,
-            "enabled": False,
-            "disable_reason": "env does not implement the public collector graph mode protocol",
-        },
     }
     if trace_recorder:
         manifest_ns = _time.perf_counter_ns()
@@ -720,40 +656,15 @@ def _run_collector(
         while not stop_event.is_set():
             cycle_timing_ms: dict[str, float] = dict.fromkeys(COLLECTOR_TIMING_KEYS, 0.0)
             phase_start_ns = _time.perf_counter_ns()
-            actor_input_t: torch.Tensor | None = None
-            actor_input_np: np.ndarray | None = None
-
-            if tensor_collector:
-                assert obs_t is not None
-                adapter = get_offpolicy_actor_adapter(algo_type)
-                if adapter is not None and adapter.resolve_priv_info is not None:
-                    raise ValueError(
-                        "Tensor-native FlashSAC collector does not support privileged actor adapters"
-                    )
-                actor_input_t = obs_t
-            else:
-                assert obs_np is not None
-                assert critic_np is not None
-                actor_context_np = resolve_offpolicy_actor_priv_info(
-                    algo_type=algo_type,
-                    obs_np=obs_np,
-                    critic_np=critic_np,
-                    info=info_dict,
-                )
-                actor_input_np = (
-                    np.concatenate((obs_np, actor_context_np), axis=1)
-                    if actor_context_np is not None
-                    else obs_np
-                )
+            assert obs_t is not None
+            actor_input = obs_t
             request_ns = _time.perf_counter_ns()
-            actor_input = actor_input_t if tensor_collector else actor_input_np
-            assert actor_input is not None
             observation_published = False
             while not stop_event.is_set():
                 observation_published = inference_slot.try_publish_observation(
                     tick_id=inference_tick,
                     observations=actor_input,
-                    dones=prev_dones_t if tensor_collector else prev_dones_np,
+                    dones=prev_dones_t,
                     epoch=inference_epoch,
                     timeout_sec=0.1,
                 )
@@ -817,7 +728,6 @@ def _run_collector(
                 inference_in_flight,
                 publication_lag,
             ) = _inference_flight_metrics(inference_slot)
-            actions_np = None if tensor_collector else _collector_action_numpy(actions)
             if trace_recorder:
                 trace_recorder.add_slice(
                     "collector/wait_for_learner_action",
@@ -840,14 +750,14 @@ def _run_collector(
             # inference ring is CPU. Reuse one persistent host staging tensor
             # for this explicit ring->env boundary rather than allocating or
             # silently converting inside the env.
-            if tensor_collector and isinstance(actions, np.ndarray):
+            if isinstance(actions, np.ndarray):
                 if action_host is None:
                     action_host = torch.empty(
                         actions.shape, dtype=torch.float32, device=torch.device("cpu")
                     )
                 action_host.copy_(torch.from_numpy(np.ascontiguousarray(actions, dtype=np.float32)))
                 actions = action_host
-            state = env.step(actions if tensor_collector else actions_np)
+            state = env.step(actions)
             if trace_recorder:
                 trace_recorder.add_slice(
                     "collector/env_step",
@@ -859,78 +769,34 @@ def _run_collector(
             phase_start_ns = _record_phase_ms(cycle_timing_ms, "env_step_ms", phase_start_ns)
             cycle_timing_ms.update(extract_env_step_breakdown_timing_ms(state.info))
 
-            # Extract data as numpy
-            if tensor_collector:
-                assert obs_t is not None
-                assert critic_t is not None
-                next_obs_t, next_critic_t = cast(
-                    tuple[torch.Tensor, torch.Tensor], split_obs_dict(state.obs)
-                )
-                rewards_t = state.reward.to(dtype=torch.float32).ravel()
-                truncated_t = state.truncated.to(dtype=torch.float32).ravel()
-                combined_dones_t = (state.terminated | state.truncated).to(dtype=torch.float32)
-                assert rewards_t is not None
-                assert truncated_t is not None
-                assert combined_dones_t is not None
-                prev_dones_t = combined_dones_t
-                done_mask_t = combined_dones_t > 0.5
-                assert tensor_metrics is not None
-                reward_components_t = state.info.get("reward_components")
-                tensor_metrics.update(
-                    rewards_t,
-                    done_mask_t,
-                    truncated_t > 0.5,
-                    reward_components=reward_components_t,
-                )
-                terminal_final = state.final_observation
-                if terminal_final is not None:
-                    terminal_obs_t = terminal_final.get("obs")
-                    terminal_critic_t = terminal_final.get("critic")
-                else:
-                    terminal_obs_t = None
-                    terminal_critic_t = None
+            # Extract transition tensors
+            next_obs_t, next_critic_t = split_obs_dict(state.obs)
+            rewards_t = state.reward.to(dtype=torch.float32).ravel()
+            truncated_t = state.truncated.to(dtype=torch.float32).ravel()
+            combined_dones_t = (state.terminated | state.truncated).to(dtype=torch.float32)
+            assert next_obs_t is not None
+            assert next_critic_t is not None
+            assert rewards_t is not None
+            assert truncated_t is not None
+            assert combined_dones_t is not None
+            prev_dones_t = combined_dones_t
+            done_mask_t = combined_dones_t > 0.5
+            assert tensor_metrics is not None
+            reward_components_t = state.info.get("reward_components")
+            tensor_metrics.update(
+                rewards_t,
+                done_mask_t,
+                truncated_t > 0.5,
+                reward_components=reward_components_t,
+            )
+            terminal_final = state.final_observation
+            if terminal_final is not None:
+                terminal_obs_t = terminal_final.get("obs")
+                terminal_critic_t = terminal_final.get("critic")
             else:
-                next_obs_np, next_critic_np = split_obs_dict(state.obs)
-                next_obs_np = np.asarray(next_obs_np, dtype=np.float32)
-                next_critic_np = np.asarray(next_critic_np, dtype=np.float32)
-                rewards_np = np.asarray(state.reward, dtype=np.float32).ravel()
-                truncated_np = state.truncated.astype(np.float32, copy=False).ravel()
-                combined_dones = (
-                    (state.terminated | state.truncated).astype(np.float32, copy=False).ravel()
-                )
-                assert rewards_np is not None
-                assert truncated_np is not None
-                assert combined_dones is not None
-                prev_dones_np = combined_dones
-                done_mask_np = combined_dones > 0.5
-                timeout_mask_np = truncated_np > 0.5
-                done_count_window += int(np.count_nonzero(done_mask_np))
-                timeout_count_window += int(np.count_nonzero(timeout_mask_np))
-                terminal_contract = resolve_terminal_observation_contract(
-                    next_obs_batch_size=next_obs_np.shape[0],
-                    final_observation=state.final_observation,
-                    done=done_mask_np,
-                    info=state.info,
-                    truncated=truncated_np,
-                )
-            if tensor_collector:
-                assert obs_t is not None
-                assert critic_t is not None
-                assert next_obs_t is not None
-                assert next_critic_t is not None
-                assert rewards_t is not None
-                assert combined_dones_t is not None
-                assert truncated_t is not None
-                assert done_mask_t is not None
-            else:
-                assert obs_np is not None
-                assert critic_np is not None
-                assert next_obs_np is not None
-                assert next_critic_np is not None
-                assert rewards_np is not None
-                assert combined_dones is not None
-                assert truncated_np is not None
-                assert terminal_contract is not None
+                terminal_obs_t = None
+                terminal_critic_t = None
+            assert done_mask_t is not None
             # ReplayBuffer `dones` follows the UniLab env lifecycle contract:
             # done = terminated | truncated. Learners use `truncated` to keep
             # bootstrap enabled for timeout/truncation rows.
@@ -938,65 +804,24 @@ def _run_collector(
                 cycle_timing_ms, "transition_extract_ms", phase_start_ns
             )
             _rb_ns = _time.perf_counter_ns()
-            if tensor_collector:
-                assert obs_t is not None
-                assert critic_t is not None
-                assert next_obs_t is not None
-                assert next_critic_t is not None
-                assert rewards_t is not None
-                assert combined_dones_t is not None
-                assert truncated_t is not None
-                assert done_mask_t is not None
-                published = replay_add(
-                    obs_t,
-                    actions.to(dtype=torch.float32),
-                    rewards_t,
-                    next_obs_t,
-                    combined_dones_t,
-                    truncated_t,
-                    terminal_mask=done_mask_t,
-                    terminal_next_obs=terminal_obs_t,
-                    critic=critic_t,
-                    next_critic=next_critic_t,
-                    terminal_next_critic=terminal_critic_t,
-                    completion=state.info.get("graph_completion"),
-                )
-                if not published and not stop_event.is_set():
-                    raise RuntimeError("replay ingress closed before collector shutdown")
-            else:
-                assert obs_np is not None
-                assert critic_np is not None
-                assert next_obs_np is not None
-                assert next_critic_np is not None
-                assert actions_np is not None
-                assert rewards_np is not None
-                assert combined_dones is not None
-                assert truncated_np is not None
-                assert terminal_contract is not None
-                published = replay_add(
-                    torch.from_numpy(obs_np),
-                    torch.from_numpy(actions_np),
-                    torch.from_numpy(rewards_np),
-                    torch.from_numpy(next_obs_np),
-                    torch.from_numpy(combined_dones),
-                    torch.from_numpy(truncated_np),
-                    terminal_mask=torch.from_numpy(terminal_contract.terminal_mask),
-                    terminal_next_obs=(
-                        torch.from_numpy(terminal_contract.terminal_obs)
-                        if terminal_contract.terminal_obs is not None
-                        else None
-                    ),
-                    critic=torch.from_numpy(critic_np),
-                    next_critic=torch.from_numpy(next_critic_np),
-                    terminal_next_critic=(
-                        torch.from_numpy(terminal_contract.terminal_critic)
-                        if terminal_contract.terminal_critic is not None
-                        else None
-                    ),
-                    completion=state.info.get("graph_completion"),
-                )
-                if not published and not stop_event.is_set():
-                    raise RuntimeError("replay ingress closed before collector shutdown")
+            assert obs_t is not None
+            assert critic_t is not None
+            published = replay_add(
+                obs_t,
+                actions.to(dtype=torch.float32),
+                rewards_t,
+                next_obs_t,
+                combined_dones_t,
+                truncated_t,
+                terminal_mask=done_mask_t,
+                terminal_next_obs=terminal_obs_t,
+                critic=critic_t,
+                next_critic=next_critic_t,
+                terminal_next_critic=terminal_critic_t,
+                completion=state.info.get("completion"),
+            )
+            if not published and not stop_event.is_set():
+                raise RuntimeError("replay ingress closed before collector shutdown")
             if trace_recorder:
                 trace_recorder.add_slice(
                     "collector/replay_add",
@@ -1007,28 +832,8 @@ def _run_collector(
             phase_start_ns = _record_phase_ms(cycle_timing_ms, "replay_write_ms", phase_start_ns)
 
             # Track episode rewards - vectorized
-            if tensor_collector:
-                assert next_obs_t is not None
-                assert next_critic_t is not None
-                obs_t = next_obs_t
-                critic_t = next_critic_t
-            else:
-                assert rewards_np is not None
-                assert combined_dones is not None
-                assert next_obs_np is not None
-                assert next_critic_np is not None
-                current_ep_rewards += rewards_np
-                current_ep_lengths += 1
-                reset_mask = combined_dones > 0.5
-                reset_indices = np.where(reset_mask)[0]
-                if len(reset_indices) > 0:
-                    ep_rewards.extend(current_ep_rewards[reset_indices].tolist())
-                    ep_lengths.extend(current_ep_lengths[reset_indices].tolist())
-                    current_ep_rewards[reset_indices] = 0.0
-                    current_ep_lengths[reset_indices] = 0
-                obs_np = next_obs_np
-                critic_np = next_critic_np
-            info_dict = state.info
+            obs_t = next_obs_t
+            critic_t = next_critic_t
             total_steps += num_envs
 
             # Extract reward components from env info
@@ -1042,48 +847,44 @@ def _run_collector(
 
             # Send metrics every collector cycle so learner-side reward and
             # throughput displays track the current policy without extra lag.
-            if metrics_queue is not None and (tensor_metrics is None or tensor_metrics.ready):
-                if tensor_collector:
-                    assert tensor_metrics is not None
-                    metric_flush = tensor_metrics.flush()
-                    pending_flush = pending_tensor_metric_flush
-                    completed_flush = metric_flush
-                    if pending_flush is not None:
-                        completed_flush = TensorMetricFlush(
-                            pending_flush.rewards + metric_flush.rewards,
-                            pending_flush.lengths + metric_flush.lengths,
-                            pending_flush.done_count + metric_flush.done_count,
-                            pending_flush.timeout_count + metric_flush.timeout_count,
-                            reward_component_means=_merge_reward_component_means(
-                                pending_flush.reward_component_means,
-                                metric_flush.reward_component_means,
-                                left_updates=pending_flush.reward_component_updates,
-                                right_updates=metric_flush.reward_component_updates,
-                            ),
-                            reward_component_updates=(
-                                pending_flush.reward_component_updates
-                                + metric_flush.reward_component_updates
-                            ),
-                        )
-                    publication_rewards = deque(ep_rewards, maxlen=ep_rewards.maxlen)
-                    publication_lengths = deque(ep_lengths, maxlen=ep_lengths.maxlen)
-                    publication_rewards.extend(completed_flush.rewards)
-                    publication_lengths.extend(completed_flush.lengths)
-                    done_count_window += metric_flush.done_count
-                    timeout_count_window += metric_flush.timeout_count
-                    published = enqueue_collector_metrics(
-                        reward_history=publication_rewards,
-                        length_history=publication_lengths,
-                        reward_component_means=completed_flush.reward_component_means,
+            if metrics_queue is not None and tensor_metrics.ready:
+                metric_flush = tensor_metrics.flush()
+                pending_flush = pending_tensor_metric_flush
+                completed_flush = metric_flush
+                if pending_flush is not None:
+                    completed_flush = TensorMetricFlush(
+                        pending_flush.rewards + metric_flush.rewards,
+                        pending_flush.lengths + metric_flush.lengths,
+                        pending_flush.done_count + metric_flush.done_count,
+                        pending_flush.timeout_count + metric_flush.timeout_count,
+                        reward_component_means=_merge_reward_component_means(
+                            pending_flush.reward_component_means,
+                            metric_flush.reward_component_means,
+                            left_updates=pending_flush.reward_component_updates,
+                            right_updates=metric_flush.reward_component_updates,
+                        ),
+                        reward_component_updates=(
+                            pending_flush.reward_component_updates
+                            + metric_flush.reward_component_updates
+                        ),
                     )
-                    if published:
-                        ep_rewards = publication_rewards
-                        ep_lengths = publication_lengths
-                        pending_tensor_metric_flush = None
-                    else:
-                        pending_tensor_metric_flush = completed_flush
+                publication_rewards = deque(ep_rewards, maxlen=ep_rewards.maxlen)
+                publication_lengths = deque(ep_lengths, maxlen=ep_lengths.maxlen)
+                publication_rewards.extend(completed_flush.rewards)
+                publication_lengths.extend(completed_flush.lengths)
+                done_count_window += metric_flush.done_count
+                timeout_count_window += metric_flush.timeout_count
+                published = enqueue_collector_metrics(
+                    reward_history=publication_rewards,
+                    length_history=publication_lengths,
+                    reward_component_means=completed_flush.reward_component_means,
+                )
+                if published:
+                    ep_rewards = publication_rewards
+                    ep_lengths = publication_lengths
+                    pending_tensor_metric_flush = None
                 else:
-                    enqueue_collector_metrics()
+                    pending_tensor_metric_flush = completed_flush
             for key, value in cycle_timing_ms.items():
                 _record_timing_ms(timing_accum_ms, timing_counts, key, value)
 

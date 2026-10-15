@@ -14,6 +14,7 @@ import torch
 
 import uni_rl.offpolicy.double_buffer_runner as device_runner_module
 import uni_rl.offpolicy.runner as runner_module
+from uni_rl.algos.common.device import EnvContractProbe
 from uni_rl.ipc.async_runner import AsyncRunner
 from uni_rl.ipc.inference_ring import SharedInferenceRing
 from uni_rl.logging.metric_schema import METRIC_SCHEMA_VERSION, normalize_metric_map
@@ -112,7 +113,7 @@ def test_scheduler_rejects_slot_reuse_before_response_release() -> None:
         scheduler.finish_update()
 
 
-def test_scheduler_rejects_out_of_order_collector_tick() -> None:
+def test_scheduler_rejects_out_of_order_collector_publication() -> None:
     scheduler = _LearnerInferenceScheduler(env_steps_per_sync=1)
 
     with pytest.raises(RuntimeError, match="expected 0, got 1"):
@@ -446,7 +447,7 @@ class _RewardSummaryLogger(_FakeLogger):
 
 
 def _unused_env_factory(num_envs, env_cfg_override=None):
-    raise AssertionError("probe env must not be constructed when get_env_dims is patched")
+    raise AssertionError("probe env must not be constructed when probe_env_contract is patched")
 
 
 def _make_device_runner(
@@ -465,11 +466,21 @@ def _make_device_runner(
     num_envs: int = 2,
     batch_size: int = 4,
     updates_per_step: int = 2,
+    produces_completion_receipts: bool = True,
 ):
     monkeypatch.setattr(
         device_runner_module, "require_offpolicy_replay_device", lambda value: value
     )
-    monkeypatch.setattr(runner_module, "get_env_dims", lambda *args, **kwargs: (4, 2, 5))
+    monkeypatch.setattr(
+        runner_module,
+        "probe_env_contract",
+        lambda *args, **kwargs: EnvContractProbe(
+            obs_dim=4,
+            action_dim=2,
+            critic_obs_dim=5,
+            produces_completion_receipts=produces_completion_receipts,
+        ),
+    )
     placement = None
     if collector_tensor_native is not None:
         placement = resolve_inference_placement(
@@ -1277,6 +1288,7 @@ def test_runner_constructs_only_bounded_device_replay(
         "ingress_slot_rows": 2,
         "ingress_depth": 2,
         "ingress_device": "cpu",
+        "require_completion_receipt": True,
     }
     assert _FakePipeline.last_kwargs == {
         "device": "cuda",
@@ -1303,6 +1315,34 @@ def test_runner_constructs_only_bounded_device_replay(
     assert collector_kwargs["inference_response_queue"] is not None
     assert "collection_ready_queue" not in collector_kwargs
     assert "trainer_done_queue" not in collector_kwargs
+    assert _FakePipeline.close_calls == 1
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+def test_runner_relaxes_receipt_gate_for_sync_declared_env(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path,
+):
+    """A sync-declared probe must relax the replay ingress receipt gate."""
+    _FakePipeline.close_calls = 0
+    monkeypatch.setattr(device_runner_module, "ReplayBuffer", _FakeReplayBuffer)
+    monkeypatch.setattr(device_runner_module, "GPUResidentReplayPipeline", _FakePipeline)
+    monkeypatch.setattr(device_runner_module, "OffPolicyLogger", _FakeLogger)
+    monkeypatch.setattr(device_runner_module.torch, "save", lambda *args, **kwargs: None)
+    monkeypatch.setattr(device_runner_module.time, "sleep", lambda seconds: None)
+
+    runner = _make_device_runner(
+        monkeypatch,
+        _Learner(),
+        collector_tensor_native=True,
+        produces_completion_receipts=False,
+    )
+    assert runner.produces_completion_receipts is False
+    monkeypatch.setattr(runner, "_start_collector", lambda *, target_fn, kwargs: None)
+    runner.learn(max_iterations=0, save_interval=0, log_dir=str(tmp_path))
+
+    assert _FakeReplayBuffer.last_kwargs["require_completion_receipt"] is False
+    assert _FakeReplayBuffer.last_kwargs["ingress_device"] == "cuda"
     assert _FakePipeline.close_calls == 1
 
 

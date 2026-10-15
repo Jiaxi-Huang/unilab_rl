@@ -66,7 +66,6 @@ def _training_cfg() -> dict[str, Any]:
         "trace_thread_time": False,
         "trace_cuda_events": False,
         "log_interval": 3,
-        "collector_graph": "disabled",
     }
 
 
@@ -224,7 +223,6 @@ def test_flashsac_builder_forwards_backend_device_binder(
     assert _FakeLearner.last_kwargs["actor_normalize_parameters"] is True
     assert _FakeLearner.last_kwargs["critic_normalize_parameters"] is True
     assert runner.kwargs["target_frequency"] == 1
-    assert runner.kwargs["collector_graph_mode"] == "disabled"
     assert runner.kwargs["policy_before_critic"] is False
     assert runner.kwargs["replay_pipeline_factory"].keywords == {
         "decay_step": 0,

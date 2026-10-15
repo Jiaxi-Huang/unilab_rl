@@ -6,10 +6,11 @@ import multiprocessing as mp
 import threading
 import time
 
+import numpy as np
 import pytest
 import torch
 
-from uni_rl.ipc.graph_completion import ImmediateGraphCompletion
+from uni_rl.ipc.completion import EventCompletion, ImmediateCompletion, wait_completion
 from uni_rl.ipc.replay_buffer import ReplayBuffer
 
 _SPAWN_CTX = mp.get_context("spawn")
@@ -261,6 +262,110 @@ def test_add_batch_backpressures_between_chunks_until_learner_commits():
     buf.close()
 
 
+def test_ingress_waits_before_transition_source_reads(monkeypatch: pytest.MonkeyPatch) -> None:
+    events: list[str] = []
+
+    class OrderingCompletion(ImmediateCompletion):
+        def wait_before_read(self, stream=None):
+            events.append("wait")
+
+    buf = ReplayBuffer(
+        capacity=16,
+        obs_dim=_OBS_DIM,
+        action_dim=_ACTION_DIM,
+        device="cpu",
+        ingress_slot_rows=4,
+    )
+    original_write = buf._write_transition_rows
+    original_patch = buf._patch_terminal_next_observations
+
+    def record_write(*args, **kwargs):
+        events.append("read")
+        return original_write(*args, **kwargs)
+
+    def record_patch(*args, **kwargs):
+        events.append("patch")
+        return original_patch(*args, **kwargs)
+
+    monkeypatch.setattr(buf, "_write_transition_rows", record_write)
+    monkeypatch.setattr(buf, "_patch_terminal_next_observations", record_patch)
+    batch = _random_batch(4)
+
+    try:
+        buf.add(*batch, completion=OrderingCompletion(producer_id="producer-ingress"))
+        assert events == ["wait", "read", "patch"]
+    finally:
+        buf.close()
+
+
+def test_completion_ipc_export_failure_fails_closed() -> None:
+    class FailingEvent:
+        def ipc_handle(self) -> bytes:
+            raise RuntimeError("CUDA IPC export failed")
+
+    failing = EventCompletion(
+        contract_version=3,
+        operation="step",
+        sequence=1,
+        producer_id="producer-a",
+        event=FailingEvent(),
+    )
+
+    buf = ReplayBuffer(
+        capacity=8,
+        obs_dim=_OBS_DIM,
+        action_dim=_ACTION_DIM,
+        device="cpu",
+        ingress_slot_rows=4,
+    )
+
+    try:
+        with pytest.raises(RuntimeError, match="CUDA IPC export failed"):
+            buf._publish_completion_metadata(failing)
+        assert not bool(buf._completion_metadata_available[0])
+    finally:
+        buf.close()
+
+
+def test_host_publication_receipt_exports_no_event_metadata() -> None:
+    buf = _make_buf()
+
+    try:
+        buf._publish_completion_metadata(ImmediateCompletion(sequence=1))
+        assert not bool(buf._completion_metadata_available[0])
+    finally:
+        buf.close()
+
+
+def test_import_ingress_publication_rejects_malformed_metadata() -> None:
+    buf = _make_buf()
+
+    try:
+        buf._completion_metadata_handle_size[0] = 8
+        buf._completion_metadata_producer_size[0] = len(b"producer-a")
+        buf._completion_metadata_producer[0, : len(b"producer-a")] = torch.from_numpy(
+            np.frombuffer(b"producer-a", dtype=np.uint8).copy()
+        )
+        buf._completion_metadata_sequence[0] = 1
+        buf._completion_metadata_available[0] = True
+
+        buf._completion_metadata_contract[0] = 1
+        with pytest.raises(ValueError, match="unsupported completion contract"):
+            buf._import_ingress_publication()
+
+        buf._completion_metadata_contract[0] = 3
+        buf._completion_metadata_producer_size[0] = 0
+        with pytest.raises(TypeError, match="producer_id"):
+            buf._import_ingress_publication()
+
+        buf._completion_metadata_producer_size[0] = len(b"producer-a")
+        buf._completion_metadata_handle_size[0] = 0
+        with pytest.raises(TypeError, match="handle"):
+            buf._import_ingress_publication()
+    finally:
+        buf.close()
+
+
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
 def test_cuda_ingress_publication_requires_completion_read_gate(
     monkeypatch: pytest.MonkeyPatch,
@@ -285,16 +390,16 @@ def test_cuda_ingress_publication_requires_completion_read_gate(
             monkeypatch.setattr(slot, "item", fail_ingress_read)
             protected_ingress_slots.append(slot)
         batch = tuple(tensor.to("cuda") for tensor in _random_batch(4))
-        with pytest.raises(RuntimeError, match="graph completion receipt"):
+        with pytest.raises(RuntimeError, match="completion receipt"):
             buf.add(*batch)
 
-        class StreamCompletion(ImmediateGraphCompletion):
+        class StreamCompletion(ImmediateCompletion):
             def wait_before_read(self, stream=None):
                 assert isinstance(stream, torch.cuda.Stream)
 
         buf.add(
             *batch,
-            completion=StreamCompletion(operation="step", capture_id="capture-ingress"),
+            completion=StreamCompletion(operation="step", producer_id="producer-ingress"),
         )
 
         assert protected_ingress_slots
@@ -313,12 +418,62 @@ def test_cuda_ingress_publication_requires_completion_read_gate(
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+def test_cuda_ingress_accepts_sync_producer_without_receipt(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A producer declared synchronous emits no receipt; ingress must not wait.
+
+    ``require_completion_receipt=False`` is the buffer-side projection of the
+    env contract declaration ``produces_completion_receipts = False``: the
+    producer's step outputs are already ordered at return, so a missing
+    receipt is accepted and no read gate runs.
+    """
+    wait_calls: list[object] = []
+
+    def record_ingress_wait(completion, **kwargs) -> object:
+        wait_calls.append(completion)
+        return completion
+
+    monkeypatch.setattr(
+        "uni_rl.ipc.replay_buffer.wait_completion",
+        record_ingress_wait,
+    )
+    buf = ReplayBuffer(
+        capacity=16,
+        obs_dim=_OBS_DIM,
+        action_dim=_ACTION_DIM,
+        device="cuda",
+        ingress_slot_rows=4,
+        ingress_device="cuda",
+        require_completion_receipt=False,
+    )
+    try:
+        batch = tuple(tensor.to("cuda") for tensor in _random_batch(4))
+        assert buf.add(*batch) is True
+        # The only gate invocation observed a None receipt: no wait happened.
+        assert wait_calls == [None]
+        assert buf.last_completion is None
+        assert buf.completion_sequence == 0
+        assert buf.published_ptr == 4
+
+        ingress = buf.take_published_ingress()
+        assert ingress is not None
+        slot, start, count, packed = ingress
+        buf.commit_ingress(slot=slot, start=start, count=count)
+        assert (start, count) == (0, 4)
+        torch.testing.assert_close(packed[:, buf._obs_sl], batch[0])
+        torch.testing.assert_close(packed[:, buf._act_sl], batch[1])
+    finally:
+        buf.close()
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
 def test_cuda_add_batch_reuses_one_completion_gate_for_each_chunk(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     waited_streams: list[object] = []
 
-    class RecordingCompletion(ImmediateGraphCompletion):
+    class RecordingCompletion(ImmediateCompletion):
         def wait_before_read(self, stream=None):
             waited_streams.append(stream)
 
@@ -338,7 +493,7 @@ def test_cuda_add_batch_reuses_one_completion_gate_for_each_chunk(
         assert (
             buf.add_batch(
                 *batch,
-                completion=RecordingCompletion(capture_id="capture-ingress"),
+                completion=RecordingCompletion(producer_id="producer-ingress"),
             )
             is True
         )
@@ -402,31 +557,79 @@ def test_ingress_rejects_stale_completion_within_one_buffer() -> None:
 
     assert buf.add(
         *_random_batch(4),
-        completion=ImmediateGraphCompletion(sequence=2),
+        completion=ImmediateCompletion(sequence=2),
     )
-    with pytest.raises(ValueError, match="stale graph completion"):
+    with pytest.raises(ValueError, match="stale completion"):
         buf.add(
             *_random_batch(4),
-            completion=ImmediateGraphCompletion(sequence=1),
+            completion=ImmediateCompletion(sequence=1),
         )
     buf.close()
 
 
-def test_ingress_receipt_is_relabeled_whole_collector_tick() -> None:
+def test_ingress_publication_receipt_preserves_step_metadata() -> None:
     buf = _make_buf()
 
     assert buf.add(
         *_random_batch(4),
-        completion=ImmediateGraphCompletion(sequence=1, capture_id="capture-a"),
+        completion=ImmediateCompletion(sequence=1, producer_id="producer-a"),
     )
 
-    completion = buf.last_graph_completion
+    completion = buf.last_completion
     assert completion is not None
-    assert completion.operation == "collector_tick"
+    assert completion.operation == "step"
     assert completion.sequence == 1
-    assert completion.capture_id == "capture-a"
-    assert buf.graph_completion_sequence == 1
+    assert completion.producer_id == "producer-a"
+    assert buf.completion_sequence == 1
     buf.close()
+
+
+def test_ingress_accepts_foreign_structural_completion_producer(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    events: list[str] = []
+
+    class ForeignImmediateCompletion:
+        contract_version = 3
+        operation = "step"
+        sequence = 3
+        producer_id = "producer-foreign"
+
+        def wait_before_read(self, stream=None) -> None:
+            events.append("wait")
+
+    buf = _make_buf(slot_rows=4)
+    batch = _random_batch(4)
+    original_write = buf._write_transition_rows
+    original_patch = buf._patch_terminal_next_observations
+
+    def record_write(*args, **kwargs):
+        events.append("read")
+        return original_write(*args, **kwargs)
+
+    def record_patch(*args, **kwargs):
+        events.append("patch")
+        return original_patch(*args, **kwargs)
+
+    monkeypatch.setattr(buf, "_write_transition_rows", record_write)
+    monkeypatch.setattr(buf, "_patch_terminal_next_observations", record_patch)
+
+    try:
+        token = ForeignImmediateCompletion()
+        assert buf.add(*batch, completion=token)
+        completion = buf.last_completion
+        assert completion is not None
+        assert completion is not token
+        assert isinstance(completion, ImmediateCompletion)
+        assert completion.operation == "step"
+        assert completion.sequence == 3
+        assert completion.producer_id == "producer-foreign"
+        _, _, packed = _take_and_commit(buf)
+        torch.testing.assert_close(packed[:, buf._obs_sl], batch[0])
+        torch.testing.assert_close(packed[:, buf._act_sl], batch[1])
+        assert events == ["wait", "read", "patch"]
+    finally:
+        buf.close()
 
 
 def test_ingress_writes_packed_columns_without_cat(monkeypatch: pytest.MonkeyPatch):
@@ -606,8 +809,8 @@ def _collector_add(buf: ReplayBuffer, chunks: int) -> None:
 
 def _collector_publish_cuda_completion(buf: ReplayBuffer) -> None:
     batch = tuple(tensor.to("cuda") for tensor in _random_batch(4))
-    completion = ImmediateGraphCompletion(
-        operation="step", sequence=1, capture_id="capture-cross-process"
+    completion = ImmediateCompletion(
+        operation="step", sequence=1, producer_id="producer-cross-process"
     )
     assert buf.add(*batch, completion=completion) is True
 
@@ -662,23 +865,21 @@ def test_spawned_collector_transports_ingress_completion_to_learner_copy() -> No
         deadline = time.monotonic() + 15.0
         while buf.published_ptr == 0 and time.monotonic() < deadline:
             time.sleep(0.001)
-        imported = buf.import_shared_graph_completion()
+        imported = buf.import_ingress_publication()
         assert imported is not None
-        assert imported.capture_id == "capture-cross-process"
+        assert imported.producer_id == "producer-cross-process"
         assert imported.sequence == 1
-        assert buf.graph_capture_id == "capture-cross-process"
+        assert buf.completion_producer_id == "producer-cross-process"
         ingress = buf.take_published_ingress()
         assert ingress is not None
         slot, start, count, packed = ingress
         consumer = torch.cuda.Stream()
         with torch.cuda.stream(consumer):
-            from uni_rl.ipc.graph_completion import wait_graph_completion
-
-            wait_graph_completion(
+            wait_completion(
                 imported,
                 stream=consumer,
-                operation="collector_tick",
-                capture_id="capture-cross-process",
+                operation="step",
+                producer_id="producer-cross-process",
                 last_sequence=0,
             )
             copied = packed.clone()

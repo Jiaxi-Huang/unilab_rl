@@ -195,7 +195,6 @@ class DoubleBufferOffPolicyRunner(OffPolicyRunner):
         inference_slot_capacity: int | None = None,
         inference_epoch: int = 0,
         collector_metrics_interval: int | None = None,
-        collector_graph_mode: str = "disabled",
         **kwargs,
     ):
         kwargs["device"] = require_offpolicy_replay_device(kwargs.get("device"))
@@ -356,14 +355,6 @@ class DoubleBufferOffPolicyRunner(OffPolicyRunner):
             raise ValueError("inference_epoch must be non-negative")
         self.inference_epoch = int(inference_epoch)
         self.collector_metrics_interval = tensor_runtime_settings.collector_metrics_interval
-        if not isinstance(collector_graph_mode, str):
-            raise TypeError(f"collector_graph_mode must be a string, got {collector_graph_mode!r}")
-        self.collector_graph_mode = collector_graph_mode.strip().lower()
-        if self.collector_graph_mode not in {"disabled", "eager", "graph"}:
-            raise ValueError(
-                "collector_graph_mode must be one of 'disabled', 'eager', or 'graph'; "
-                f"got {collector_graph_mode!r}"
-            )
         self.replay_ingress_depth = tensor_runtime_settings.replay_ingress_depth
         self.replay_ingress_slot_rows = tensor_runtime_settings.replay_ingress_slot_rows
         # Backend-owned process-device binder forwarded to the collector
@@ -412,16 +403,6 @@ class DoubleBufferOffPolicyRunner(OffPolicyRunner):
             "logger_owner_rank": 0,
             "logger_cross_rank_aggregation": self.dp_sync is not None,
             "cuda_graph": self._cuda_graph_runtime_manifest(),
-            "collector_graph": {
-                "mode": self.collector_graph_mode,
-                "requested": self.collector_graph_mode == "graph",
-                "enabled": False,
-                "disable_reason": (
-                    "collector graph mode is disabled"
-                    if self.collector_graph_mode == "disabled"
-                    else "explicit eager collector execution"
-                ),
-            },
         }
         if self.dp_sync is not None:
             self.runtime_manifest["dp_sync"] = {
@@ -1563,6 +1544,7 @@ class DoubleBufferOffPolicyRunner(OffPolicyRunner):
             ingress_depth=self.replay_ingress_depth,
             ingress_device=self.device if gpu_centric_collector else "cpu",
             # CPU transport still owns a CUDA replay device and CPU ingress.
+            require_completion_receipt=self.produces_completion_receipts,
         )
         self._active_replay_buffer = replay_buffer
         self._shared_resources.append(replay_buffer)
@@ -1670,7 +1652,6 @@ class DoubleBufferOffPolicyRunner(OffPolicyRunner):
                     "cuda_ipc_events" if inference_slot.device.type == "cuda" else "cpu_synchronous"
                 ),
                 "collector_metrics_interval": self.collector_metrics_interval,
-                "collector_graph_mode": self.collector_graph_mode,
             }
         )
 
@@ -1768,7 +1749,6 @@ class DoubleBufferOffPolicyRunner(OffPolicyRunner):
                 "nan_guard_factory": self.nan_guard_factory,
                 "torch_thread_runtime": self.torch_thread_runtime,
                 "backend_device_binder": self.backend_device_binder,
-                "collector_graph_mode": self.collector_graph_mode,
                 "learner_coordination": self._learner_coordination,
                 "learner_pid": os.getpid(),
             }
