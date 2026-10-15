@@ -16,6 +16,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   accepted at CUDA replay ingress without a receipt; undeclared envs default to
   `True` (receipt required — fail-closed direction unchanged).
 
+### Changed
+
+- The mujoco + CUDA-learner off-policy topology now resolves to the CUDA
+  tensor ring by default (UniLab #2365). Driven by UniLab's
+  `training.collector_tensor_device=auto` (collector env tensors follow the
+  learner device), the probe reports CUDA-native observations and, with no
+  explicit transport config, placement resolution selects the CUDA tensor ring
+  (`cuda_no_host_boundary` staging, replay ingress on the learner device, no
+  host action staging). On CUDA platforms the CPU transport is no longer
+  reachable for tensor-native envs; the CPU ring path remains for CPU-only and
+  Apple Silicon `torch.mps` (Metal Performance Shaders) learners.
+
 ### Removed
 
 - Shrunk the replay completion surface to the minimal async step-only event
