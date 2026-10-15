@@ -809,19 +809,26 @@ def test_tensor_collector_reports_bounded_inference_scheduling_diagnostics(
     assert inference_request_queue.get_nowait() == 0
 
 
-def test_tensor_collector_snapshots_transition_source_before_persistent_carrier_update(
+def test_tensor_collector_passes_env_observations_to_replay_without_snapshot(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Replay must receive obs[t], even when autoreset reuses obs[t+1] storage."""
+    """Replay receives the env-provided observation tensors directly.
+
+    The env contract guarantees caller-owned public observations (no in-place
+    reuse across steps), so the collector hands them to replay without a
+    defensive staging copy; the stored rows are the identical tensor objects.
+    """
     stop_event = threading.Event()
     metrics_queue: queue.Queue[dict] = queue.Queue(maxsize=4)
     replay_calls: list[tuple[tuple[torch.Tensor, ...], dict[str, object]]] = []
-    persistent_obs = torch.zeros((2, 2), dtype=torch.float32)
-    persistent_critic = torch.full((2, 3), 5.0, dtype=torch.float32)
+    initial_obs = torch.zeros((2, 2), dtype=torch.float32)
+    initial_critic = torch.full((2, 3), 5.0, dtype=torch.float32)
+    next_obs = torch.full((2, 2), 7.0, dtype=torch.float32)
+    next_critic = torch.full((2, 3), 11.0, dtype=torch.float32)
 
     class _Env:
         state = SimpleNamespace(
-            obs={"obs": persistent_obs, "critic": persistent_critic},
+            obs={"obs": initial_obs, "critic": initial_critic},
             reward=torch.ones(2),
             terminated=torch.tensor([False, True]),
             truncated=torch.zeros(2, dtype=torch.bool),
@@ -832,19 +839,15 @@ def test_tensor_collector_snapshots_transition_source_before_persistent_carrier_
         def step(self, actions):
             torch.testing.assert_close(actions, torch.zeros((2, 2)))
             stop_event.set()
-            persistent_obs.fill_(7.0)
-            persistent_critic.fill_(11.0)
-            return SimpleNamespace(
-                obs=self.state.obs,
+            self.state = SimpleNamespace(
+                obs={"obs": next_obs, "critic": next_critic},
                 reward=torch.ones(2),
                 terminated=self.state.terminated,
                 truncated=self.state.truncated,
-                final_observation={
-                    "obs": torch.full((2, 2), 9.0),
-                    "critic": torch.full((2, 3), 13.0),
-                },
+                final_observation=None,
                 info={"timing": {}},
             )
+            return self.state
 
         def close(self):
             return None
@@ -927,10 +930,11 @@ def test_tensor_collector_snapshots_transition_source_before_persistent_carrier_
 
     assert len(replay_calls) == 1
     replay_args, replay_kwargs = replay_calls[0]
-    torch.testing.assert_close(replay_args[0], torch.zeros((2, 2)))
-    torch.testing.assert_close(replay_kwargs["critic"], torch.full((2, 3), 5.0))
-    torch.testing.assert_close(replay_args[3], torch.full((2, 2), 7.0))
-    torch.testing.assert_close(replay_kwargs["next_critic"], torch.full((2, 3), 11.0))
+    assert replay_args[0] is initial_obs
+    assert replay_kwargs["critic"] is initial_critic
+    assert replay_args[3] is next_obs
+    assert replay_kwargs["next_critic"] is next_critic
+    assert replay_args[0].data_ptr() == initial_obs.data_ptr()
 
 
 def test_tensor_collector_stages_numpy_ring_actions_before_env_step(

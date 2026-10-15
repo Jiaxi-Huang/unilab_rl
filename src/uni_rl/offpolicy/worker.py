@@ -593,8 +593,6 @@ def _run_collector(
     action_host: torch.Tensor | None = None
     obs_t: torch.Tensor | None = None
     critic_t: torch.Tensor | None = None
-    source_obs_t: torch.Tensor | None = None
-    source_critic_t: torch.Tensor | None = None
     next_obs_t: torch.Tensor | None = None
     next_critic_t: torch.Tensor | None = None
     rewards_t: torch.Tensor | None = None
@@ -606,8 +604,6 @@ def _run_collector(
     obs_t, critic_t = split_obs_dict(state.obs)
     assert obs_t is not None
     assert critic_t is not None
-    source_obs_t = obs_t.clone()
-    source_critic_t = critic_t.clone()
     prev_dones_t = torch.zeros(num_envs, dtype=torch.float32, device=actor_observation.device)
     import time as _time
 
@@ -750,15 +746,6 @@ def _run_collector(
 
             # Step environment
             _env_ns = _time.perf_counter_ns()
-            # Persistent environment carriers may be updated in place. Preserve
-            # the pre-action transition source without allocating on the hot
-            # path; autoreset can otherwise overwrite obs[t] before replay sees it.
-            assert obs_t is not None
-            assert critic_t is not None
-            assert source_obs_t is not None
-            assert source_critic_t is not None
-            source_obs_t.copy_(obs_t)
-            source_critic_t.copy_(critic_t)
             # TorchEnv has a tensor-only public action contract even when the
             # inference ring is CPU. Reuse one persistent host staging tensor
             # for this explicit ring->env boundary rather than allocating or
@@ -809,8 +796,6 @@ def _run_collector(
             else:
                 terminal_obs_t = None
                 terminal_critic_t = None
-            assert source_obs_t is not None
-            assert source_critic_t is not None
             assert done_mask_t is not None
             # ReplayBuffer `dones` follows the UniLab env lifecycle contract:
             # done = terminated | truncated. Learners use `truncated` to keep
@@ -822,7 +807,7 @@ def _run_collector(
             assert obs_t is not None
             assert critic_t is not None
             published = replay_add(
-                source_obs_t,
+                obs_t,
                 actions.to(dtype=torch.float32),
                 rewards_t,
                 next_obs_t,
@@ -830,7 +815,7 @@ def _run_collector(
                 truncated_t,
                 terminal_mask=done_mask_t,
                 terminal_next_obs=terminal_obs_t,
-                critic=source_critic_t,
+                critic=critic_t,
                 next_critic=next_critic_t,
                 terminal_next_critic=terminal_critic_t,
                 completion=state.info.get("completion"),
