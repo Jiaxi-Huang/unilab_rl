@@ -1,16 +1,19 @@
 """Observation-group helpers for the uni_rl env contract.
 
-Pure numpy helpers over the ``obs_groups_spec`` / observation-dict contract
-defined in ``uni_rl.env_contract``. Ported from UniLab's
-``unilab.base.observations`` (issue #1479) with identical names and semantics.
+Generic helpers over the ``obs_groups_spec`` / observation-dict contract
+defined in ``uni_rl.env_contract``. Observation values are Torch tensors at
+the env boundary (see ``env_contract``); the helpers stay value-agnostic so
+host-side diagnostics with NumPy carriers can reuse them.
 """
 
 from __future__ import annotations
 
-import numpy as np
+from typing import TypeVar
+
+T = TypeVar("T")
 
 
-def split_obs_dict(obs: dict[str, np.ndarray]) -> tuple[np.ndarray, np.ndarray]:
+def split_obs_dict(obs: dict[str, T]) -> tuple[T, T]:
     """Split observation dict into (actor_obs, critic_obs).
 
     When no separate critic group exists, critic_obs == actor_obs.
